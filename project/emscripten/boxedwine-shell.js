@@ -793,7 +793,7 @@
                 loadFile(pathPrefix, filename, (bytes) => { createFile("/", filename, bytes); callback(); });
                 return;
             }
-            lazyAddCachedFile("/", filename, pathPrefix + filename).then(callback, (e) => console.log("Unable to load:" + filename + " error:" + e));
+            lazyAddCachedFile("/", filename, pathPrefix + filename).then(callback, (e) => vnboxReport("lazyfs", "Unable to load " + filename + ": " + e));
         }
         function buildAppFileSystem(callback) {
             if (Config.lazyApp.startsWith("opfs:")) {
@@ -801,7 +801,7 @@
                 mountLazyApp(getLazyAppMount(), name, lazyOpfsDir(path)).then(() => {
                     Config.appSubfolder = name;
                     callback();
-                }, (e) => console.log("Unable to mount lazy game folder " + path + ": " + e));
+                }, (e) => vnboxReport("lazyfs", "Unable to mount lazy game folder " + path + ": " + e));
             }else if(Config.appPayload.length > 0){
             	let uint8Array = getBase64Data(Config.appPayload);
             	createFile("/", Config.payloadZipFile, uint8Array);
@@ -2342,6 +2342,7 @@
         if (source) details += ' at ' + source + ':' + lineno + ':' + colno;
         if (error && error.stack) details += '\n' + error.stack;
         Module.printErr(details);
+        if (typeof vnboxReport === 'function') vnboxReport('error', details);
         Module.setStatus('Exception thrown, see JavaScript console');
         spinnerElement.style.display = 'none';
         Module.setStatus = function(text) {
@@ -2351,6 +2352,7 @@
       window.onunhandledrejection = function(event) {
         var reason = event && event.reason;
         Module.printErr('Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : reason));
+        if (typeof vnboxReport === 'function') vnboxReport('error', 'Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : reason));
       };
 function createFile(dir, name, buf) {
     try {

@@ -46,9 +46,11 @@ jobs:
           mkdir "dist/$name"
           (cd project/emscripten/Build/JitJspi && cp $files "$GITHUB_WORKSPACE/dist/$name/")
           cp license.txt "dist/$name/LICENSE.txt"
+          vn/build-jp-overlay.sh dist/TinyCore15Wine11.0-web.zip dist/jp.zip
+          # lazyfs.js keys its OPFS copies of the zips by these
+          (cd dist && sha256sum TinyCore15Wine11.0-web.zip jp.zip) > "dist/$name/vnbox-zips.sha256"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -r "dist/$name"
-          vn/build-jp-overlay.sh dist/TinyCore15Wine11.0-web.zip dist/jp.zip
           (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
           cat dist/SHA256SUMS
 
@@ -60,7 +62,7 @@ jobs:
           cat > notes.md <<NOTES
           Web build of VNBox (\`make jitJspi\`, Emscripten $EMSDK_VERSION, commit $GITHUB_SHA).
 
-          - \`vnbox-web-$GITHUB_REF_NAME.tar.gz\`: boxedwine.{html,js,wasm,css}, boxedwine-shell.js, fsfs.js, lazyfs.js, lazyfs-worker.js, frida-compat.js. GPL-2.0, source is this tag.
+          - \`vnbox-web-$GITHUB_REF_NAME.tar.gz\`: boxedwine.{html,js,wasm,css}, boxedwine-shell.js, fsfs.js, lazyfs.js, lazyfs-worker.js, frida-compat.js, vnbox-zips.sha256. GPL-2.0, source is this tag.
           - \`TinyCore15Wine11.0-web.zip\`: unmodified mirror of the Boxedwine root file system ($ROOT_FS_URL). It holds Tiny Core Linux, Wine 11.0 and other GPL/LGPL software; build scripts in [tools/buildWine](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_REF_NAME/tools/buildWine), sources from the projects (https://www.winehq.org, http://tinycorelinux.net) and https://boxedwine.org.
           - \`jp.zip\`: Japanese overlay, IPA fonts (IPA Font License v1.0, included in the zip) and a ja_JP.utf8 locale name, built by vn/build-jp-overlay.sh.
           - \`SHA256SUMS\`
