@@ -6,7 +6,7 @@
 // URL: frida=<script url> loads that script (and its require()d libs) into the game process,
 // the one whose first loaded module is the exe named by p=. Lines the script sends go to
 // window.boxedwineText(line) when defined, and to the console.
-// Only same-origin blob: URLs and same-origin files under the folder above this page load (XSS guard).
+// Only same-origin blob: URLs and same-origin files under the folder above frida-compat.js load (XSS guard).
 //
 // Covered: Interceptor.attach (onEnter), Breakpoint.add/remove, this.context.<x86 regs>,
 // args[i], ptr(), NativePointer arithmetic and reads (U8..U64, Pointer, ByteArray, CString,
@@ -379,8 +379,12 @@
     // synchronously as CommonJS modules when the script runs.
     const sources = new Map(), cache = new Map();
     // Scripts run with the page's origin, so only same-origin blob: URLs (made by the parent page)
-    // and files under the folder above this page (the embedding site's /vn/) are allowed.
-    function scriptAllowed(url, page) {
+    // and files under the folder above frida-compat.js (the embedding site's /vn/) are allowed.
+    // The folder is taken from this file's URL, not the page's: an embedding page may sit elsewhere
+    // (/vn/vnbox.html loading /vn/vnbox/frida-compat.js allows /vn/).
+    const selfUrl = (typeof document !== 'undefined' && document.currentScript && document.currentScript.src) ||
+        (typeof location !== 'undefined' ? location.href : '');
+    function scriptAllowed(url, page, script = page) {
         let u;
         try { u = new URL(url); } catch (e) { return false; }
         const pageUrl = new URL(page);
@@ -388,14 +392,14 @@
         // servers decode %2F/%5C and then resolve .., so an encoded separator could leave the folder
         if (/%2f|%5c/i.test(u.pathname)) return false;
         return (u.protocol === 'https:' || u.protocol === 'http:') && u.origin === pageUrl.origin &&
-            u.href.startsWith(new URL('../', pageUrl).href);
+            u.href.startsWith(new URL('../', script).href);
     }
     async function fetchTree(url) {
         if (sources.has(url)) return;
-        if (!scriptAllowed(url, location.href)) throw new Error('frida: script URL refused (not same-origin blob: or under ../): ' + url);
+        if (!scriptAllowed(url, location.href, selfUrl)) throw new Error('frida: script URL refused (not same-origin blob: or under the folder above frida-compat.js): ' + url);
         const res = await fetch(url);
         if (!res.ok) throw new Error('frida: ' + url + ': HTTP ' + res.status);
-        if (res.redirected && !scriptAllowed(res.url, location.href)) throw new Error('frida: script redirected off the allowed paths: ' + res.url);
+        if (res.redirected && !scriptAllowed(res.url, location.href, selfUrl)) throw new Error('frida: script redirected off the allowed paths: ' + res.url);
         const text = await res.text();
         sources.set(url, text);
         const deps = [...text.matchAll(/require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)/g)].map((m) => new URL(m[1], url).href);
