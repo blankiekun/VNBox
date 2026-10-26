@@ -385,6 +385,8 @@
         try { u = new URL(url); } catch (e) { return false; }
         const pageUrl = new URL(page);
         if (u.protocol === 'blob:') return u.origin === pageUrl.origin;
+        // servers decode %2F/%5C and then resolve .., so an encoded separator could leave the folder
+        if (/%2f|%5c/i.test(u.pathname)) return false;
         return (u.protocol === 'https:' || u.protocol === 'http:') && u.origin === pageUrl.origin &&
             u.href.startsWith(new URL('../', pageUrl).href);
     }

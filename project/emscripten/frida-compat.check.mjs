@@ -35,6 +35,6 @@ const page = 'https://ex.org/vn/vnbox/boxedwine.html?frida=x';
 for (const ok of ['blob:https://ex.org/1234', 'https://ex.org/vn/hooks/a.js', 'https://ex.org/vn/vnbox/libPCKiriKiri.js'])
     assert.ok(F.test.scriptAllowed(ok, page), ok);
 for (const bad of ['blob:https://evil.org/1234', 'https://evil.org/vn/a.js', 'https://ex.org/a.js', 'https://ex.org/vnx/a.js',
-    'https://ex.org/vn/../a.js', 'https://ex.org/vn/%2e%2e/a.js', 'data:text/javascript,alert(1)', 'javascript:alert(1)', 'http://ex.org/vn/a.js', '//evil.org/vn/a.js'])
+    'https://ex.org/vn/../a.js', 'https://ex.org/vn/%2e%2e/a.js', 'data:text/javascript,alert(1)', 'javascript:alert(1)', 'http://ex.org/vn/a.js', '//evil.org/vn/a.js', 'https://ex.org/vn/..%2Fcalibre/a.js', 'https://ex.org/vn/..%5ca.js'])
     assert.ok(!F.test.scriptAllowed(bad, page), bad);
 console.log('frida-compat url guard ok');
