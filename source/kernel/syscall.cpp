@@ -2694,7 +2694,13 @@ static const SyscallFunc syscallFunc[] = {
 #ifndef BOXEDWINE_MULTI_THREADED
 extern S32 contextTime; // about the # instruction per 10 ms
 #endif
+#ifdef BOXEDWINE_JSPI_PROBE
+extern "C" int boxedwine_jspi_probe();
+#endif
 void ksyscall(CPU* cpu, U32 eipCount) {
+#ifdef BOXEDWINE_JSPI_PROBE
+    { static U32 probeCount; if (++probeCount % 5000 == 0) boxedwine_jspi_probe(); } // suspend inside a syscall: a JIT block may be below
+#endif
     U32 result = -K_ENOSYS;
     U64 startTime = KSystem::getMicroCounter();
 #ifdef BOXEDWINE_MULTI_THREADED 

@@ -22,6 +22,7 @@
         let DEFAULT_LOAD_DESKTOP = false;
         let DEFAULT_SOUND_ENABLED = true;
         let DEFAULT_DISABLE_HIDE_CURSOR = false;
+        const LAZY_APP_MOUNT = "/lazyapp";
         let DEFAULT_APP_DIRECTORY = "/home/username/.wine/dosdevices/c:/files";
         let DEFAULT_BPP = 32;
         let DEFAULT_FRAME_SKIP = "0";
@@ -162,6 +163,7 @@
             Config.rootZipFile = getRootZipFile("root"); //MANUAL:"base.zip";
             Config.extraZipFiles = getZipFileList("overlay"); //MANUAL:"dlls.zip;fonts.zip";
             Config.appZipFile = getAppZipFile("app"); //MANUAL:"chomp.zip";
+            Config.lazyApp = new URLSearchParams(location.search).get("lazy") || ""; // "opfs:vn/albatross": game folder read lazily (lazyfs.js)
             let cdrom = getCDRom("cdrom"); //MANUAL:{files: ["disc1.iso", "disc2.iso"], drive: "e"}
             Config.cdromISOFiles = cdrom.files;
             Config.cdromDrive = cdrom.drive;
@@ -781,7 +783,13 @@
 			});
 		}
         function buildAppFileSystem(callback) {
-            if(Config.appPayload.length > 0){
+            if (Config.lazyApp.startsWith("opfs:")) {
+                let path = Config.lazyApp.substring(5), name = path.split("/").filter(Boolean).pop();
+                mountLazyApp(LAZY_APP_MOUNT, name, lazyOpfsDir(path)).then(() => {
+                    Config.appSubfolder = name;
+                    callback();
+                }, (e) => console.log("Unable to mount lazy game folder " + path + ": " + e));
+            }else if(Config.appPayload.length > 0){
             	let uint8Array = getBase64Data(Config.appPayload);
             	createFile("/", Config.payloadZipFile, uint8Array);
                 callback();
@@ -1889,6 +1897,10 @@
     			params.push("-mount");
     			params.push(Config.appZipFile);
     			params.push(Config.appDirPrefix);          
+			} else if (Config.lazyApp.length > 0) { // -mount /lazyapp "/home/username/files/"
+    			params.push("-mount");
+    			params.push(LAZY_APP_MOUNT);
+    			params.push(Config.appDirPrefix);
 			} else if (Config.appPayload.length > 0){ // -mount "app.zip" "/home/username/files/" 			
     			params.push("-mount");
     			params.push(Config.payloadZipFile);
@@ -1954,7 +1966,7 @@
             	}else if(Config.appPayload.length > 0 && Config.Program.length > 0 && Config.Program.substring(0 ,1) != "/"){
                 	params.push("-w");
                 	params.push(Config.appDirPrefix);
-            	}else if(Config.appZipFile.length > 0 && Config.Program.length > 0 && Config.Program.substring(0 ,1) != "/"){
+            	}else if((Config.appZipFile.length > 0 || Config.lazyApp.length > 0) && Config.Program.length > 0 && Config.Program.substring(0 ,1) != "/"){
                 	params.push("-w");
                 	if (Config.appSubfolder.length > 0) {
                 		params.push(Config.appDirPrefix + "/" + Config.appSubfolder);                

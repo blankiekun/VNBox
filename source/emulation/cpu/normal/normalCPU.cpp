@@ -396,14 +396,40 @@ static bool hostHookMatches(KMemory* memory, U32 eip) {
 }
 
 #ifdef __EMSCRIPTEN__
-// boxedwineTextHook(eip, shiftJisBytes) on the page takes the line when defined.
-EM_JS(void, boxedwine_host_hook_js, (U32 eip, const U8* text, U32 len), {
+#include <emscripten.h>
+// The CPU that hit the hook, so JS called from the hook can read its guest memory.
+static thread_local CPU* hookCpu;
+
+// Synchronous guest-memory read for hook JS (the Frida-compat layer's readByteArray):
+// copies up to len readable bytes at guest address addr into buf, returns the count.
+extern "C" EMSCRIPTEN_KEEPALIVE U32 boxedwine_hook_read(U32 addr, U8* buf, U32 len) {
+    if (!hookCpu) return 0;
+    U32 n = 0;
+    while (n < len && hookCpu->memory->canRead(addr + n, 1)) {
+        buf[n] = hookCpu->memory->readb(addr + n);
+        n++;
+    }
+    return n;
+}
+
+// Runs on the thread that hit the hook: in the multi-threaded build that is the
+// guest thread's pthread worker, which never returns to its event loop, so the
+// line goes to the page over a BroadcastChannel (posting needs no event loop).
+// boxedwineTextHook(eip, shiftJisBytes, eax), when defined in this context, takes the line.
+EM_JS(void, boxedwine_host_hook_js, (U32 eip, U32 eax, const U8* text, U32 len), {
     var bytes = HEAPU8.slice(text, text + len);
     if (typeof boxedwineTextHook === "function") {
-        boxedwineTextHook(eip, bytes);
+        boxedwineTextHook(eip, bytes, eax);
         return;
     }
-    console.log("[texthook] " + eip.toString(16) + " " + JSON.stringify(new TextDecoder("shift_jis").decode(bytes)));
+    var buf = _malloc(16);
+    var n = _boxedwine_hook_read(eax, buf, 16);
+    var raw = Array.from(HEAPU8.subarray(buf, buf + n), function(b) { return b.toString(16).padStart(2, "0"); }).join("");
+    _free(buf);
+    var where = typeof window === "undefined" ? "worker" : "main";
+    if (!globalThis.boxedwineTextChannel) globalThis.boxedwineTextChannel = new BroadcastChannel("boxedwine-text");
+    globalThis.boxedwineTextChannel.postMessage({ eip: eip, bytes: bytes, where: where, eax: eax, raw: raw, t: performance.timeOrigin + performance.now() });
+    console.log("[texthook] " + where + " " + eip.toString(16) + " " + JSON.stringify(new TextDecoder("shift_jis").decode(bytes)));
 });
 #endif
 
@@ -434,6 +460,22 @@ static U32 cleanAlbatrossText(const U8* in, U32 len, U8* out) {
     return n;
 }
 
+#ifdef BOXEDWINE_JSPI_PROBE
+// JSPI probe: suspend the whole wasm stack (main module and any JIT block modules on it)
+// on a JS promise at each hooked line, then resume. Frames from runtime-built modules show
+// as wasm://wasm/<hash> in the stack; the main module's as boxedwine.wasm.
+EM_ASYNC_JS(int, boxedwine_jspi_probe, (), {
+    Error.stackTraceLimit = 1000;
+    var stack = new Error().stack.split("\n");
+    var jit = stack.filter(function(l) { return l.indexOf("wasm://wasm/") >= 0; }).length;
+    var main = stack.filter(function(l) { return l.indexOf("boxedwine.wasm") >= 0; }).length;
+    var t = performance.now();
+    await new Promise(function(r) { setTimeout(r, 5); });
+    console.log("[jspi] resumed after " + (performance.now() - t).toFixed(1) + " ms; frames on the suspended stack: jit modules " + jit + ", main module " + main + ", total " + stack.length);
+    return 1;
+});
+#endif
+
 static void OPCALL hostHookOp(CPU* cpu, DecodedOp* op) {
     if (!cpu->reg[5].u32) {
         U32 address = cpu->reg[0].u32;
@@ -442,15 +484,20 @@ static void OPCALL hostHookOp(CPU* cpu, DecodedOp* op) {
         while (len < sizeof(text) && cpu->memory->canRead(address + len, 1) && (text[len] = cpu->memory->readb(address + len))) {
             len++;
         }
-        static U8 last[4096];
-        static U32 lastLen = 0;
+        static thread_local U8 last[4096];
+        static thread_local U32 lastLen = 0;
         if (len != lastLen || memcmp(text, last, len)) { // the engine calls this again with the same line on redraws
             memcpy(last, text, len);
             lastLen = len;
             U8 clean[4096];
             U32 cleanLen = cleanAlbatrossText(text, len, clean);
 #ifdef __EMSCRIPTEN__
-            boxedwine_host_hook_js(cpu->seg[CS].address + cpu->eip.u32, clean, cleanLen);
+            hookCpu = cpu;
+            boxedwine_host_hook_js(cpu->seg[CS].address + cpu->eip.u32, address, clean, cleanLen);
+            hookCpu = nullptr;
+#ifdef BOXEDWINE_JSPI_PROBE
+            boxedwine_jspi_probe();
+#endif
 #else
             (void)cleanLen;
 #endif

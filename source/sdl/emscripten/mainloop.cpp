@@ -236,7 +236,25 @@ bool doMainLoop() {
 #endif
             //SDL.defaults.opaqueFrontBuffer = false;
     );
+#ifdef BOXEDWINE_JSPI_PROBE
+    // JSPI needs every entry into wasm that may suspend to be a promising export, which
+    // emscripten's main loop callback is not: drive mainloop from JS through one, never
+    // re-entering while a tick is suspended.
+    EM_ASM({
+        var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
+        var channel = new MessageChannel();
+        channel.port1.onmessage = function() { tick().then(function() { channel.port2.postMessage(0); }, function(e) { console.error("tick failed: " + e); }); };
+        channel.port2.postMessage(0);
+    });
+    emscripten_exit_with_live_runtime();
+#else
     emscripten_set_main_loop(mainloop, 0, 1);
+#endif
     return false;
 }
+#ifdef BOXEDWINE_JSPI_PROBE
+extern "C" EMSCRIPTEN_KEEPALIVE void boxedwine_tick() {
+    mainloop();
+}
+#endif
 #endif
