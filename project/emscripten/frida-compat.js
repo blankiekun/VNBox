@@ -6,6 +6,7 @@
 // URL: frida=<script url> loads that script (and its require()d libs) into the game process,
 // the one whose first loaded module is the exe named by p=. Lines the script sends go to
 // window.boxedwineText(line) when defined, and to the console.
+// Only same-origin blob: URLs and same-origin files under the folder above this page load (XSS guard).
 //
 // Covered: Interceptor.attach (onEnter), Breakpoint.add/remove, this.context.<x86 regs>,
 // args[i], ptr(), NativePointer arithmetic and reads (U8..U64, Pointer, ByteArray, CString,
@@ -371,16 +372,30 @@
     // Scripts get these as parameters: a global Module would clash with Emscripten's.
     const fridaGlobals = { NativePointer, ptr, NULL: ptr(0), Memory, Process, Module, Interceptor, Breakpoint, trans, hexdump };
     Object.assign(F, fridaGlobals);
-    F.test = { parsePattern, readTerminated, toU32 }; // for frida-compat.check.mjs
+    F.test = { parsePattern, readTerminated, toU32, scriptAllowed }; // for frida-compat.check.mjs
 
     // ---- loading the script ---------------------------------------------------------------------
     // require() shim: the script's relative requires are fetched up front, then evaluated
     // synchronously as CommonJS modules when the script runs.
     const sources = new Map(), cache = new Map();
+    // Scripts run with the page's origin, so only same-origin blob: URLs (made by the parent page)
+    // and files under the folder above this page (the embedding site's /vn/) are allowed.
+    function scriptAllowed(url, page) {
+        let u;
+        try { u = new URL(url); } catch (e) { return false; }
+        const pageUrl = new URL(page);
+        if (u.protocol === 'blob:') return u.origin === pageUrl.origin;
+        // servers decode %2F/%5C and then resolve .., so an encoded separator could leave the folder
+        if (/%2f|%5c/i.test(u.pathname)) return false;
+        return (u.protocol === 'https:' || u.protocol === 'http:') && u.origin === pageUrl.origin &&
+            u.href.startsWith(new URL('../', pageUrl).href);
+    }
     async function fetchTree(url) {
         if (sources.has(url)) return;
+        if (!scriptAllowed(url, location.href)) throw new Error('frida: script URL refused (not same-origin blob: or under ../): ' + url);
         const res = await fetch(url);
         if (!res.ok) throw new Error('frida: ' + url + ': HTTP ' + res.status);
+        if (res.redirected && !scriptAllowed(res.url, location.href)) throw new Error('frida: script redirected off the allowed paths: ' + res.url);
         const text = await res.text();
         sources.set(url, text);
         const deps = [...text.matchAll(/require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)/g)].map((m) => new URL(m[1], url).href);
