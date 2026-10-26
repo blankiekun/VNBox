@@ -253,7 +253,7 @@ bool doMainLoop() {
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
-        var next = function() { tick().then(function(delay) { if (delay < 0) channel.port2.postMessage(0); else setTimeout(next, delay); }, function(e) { console.error("tick failed: " + e); }); };
+        var next = function() { tick().then(function(delay) { if (delay < 0) channel.port2.postMessage(0); else setTimeout(next, delay); }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", e); else console.error("tick failed: " + e); }); };
         channel.port1.onmessage = next;
         next();
     });

@@ -276,8 +276,15 @@
         try {
             l.onEnter.call(invocation, args);
         } catch (e) {
-            console.error('[frida] hook ' + ptr(l.address) + ': ' + (e && e.stack || e));
+            const message = 'hook ' + ptr(l.address) + ': ' + (e && e.stack || e);
+            if (l.reported) console.error('[frida] ' + message); else report(message);
+            l.reported = true;
         }
+    }
+
+    // console, and the parent page when lazyfs.js (vnboxReport) is loaded
+    function report(message) {
+        if (typeof vnboxReport === 'function') vnboxReport('frida', message); else console.error('[frida] ' + message);
     }
 
     // ---- trans (dc00 libLoader.js, MIT: joins a hook's fragments into lines) ----------------------
@@ -423,21 +430,32 @@
     const params = typeof location === 'undefined' ? null : new URLSearchParams(location.search);
     const scriptUrl = params && params.get('frida') ? new URL(params.get('frida'), location.href).href : null;
     const exe = lower(params && (params.get('p') || '').split(/[\\/]/).pop());
-    let loaded = false, attached = false, phase = 0, seenAt = 0;
-    if (scriptUrl) fetchTree(scriptUrl).then(() => { loaded = true; }, (e) => console.error(e));
+    // attachedPid: the process the script runs in; a new process of the exe (the game restarted)
+    // gets it again. candidate: the process being prepared, otherPids: processes of other exes.
+    let loaded = false, attachedPid = 0, candidate = 0, phase = 0, seenAt = 0;
+    const otherPids = new Set(), copy0 = trans._copy;
+    if (scriptUrl) fetchTree(scriptUrl).then(() => { loaded = true; }, (e) => report('loading ' + scriptUrl + ': ' + (e && e.message || e)));
 
     // From C every 1024 syscalls, on the guest thread of process pid. 0: nothing, 2: load the
     // ranges asked for with prefetch and poll again, 1: load them and attach.
     function poll(pid, tid, teb) {
-        if (!loaded || attached || !teb) return 0;
-        F.pid = pid;
+        if (!loaded || pid === attachedPid || otherPids.has(pid) || !teb) return 0;
+        F.pid = pid; // for the reads below; hits keep going to attachedPid's hooks
+        try {
+            return pollProcess(pid, teb);
+        } finally {
+            F.pid = attachedPid;
+        }
+    }
+    function pollProcess(pid, teb) {
         let mods;
         try { mods = modulesOf(teb); } catch (e) { return 0; }
-        if (!mods.length || lower(mods[0].name) !== exe) return 0;
+        if (!mods.length) return 0;
+        if (lower(mods[0].name) !== exe) { otherPids.add(pid); return 0; }
         // shortcut: attach 2 s after the exe shows up, like attaching to a running process; scripts
         // that hook a DLL loaded later need a wait or a retry (dc00's do it themselves where needed)
         const now = performance.now();
-        if (!seenAt) seenAt = now;
+        if (candidate !== pid) { candidate = pid; seenAt = now; phase = 0; }
         if (now - seenAt < 2000) return 0;
         if (phase === 0) { // the main module whole and every module's headers
             phase = 1;
@@ -456,7 +474,14 @@
     }
 
     function attach(pid, tid, teb) {
-        attached = true;
+        if (attachedPid) { // a new process of the exe: drop the old one's hooks and run the script afresh
+            console.log('[frida] re-attach: pid ' + attachedPid + ' -> ' + pid);
+            Interceptor.detachAll();
+            cache.clear();
+            trans._copy = copy0;
+        }
+        attachedPid = pid;
+        candidate = 0;
         Object.assign(F, { pid, tid, teb });
         const main = modulesOf(teb)[0];
         // self-check of the C scan and pattern parsing on the exe's DOS header
@@ -468,7 +493,7 @@
         try {
             evaluate(scriptUrl);
         } catch (e) {
-            console.error('[frida] script failed: ' + (e && e.stack || e));
+            report('script failed: ' + (e && e.stack || e));
         }
     }
 })();
