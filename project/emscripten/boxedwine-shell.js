@@ -213,6 +213,8 @@
                 console.log("setting storage key to: " + (key || "default"));
             } else if (Config.appZipFile.length > 0) {
                 key = "app/" + encodeURIComponent(decodeUrlValue(Config.appZipFile));
+            } else if (Config.lazyApp.length > 0) {
+                key = "lazy/" + encodeURIComponent(Config.lazyApp);
             } else if (Config.extraZipFiles.length > 0) {
                 key = "overlay/" + Config.extraZipFiles.map(function(name) {
                     return encodeURIComponent(decodeUrlValue(name));
@@ -782,10 +784,21 @@
       			}
 			});
 		}
+        function getLazyAppMount() { // per game: also names the IndexedDB database of its saves
+            return LAZY_APP_MOUNT + "/" + encodeURIComponent(Config.lazyApp);
+        }
+        // jspi builds read zips on demand from an OPFS copy (lazyfs.js); others load them whole.
+        function loadZipFile(pathPrefix, filename, callback) {
+            if (typeof boxedwineJspiReads === "undefined" || new URLSearchParams(location.search).has("wholezips")) { // wholezips: compare
+                loadFile(pathPrefix, filename, (bytes) => { createFile("/", filename, bytes); callback(); });
+                return;
+            }
+            lazyAddCachedFile("/", filename, pathPrefix + filename).then(callback, (e) => console.log("Unable to load:" + filename + " error:" + e));
+        }
         function buildAppFileSystem(callback) {
             if (Config.lazyApp.startsWith("opfs:")) {
                 let path = Config.lazyApp.substring(5), name = path.split("/").filter(Boolean).pop();
-                mountLazyApp(LAZY_APP_MOUNT, name, lazyOpfsDir(path)).then(() => {
+                mountLazyApp(getLazyAppMount(), name, lazyOpfsDir(path)).then(() => {
                     Config.appSubfolder = name;
                     callback();
                 }, (e) => console.log("Unable to mount lazy game folder " + path + ": " + e));
@@ -1017,8 +1030,7 @@
             	callback();
             }else if(Config.extraZipFiles.length > 0){
                 for(let i = 0; i < Config.extraZipFiles.length; i++) {
-                    loadFile(Config.locateOverlayBaseUrl, Config.extraZipFiles[i], (uint8Array) => {
-                    	createFile("/", Config.extraZipFiles[i], uint8Array);
+                    loadZipFile(Config.locateOverlayBaseUrl, Config.extraZipFiles[i], () => {
                     	extraFSs.push(Config.extraZipFiles[i]);
                     	if(extraFSs.length == Config.extraZipFiles.length) {
             				callback();
@@ -1222,8 +1234,7 @@
                         showLoadingStartButton("Loading...");
                         buildExtraFileSystems(() => {
                             buildAppFileSystem(() => {
-                                loadFile(Config.locateRootBaseUrl, Config.rootZipFile, (rootZipfileBytes) => {
-                                    createFile("/", Config.rootZipFile, rootZipfileBytes);
+                                loadZipFile(Config.locateRootBaseUrl, Config.rootZipFile, () => {
                                     buildBrowserFileSystem();
                                 });
                             });
@@ -1899,7 +1910,7 @@
     			params.push(Config.appDirPrefix);          
 			} else if (Config.lazyApp.length > 0) { // -mount /lazyapp "/home/username/files/"
     			params.push("-mount");
-    			params.push(LAZY_APP_MOUNT);
+    			params.push(getLazyAppMount());
     			params.push(Config.appDirPrefix);
 			} else if (Config.appPayload.length > 0){ // -mount "app.zip" "/home/username/files/" 			
     			params.push("-mount");

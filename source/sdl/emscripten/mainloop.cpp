@@ -94,6 +94,9 @@ void waitForProcessToFinish(const std::shared_ptr<KProcess>& process, KThread* t
 static U32 lastTitleUpdate = 0;
 static int mainLoopTimingMode = -1;
 static int mainLoopTimingValue = -1;
+#ifdef BOXEDWINE_JSPI
+static int jspiTickDelay = -1; // what boxedwine_tick returns: ms to wait before the next tick, -1 = next message
+#endif
 
 static void updateMainLoopTiming(bool idle) {
     int mode = EM_TIMING_SETTIMEOUT;
@@ -120,6 +123,12 @@ static void updateMainLoopTiming(bool idle) {
             }
         }
     }
+#ifdef BOXEDWINE_JSPI
+    jspiTickDelay = mode == EM_TIMING_SETTIMEOUT ? value : -1;
+    mainLoopTimingMode = mode;
+    mainLoopTimingValue = value;
+    return;
+#endif
     if (mode != mainLoopTimingMode || (mode == EM_TIMING_SETTIMEOUT && value != mainLoopTimingValue)) {
         emscripten_set_main_loop_timing(mode, mode == EM_TIMING_SETTIMEOUT ? value : 0);
         mainLoopTimingMode = mode;
@@ -236,15 +245,17 @@ bool doMainLoop() {
 #endif
             //SDL.defaults.opaqueFrontBuffer = false;
     );
-#ifdef BOXEDWINE_JSPI_PROBE
+#ifdef BOXEDWINE_JSPI
     // JSPI needs every entry into wasm that may suspend to be a promising export, which
     // emscripten's main loop callback is not: drive mainloop from JS through one, never
-    // re-entering while a tick is suspended.
+    // re-entering while a tick is suspended, paced like updateMainLoopTiming paces
+    // emscripten's loop (a message while the guest has work, a timeout while it sleeps).
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
-        channel.port1.onmessage = function() { tick().then(function() { channel.port2.postMessage(0); }, function(e) { console.error("tick failed: " + e); }); };
-        channel.port2.postMessage(0);
+        var next = function() { tick().then(function(delay) { if (delay < 0) channel.port2.postMessage(0); else setTimeout(next, delay); }, function(e) { console.error("tick failed: " + e); }); };
+        channel.port1.onmessage = next;
+        next();
     });
     emscripten_exit_with_live_runtime();
 #else
@@ -252,9 +263,10 @@ bool doMainLoop() {
 #endif
     return false;
 }
-#ifdef BOXEDWINE_JSPI_PROBE
-extern "C" EMSCRIPTEN_KEEPALIVE void boxedwine_tick() {
+#ifdef BOXEDWINE_JSPI
+extern "C" EMSCRIPTEN_KEEPALIVE int boxedwine_tick() {
     mainloop();
+    return jspiTickDelay;
 }
 #endif
 #endif

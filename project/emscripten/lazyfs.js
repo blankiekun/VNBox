@@ -11,11 +11,17 @@
 //   stack on an async File read on the main thread. No worker, no isolation.
 // Only the block read knows the source: an HTTP backend (ranged fetch over nginx autoindex
 // JSON listings) would replace the listing and the block read and keep the rest.
-// shortcut: writes to existing game files fail (EACCES), new files stay in memory; route
-// writes to IDBFS/OPFS before saves matter.
+// Writes: the tree is built inside an IDBFS mount (autoPersist), one IndexedDB database per
+// game, next to the Wine prefix's. Files up to LAZY_EAGER_MAX are read whole at mount and are
+// plain MEMFS files, so the game's saves (save/rssave.dat) and new files work as usual and
+// persist on close; files restored from IndexedDB win over the folder's (copy-on-write).
+// Untouched game files are kept out of IndexedDB (lazyPristine, see lazyMountOverlay).
+// shortcut: writes to files over LAZY_EAGER_MAX fail (EACCES) and deleting a game file comes
+// back on reload; add a whole-file copy-up and a deleted list if a game needs either.
 var LAZY_BLOCK = 1 << 16;
+var LAZY_EAGER_MAX = 1 << 20;
 var LAZY_CACHE_BLOCKS = 64;
-var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, waitMs: 0, files: 0, mode: "" };
+var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, waitMs: 0, files: 0, mode: "", overlay: 0 };
 window.__lazyStats = lazyStats;
 var lazyCache = new Map(); // "file:block" → Uint8Array, insertion order = LRU order
 var lazyFiles = []; // jspi mode: File objects by index
@@ -91,12 +97,24 @@ async function lazyReadvAsync(stream, iov, iovcnt, offset) {
     return total;
 }
 
+// A small game file as a plain writable MEMFS file; the first write or truncate makes it the
+// game's own copy, which IDBFS then persists.
+function lazyAddEagerFile(parent, fileName, bytes) {
+    FS.createDataFile(parent, fileName, bytes, true, true, true);
+    var node = FS.lookupPath(parent + "/" + fileName).node;
+    node.lazyPristine = true;
+    var write = node.stream_ops.write, setattr = node.node_ops.setattr;
+    node.stream_ops.write = (stream, ...a) => (delete stream.node.lazyPristine, write(stream, ...a));
+    node.node_ops = Object.assign({}, node.node_ops, { setattr: (n, attr) => (attr.size !== undefined && delete n.lazyPristine, setattr(n, attr)) });
+}
+
 function lazyAddFile(parent, fileName, index, size, readSync) {
     var node = FS.createFile(parent, fileName, {}, true, false);
+    node.lazyPristine = true;
     node.lazyFile = index;
     node.lazySize = size;
     node.lazyAsync = !readSync;
-    Object.defineProperty(node, "usedBytes", { get: function() { return this.lazySize; } }); // MEMFS getattr/llseek read it
+    Object.defineProperty(node, "usedBytes", { configurable: true, get: function() { return this.lazySize; } }); // MEMFS getattr/llseek read it
     var read = readSync || (() => { throw new Error("lazy file read outside fd_read/fd_pread in jspi mode"); });
     var ops = Object.assign({}, node.stream_ops);
     ops.read = (stream, buffer, offset, length, position) => read(stream.node, buffer, offset, length, position);
@@ -111,21 +129,65 @@ function lazyAddFile(parent, fileName, index, size, readSync) {
     node.stream_ops = ops;
 }
 
+// jspi mode: fetches url into the origin private file system once (lazyfs-cache/), then adds
+// it at dir/name as a lazy node read from there, so a root or overlay zip stays out of the JS heap.
+// shortcut: the cached copy is kept by name; a zip changed on the server needs a new name.
+async function lazyAddCachedFile(dir, name, url) {
+    var cache = await (await navigator.storage.getDirectory()).getDirectoryHandle("lazyfs-cache", { create: true });
+    var cacheName = encodeURIComponent(name), file = null;
+    try { file = await (await cache.getFileHandle(cacheName)).getFile(); } catch (e) { }
+    if (!file || !file.size) { // an interrupted download leaves the file empty
+        var response = await fetch(url);
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        var handle = await cache.getFileHandle(cacheName, { create: true });
+        await response.body.pipeTo(await handle.createWritable());
+        file = await handle.getFile();
+    }
+    lazyAddFile(dir, name, lazyFiles.length, file.size, null);
+    lazyFiles.push(file);
+}
+
 function lazyBuildTree(root, entries, readSync) {
     FS.mkdirTree(root);
     entries.forEach(entry => {
         var path = root + "/" + entry.path;
         if (entry.dir) { FS.mkdirTree(path); return; }
-        var slash = path.lastIndexOf("/");
-        lazyAddFile(path.substring(0, slash), path.substring(slash + 1), entry.file, entry.size, readSync);
+        var slash = path.lastIndexOf("/"), parent = path.substring(0, slash), fileName = path.substring(slash + 1);
         lazyStats.files++;
+        if (FS.analyzePath(path).exists) { lazyStats.overlay++; return; } // the game's own copy from IndexedDB
+        if (entry.size <= LAZY_EAGER_MAX) {
+            var bytes = entry.bytes || new Uint8Array(entry.size);
+            if (!entry.bytes) readSync({ lazyFile: entry.file, lazySize: entry.size }, bytes, 0, entry.size, 0); // sab mode
+            lazyAddEagerFile(parent, fileName, bytes);
+            return;
+        }
+        lazyAddFile(parent, fileName, entry.file, entry.size, readSync);
     });
-    console.log("Lazy game folder " + root + " (" + lazyStats.mode + "): " + lazyStats.files + " files listed");
+    console.log("Lazy game folder " + root + " (" + lazyStats.mode + "): " + lazyStats.files + " files listed, " + lazyStats.overlay + " from the saved overlay");
 }
 
+// Mounts IDBFS (database named after mountPoint) and loads the game's saved files into it.
+function lazyMountOverlay(mountPoint) {
+    if (!IDBFS.lazyFiltered) { // persist only files the game wrote, not the folder's own
+        var getLocalSet = IDBFS.getLocalSet;
+        IDBFS.getLocalSet = (mount, callback) => getLocalSet(mount, (err, set) => {
+            if (set && mount.mountpoint.startsWith(LAZY_APP_MOUNT_ROOT)) {
+                for (var path in set.entries) if ((FS.analyzePath(path).object || {}).lazyPristine) delete set.entries[path];
+            }
+            callback(err, set);
+        });
+        IDBFS.lazyFiltered = true;
+    }
+    FS.mkdirTree(mountPoint);
+    var mount = FS.mount(IDBFS, { autoPersist: true }, mountPoint).mount;
+    return new Promise((resolve, reject) => IDBFS.syncfs(mount, true, err => err ? reject(err) : resolve()));
+}
+
+var LAZY_APP_MOUNT_ROOT = "/lazyapp/";
 function mountLazyApp(mountPoint, name, dirHandle) {
     lazyStats.mode = typeof boxedwineJspiReads !== "undefined" ? "jspi" : "sab";
-    return lazyStats.mode === "jspi" ? mountLazyAppJspi(mountPoint, name, dirHandle) : mountLazyAppSab(mountPoint, name, dirHandle);
+    return lazyMountOverlay(mountPoint).then(() =>
+        lazyStats.mode === "jspi" ? mountLazyAppJspi(mountPoint, name, dirHandle) : mountLazyAppSab(mountPoint, name, dirHandle));
 }
 
 async function mountLazyAppJspi(mountPoint, name, dirHandle) {
@@ -138,7 +200,7 @@ async function mountLazyAppJspi(mountPoint, name, dirHandle) {
                 await walk(h, path + "/");
             } else {
                 var f = await h.getFile();
-                entries.push({ path: path, file: lazyFiles.length, size: f.size });
+                entries.push({ path: path, file: lazyFiles.length, size: f.size, bytes: f.size <= LAZY_EAGER_MAX ? new Uint8Array(await f.arrayBuffer()) : null });
                 lazyFiles.push(f);
             }
         }
