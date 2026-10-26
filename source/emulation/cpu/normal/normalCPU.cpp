@@ -365,143 +365,207 @@ static void OPCALL normalDispatch(CPU* cpu, DecodedOp* op) {
 }
 #endif
 
-// Host-side text hooks: the instruction at a hooked guest address is decoded as
-// its own one-op block whose head (inst Custom1, so normalDispatch calls pfn)
-// reports the text to JS and then runs the real instruction. Blocks end before
-// a hooked address (CPU::shouldContinue), so neither the interpreter nor the
-// wasm JIT can run through it; the head is marked NO_JIT.
-// shortcut: one hard-coded hook (信天翁航海録 "DialogueHook", dc00 pattern
-// e8 ?? ?? ?? ?? 8b b4, text in eax, skipped while ebp != 0); a runtime table
-// comes with the Frida-compat layer (milestone 3).
-struct HostHook { U32 eip; U8 bytes[7]; };
-static const HostHook hostHooks[] = { {0x41d7f1, {0xe8, 0xda, 0xfe, 0xff, 0xff, 0x8b, 0xb4}} };
-
-bool hostHookAt(U32 eip) {
-    for (const HostHook& h : hostHooks) {
-        if (h.eip == eip) return true;
-    }
-    return false;
-}
-
-// The same address in another process (Wine's own exes also load at 0x400000)
-// is not the game's code: only hook when the bytes match.
-static bool hostHookMatches(KMemory* memory, U32 eip) {
-    for (const HostHook& h : hostHooks) {
-        if (h.eip != eip || !memory->canRead(eip, sizeof(h.bytes))) continue;
-        U32 i = 0;
-        while (i < sizeof(h.bytes) && memory->readb(eip + i) == h.bytes[i]) i++;
-        if (i == sizeof(h.bytes)) return true;
-    }
-    return false;
-}
-
+// Host-side hooks for the Frida-compat layer (project/emscripten/frida-compat.js).
+// The instruction at a hooked guest address is decoded as its own one-op block
+// whose head (inst Custom1, so normalDispatch calls pfn) calls JS with the guest
+// paused and then runs the real instruction. Blocks end before a hooked address
+// (CPU::shouldContinue), so neither the interpreter nor the wasm JIT can run
+// through it; the head is marked NO_JIT. Hooks are per process (the same address
+// in Wine's own exes is not the game's code).
+//
+// JS may only read memory that is already RAM: a not-yet-loaded file page loads
+// through the Emscripten FS, which in the JSPI build may suspend, and wasm can't
+// suspend under JS frames. So the layer asks for file pages it needs (module
+// headers, the main module) to be loaded at attach time, from a syscall where
+// the stack is wasm only.
+#include "../../softmmu/soft_mmu.h"
+#include "../../softmmu/soft_ram.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
-// The CPU that hit the hook, so JS called from the hook can read its guest memory.
-static thread_local CPU* hookCpu;
-
-// Synchronous guest-memory read for hook JS (the Frida-compat layer's readByteArray):
-// copies up to len readable bytes at guest address addr into buf, returns the count.
-extern "C" EMSCRIPTEN_KEEPALIVE U32 boxedwine_hook_read(U32 addr, U8* buf, U32 len) {
-    if (!hookCpu) return 0;
-    U32 n = 0;
-    while (n < len && hookCpu->memory->canRead(addr + n, 1)) {
-        buf[n] = hookCpu->memory->readb(addr + n);
-        n++;
-    }
-    return n;
-}
-
-// Runs on the thread that hit the hook: in the multi-threaded build that is the
-// guest thread's pthread worker, which never returns to its event loop, so the
-// line goes to the page over a BroadcastChannel (posting needs no event loop).
-// boxedwineTextHook(eip, shiftJisBytes, eax), when defined in this context, takes the line.
-EM_JS(void, boxedwine_host_hook_js, (U32 eip, U32 eax, const U8* text, U32 len), {
-    var bytes = HEAPU8.slice(text, text + len);
-    if (typeof boxedwineTextHook === "function") {
-        boxedwineTextHook(eip, bytes, eax);
-        return;
-    }
-    var buf = _malloc(16);
-    var n = _boxedwine_hook_read(eax, buf, 16);
-    var raw = Array.from(HEAPU8.subarray(buf, buf + n), function(b) { return b.toString(16).padStart(2, "0"); }).join("");
-    _free(buf);
-    var where = typeof window === "undefined" ? "worker" : "main";
-    if (!globalThis.boxedwineTextChannel) globalThis.boxedwineTextChannel = new BroadcastChannel("boxedwine-text");
-    globalThis.boxedwineTextChannel.postMessage({ eip: eip, bytes: bytes, where: where, eax: eax, raw: raw, t: performance.timeOrigin + performance.now() });
-    console.log("[texthook] " + where + " " + eip.toString(16) + " " + JSON.stringify(new TextDecoder("shift_jis").decode(bytes)));
-});
+#else
+#define EMSCRIPTEN_KEEPALIVE
 #endif
 
-// The engine's markup, as dc00's PC_Albatross_Koukairoku.js cleans it: ^dNN
-// dropped, ^n is a line break, | and [ruby] dropped. Shift-JIS trail bytes can
-// look like ASCII, so lead bytes take their trail byte with them.
-static U32 cleanAlbatrossText(const U8* in, U32 len, U8* out) {
-    U32 n = 0;
-    for (U32 i = 0; i < len; i++) {
-        U8 c = in[i];
-        if (((c >= 0x81 && c <= 0x9f) || (c >= 0xe0 && c <= 0xfc)) && i + 1 < len) {
-            out[n++] = c;
-            out[n++] = in[++i];
-        } else if (c == '^' && i + 1 < len && in[i + 1] == 'd') {
-            i++;
-            while (i + 1 < len && in[i + 1] >= '0' && in[i + 1] <= '9') i++;
-        } else if (c == '^' && i + 1 < len && in[i + 1] == 'n') {
-            i++;
-            while (i + 1 < len && (in[i + 1] == ' ' || in[i + 1] == '\t' || in[i + 1] == '\r' || in[i + 1] == '\n')) i++;
-            out[n++] = '\n';
-        } else if (c == '[') {
-            i++;
-            while (i < len && in[i] != ']') i += ((in[i] >= 0x81 && in[i] <= 0x9f) || (in[i] >= 0xe0 && in[i] <= 0xfc)) ? 2 : 1;
-        } else if (c != '|') {
-            out[n++] = c;
+struct HostHook { U32 id; U32 pid; U32 eip; };
+static std::vector<HostHook> hostHooks;
+static std::vector<HostHook> hostHookChanges; // added or removed, code at eip not yet invalidated
+static std::vector<std::pair<U32, U32>> hostHookPrefetch; // [address, size) to load before attach
+static U32 nextHostHookId = 1;
+
+static bool findHostHook(U32 pid, U32 eip, U32* id) {
+    for (const HostHook& h : hostHooks) {
+        if (h.eip == eip && h.pid == pid) {
+            if (id) *id = h.id;
+            return true;
         }
     }
+    return false;
+}
+
+bool hostHookAt(CPU* cpu, U32 eip) {
+    return !hostHooks.empty() && findHostHook(cpu->thread->process->id, eip, nullptr);
+}
+
+static KMemory* hostHookMemory(U32 pid) {
+    KProcessPtr process = KSystem::getProcess(pid);
+    return process ? process->memory : nullptr;
+}
+
+// Guest page as host RAM, or null when unreadable or not loaded (never loads anything).
+static const U8* hostHookPage(KMemory* memory, U32 page) {
+    if (page >= K_NUMBER_OF_PAGES) return nullptr;
+    MMU& mmu = getMemData(memory)->mmu[page];
+    return mmu.canReadRam ? ramPageGet((RamPage)mmu.ramIndex) : nullptr;
+}
+
+static thread_local CPU* hookCpu; // the CPU that hit the hook, while JS runs
+
+// Copies the readable prefix of guest [addr, addr + len) into buf, returns its length.
+extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_read(U32 pid, U32 addr, U8* buf, U32 len) {
+    KMemory* memory = hostHookMemory(pid);
+    U32 n = 0;
+    while (memory && n < len) {
+        U32 a = addr + n;
+        if (a < addr) break; // wrapped
+        const U8* page = hostHookPage(memory, a >> K_PAGE_SHIFT);
+        if (!page) break;
+        U32 chunk = std::min(len - n, K_PAGE_SIZE - (a & K_PAGE_MASK));
+        ::memcpy(buf + n, page + (a & K_PAGE_MASK), chunk);
+        n += chunk;
+    }
     return n;
 }
 
-#ifdef BOXEDWINE_JSPI_PROBE
-// JSPI probe: suspend the whole wasm stack (main module and any JIT block modules on it)
-// on a JS promise at each hooked line, then resume. Frames from runtime-built modules show
-// as wasm://wasm/<hash> in the stack; the main module's as boxedwine.wasm.
-EM_ASYNC_JS(int, boxedwine_jspi_probe, (), {
-    Error.stackTraceLimit = 1000;
-    var stack = new Error().stack.split("\n");
-    var jit = stack.filter(function(l) { return l.indexOf("wasm://wasm/") >= 0; }).length;
-    var main = stack.filter(function(l) { return l.indexOf("boxedwine.wasm") >= 0; }).length;
-    var t = performance.now();
-    await new Promise(function(r) { setTimeout(r, 5); });
-    console.log("[jspi] resumed after " + (performance.now() - t).toFixed(1) + " ms; frames on the suspended stack: jit modules " + jit + ", main module " + main + ", total " + stack.length);
-    return 1;
+// Frida's Memory.scanSync: addresses in [addr, addr + size) where (byte & mask[i]) == pat[i]
+// (pat already masked). Unreadable pages never match. Stores up to maxOut, returns the count.
+extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_scan(U32 pid, U32 addr, U32 size, const U8* pat, const U8* mask, U32 patLen, U32* out, U32 maxOut) {
+    KMemory* memory = hostHookMemory(pid);
+    if (!memory || !patLen) return 0;
+    U64 end = std::min((U64)addr + size, (U64)0x100000000ull);
+    U32 count = 0;
+    U32 cachedPage = 0xFFFFFFFF;
+    const U8* cached = nullptr;
+    auto byteAt = [&](U32 a, bool& ok) -> U8 {
+        if ((a >> K_PAGE_SHIFT) != cachedPage) {
+            cachedPage = a >> K_PAGE_SHIFT;
+            cached = hostHookPage(memory, cachedPage);
+        }
+        ok = cached != nullptr;
+        return ok ? cached[a & K_PAGE_MASK] : 0;
+    };
+    for (U64 a = addr; a + patLen <= end; a++) {
+        U32 i = 0;
+        bool ok = true;
+        for (; i < patLen; i++) {
+            U8 b = byteAt((U32)(a + i), ok);
+            if (!ok || (b & mask[i]) != pat[i]) break;
+        }
+        if (i == patLen) {
+            if (count < maxOut) out[count] = (U32)a;
+            count++;
+        } else if (!ok && i == 0) {
+            a = ((a >> K_PAGE_SHIFT) + 1) * K_PAGE_SIZE - 1; // skip the unreadable page
+        }
+    }
+    return count;
+}
+
+// Registers of the CPU that hit the hook: 0-7 eax ecx edx ebx esp ebp esi edi, 8 eip.
+extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_reg(U32 i) {
+    if (!hookCpu || i > 8) return 0;
+    return i == 8 ? hookCpu->seg[CS].address + hookCpu->eip.u32 : hookCpu->reg[i].u32;
+}
+
+// Writes one of the general registers (0-7); eip can't be changed from a hook.
+extern "C" EMSCRIPTEN_KEEPALIVE void bw_set_reg(U32 i, U32 value) {
+    if (hookCpu && i < 8) hookCpu->reg[i].u32 = value;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_hook_add(U32 pid, U32 eip) {
+    HostHook h = { nextHostHookId++, pid, eip };
+    hostHooks.push_back(h);
+    hostHookChanges.push_back(h);
+    return h.id;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void bw_hook_remove(U32 id) {
+    for (auto it = hostHooks.begin(); it != hostHooks.end(); ++it) {
+        if (it->id == id) {
+            hostHookChanges.push_back(*it);
+            hostHooks.erase(it);
+            return;
+        }
+    }
+}
+
+// Asks for the file pages in [addr, addr + size) to be loaded before the next poll or attach.
+extern "C" EMSCRIPTEN_KEEPALIVE void bw_prefetch(U32 addr, U32 size) {
+    hostHookPrefetch.push_back({ addr, size });
+}
+
+#ifdef __EMSCRIPTEN__
+// window.boxedwineFrida (frida-compat.js) gets the exports on its first poll.
+// 0: nothing to do, 1: load the prefetch ranges then attach, 2: load them then poll again.
+EM_JS(int, boxedwine_frida_poll, (U32 pid, U32 tid, U32 teb), {
+    var f = globalThis.boxedwineFrida;
+    if (!f) return 0;
+    if (!f.api) f.api = {read: _bw_read, scan: _bw_scan, reg: _bw_reg, setReg: _bw_set_reg, hookAdd: _bw_hook_add, hookRemove: _bw_hook_remove, prefetch: _bw_prefetch, malloc: _malloc, free: _free, heap: function() { return HEAPU8; }};
+    return f.poll(pid, tid, teb);
+});
+EM_JS(void, boxedwine_frida_attach, (U32 pid, U32 tid, U32 teb), {
+    globalThis.boxedwineFrida.attach(pid, tid, teb);
+});
+EM_JS(void, boxedwine_frida_hit, (U32 id, U32 pid, U32 tid), {
+    globalThis.boxedwineFrida.hit(id, pid, tid);
 });
 #endif
+
+// Called at the start of every syscall, on the guest thread: the stack below is wasm only,
+// so loading file pages (which may suspend on a lazy game file) is safe here.
+void hostHookSyscall(KThread* thread) {
+#ifdef __EMSCRIPTEN__
+    U32 pid = thread->process->id;
+    for (size_t i = 0; i < hostHookChanges.size();) {
+        if (hostHookChanges[i].pid == pid) {
+            thread->memory->removeCode(thread, hostHookChanges[i].eip, 1, false);
+            hostHookChanges.erase(hostHookChanges.begin() + i);
+        } else {
+            i++;
+        }
+    }
+    static U32 count;
+    if (++count % 1024) return;
+    U32 teb = thread->cpu->seg[FS].address;
+    for (int round = 0; round < 4; round++) {
+        int r = boxedwine_frida_poll(pid, thread->id, teb);
+        for (auto& range : hostHookPrefetch) {
+            U32 first = range.first >> K_PAGE_SHIFT;
+            U32 last = (U32)(std::min((U64)range.first + range.second, (U64)0x100000000ull) - 1) >> K_PAGE_SHIFT;
+            for (U32 page = first; range.second && page <= last && page < K_NUMBER_OF_PAGES; page++) {
+                MMU& mmu = getMemData(thread->memory)->mmu[page];
+                if (mmu.getPageType() == PageType::File && thread->memory->canRead(page)) {
+                    thread->memory->readb(page << K_PAGE_SHIFT); // loads the page
+                }
+            }
+        }
+        hostHookPrefetch.clear();
+        if (r == 1) {
+            boxedwine_frida_attach(pid, thread->id, teb);
+            hostHookSyscall(thread); // invalidate what the script hooked
+        }
+        if (r != 2) return;
+    }
+#endif
+}
 
 static void OPCALL hostHookOp(CPU* cpu, DecodedOp* op) {
-    if (!cpu->reg[5].u32) {
-        U32 address = cpu->reg[0].u32;
-        U8 text[4096];
-        U32 len = 0;
-        while (len < sizeof(text) && cpu->memory->canRead(address + len, 1) && (text[len] = cpu->memory->readb(address + len))) {
-            len++;
-        }
-        static thread_local U8 last[4096];
-        static thread_local U32 lastLen = 0;
-        if (len != lastLen || memcmp(text, last, len)) { // the engine calls this again with the same line on redraws
-            memcpy(last, text, len);
-            lastLen = len;
-            U8 clean[4096];
-            U32 cleanLen = cleanAlbatrossText(text, len, clean);
+    U32 id;
+    if (findHostHook(cpu->thread->process->id, cpu->seg[CS].address + cpu->eip.u32, &id)) {
 #ifdef __EMSCRIPTEN__
-            hookCpu = cpu;
-            boxedwine_host_hook_js(cpu->seg[CS].address + cpu->eip.u32, address, clean, cleanLen);
-            hookCpu = nullptr;
-#ifdef BOXEDWINE_JSPI_PROBE
-            boxedwine_jspi_probe();
+        hookCpu = cpu;
+        boxedwine_frida_hit(id, cpu->thread->process->id, cpu->thread->id);
+        hookCpu = nullptr;
 #endif
-#else
-            (void)cleanLen;
-#endif
-        }
     }
     DecodedOp* real = reinterpret_cast<DecodedOp*>(op->data.nextJump);
 #if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT)
@@ -593,13 +657,13 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                 U32 eipLen = 0;
                 U32 address = startIp;
 
-                bool hooked = hostHookMatches(memory, startIp);
+                bool hooked = hostHookAt(this, startIp);
                 op = decodeBlock(this, startIp, this->isBig(), opCount, eipLen, hooked ? 0 : 0xFFFFFFFF);
                 if (!op) {
                     return nullptr;
                 }
                 if (hooked) {
-                    // shortcut: the real op is not in the cache, so it leaks when this code is invalidated; fine for one hook.
+                    // shortcut: the real op is not in the cache, so it leaks when this code is invalidated; fine for a few hooks.
                     op->pfn = getFunctionForOp(op);
                     DecodedOp* head = DecodedOp::alloc();
                     head->inst = Custom1;
