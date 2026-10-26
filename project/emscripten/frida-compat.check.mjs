@@ -38,3 +38,10 @@ for (const bad of ['blob:https://evil.org/1234', 'https://evil.org/vn/a.js', 'ht
     'https://ex.org/vn/../a.js', 'https://ex.org/vn/%2e%2e/a.js', 'data:text/javascript,alert(1)', 'javascript:alert(1)', 'http://ex.org/vn/a.js', '//evil.org/vn/a.js', 'https://ex.org/vn/..%2Fcalibre/a.js', 'https://ex.org/vn/..%5ca.js'])
     assert.ok(!F.test.scriptAllowed(bad, page), bad);
 console.log('frida-compat url guard ok');
+// chimimouryou: page /vn/vnbox.html, this file /vn/vnbox/frida-compat.js: the folder is /vn/, not the root
+const embed = 'https://ex.org/vn/vnbox.html?frida=x', self = 'https://ex.org/vn/vnbox/frida-compat.js';
+assert.ok(F.test.scriptAllowed('https://ex.org/vn/vnbox/hooks/a.js', embed, self));
+assert.ok(!F.test.scriptAllowed('https://ex.org/calibre/x.js', embed, self));
+assert.ok(!F.test.scriptAllowed('https://ex.org/vnx.js', embed, self));
+assert.ok(!F.test.scriptAllowed('https://evil.org/vn/a.js', embed, self));
+console.log('frida-compat embed guard ok');
