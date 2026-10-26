@@ -193,8 +193,10 @@ union SSE {
 #endif
 #endif
 
-#if JIT_RUN_COUNT > 254
+#if JIT_RUN_COUNT > 254 && !defined(BOXEDWINE_WASM_JIT)
 #error "JIT_RUN_COUNT must fit in DecodedOp::runCount (U8) and leave room for the JIT_RUN_COUNT + 1 sentinel"
+#elif JIT_RUN_COUNT > 65534
+#error "JIT_RUN_COUNT must fit in DecodedOp::runCount (U16) and leave room for the JIT_RUN_COUNT + 1 sentinel"
 #endif
 
 #ifdef BOXEDWINE_WASM_JIT

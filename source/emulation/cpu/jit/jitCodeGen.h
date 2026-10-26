@@ -34,6 +34,8 @@ public:
     BHashTable<U32, U32> eipToBufferPos;    
     U32 startingEip = 0;
     U32 lastOpEip = 0;
+    // Set when shouldStopBlockBefore ended the block: compileOps exits to this eip after the last op.
+    U32 stopBeforeEip = 0;
     U32 emulatedLen = 0;
     U32 blockOpCount = 0;
     

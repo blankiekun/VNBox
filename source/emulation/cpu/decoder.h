@@ -1721,9 +1721,18 @@ public:
 // REP MOVSD uses the displacement as two 16-bit hit counters, not a sum.
 #define MOVSD_SIZE_HITS data.disp
 
-    U8 runCount;
 #endif
     U8 flags2;
+#ifdef BOXEDWINE_JIT
+    // wasm: U16 so JIT_RUN_COUNT can go past 254 (fills the padding byte after flags2).
+#ifdef BOXEDWINE_WASM_JIT
+    U16 runCount;
+#define JIT_RUN_COUNT_MAX 0xffff
+#else
+    U8 runCount;
+#define JIT_RUN_COUNT_MAX 0xff
+#endif
+#endif
 #ifdef BOXEDWINE_JIT_X64
     // Native x64 profile metadata occupies existing alignment padding.
     // Only CallR32, CallE32 and Retn32 observe targets during warmup.

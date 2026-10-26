@@ -14646,6 +14646,18 @@ void JitWasmCodeGen::postCompile(DecodedOp* op) {
 
 bool JitWasmCodeGen::shouldStopBlockBefore(U32 eip, DecodedOp* op) {
 #if !defined(BOXEDWINE_MULTI_THREADED) && !defined(__TEST)
+    // Blocks overlap: every entry point (a return site, a jump from another
+    // block) compiles its own block over the code that follows it, so the same
+    // guest code was compiled ~5 times. End a block where another one starts or
+    // is queued, and after a call: its return site becomes its own entry anyway.
+    DecodedOp* prev = m_stopScanPrev && m_stopScanPrevEip + m_stopScanPrev->len == eip ? m_stopScanPrev
+        : (this->firstOp && this->startingEip + this->firstOp->len == eip ? this->firstOp : nullptr);
+    m_stopScanPrev = op;
+    m_stopScanPrevEip = eip;
+    if (op && eip != this->startingEip && ((prev && prev->isCall()) ||
+            (op->flags2 & OP_FLAG2_WASM_JIT_PENDING) || ((op->flags & OP_FLAG_JIT) && op->pfnJitCode))) {
+        return true;
+    }
     // Honor profile-guided split hints from the grouped manifest: end the
     // block before a hot interior target so that target compiles (and is
     // cached) as its own block-start entry, making it reachable by the
