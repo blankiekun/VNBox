@@ -365,6 +365,105 @@ static void OPCALL normalDispatch(CPU* cpu, DecodedOp* op) {
 }
 #endif
 
+// Host-side text hooks: the instruction at a hooked guest address is decoded as
+// its own one-op block whose head (inst Custom1, so normalDispatch calls pfn)
+// reports the text to JS and then runs the real instruction. Blocks end before
+// a hooked address (CPU::shouldContinue), so neither the interpreter nor the
+// wasm JIT can run through it; the head is marked NO_JIT.
+// shortcut: one hard-coded hook (信天翁航海録 "DialogueHook", dc00 pattern
+// e8 ?? ?? ?? ?? 8b b4, text in eax, skipped while ebp != 0); a runtime table
+// comes with the Frida-compat layer (milestone 3).
+struct HostHook { U32 eip; U8 bytes[7]; };
+static const HostHook hostHooks[] = { {0x41d7f1, {0xe8, 0xda, 0xfe, 0xff, 0xff, 0x8b, 0xb4}} };
+
+bool hostHookAt(U32 eip) {
+    for (const HostHook& h : hostHooks) {
+        if (h.eip == eip) return true;
+    }
+    return false;
+}
+
+// The same address in another process (Wine's own exes also load at 0x400000)
+// is not the game's code: only hook when the bytes match.
+static bool hostHookMatches(KMemory* memory, U32 eip) {
+    for (const HostHook& h : hostHooks) {
+        if (h.eip != eip || !memory->canRead(eip, sizeof(h.bytes))) continue;
+        U32 i = 0;
+        while (i < sizeof(h.bytes) && memory->readb(eip + i) == h.bytes[i]) i++;
+        if (i == sizeof(h.bytes)) return true;
+    }
+    return false;
+}
+
+#ifdef __EMSCRIPTEN__
+// boxedwineTextHook(eip, shiftJisBytes) on the page takes the line when defined.
+EM_JS(void, boxedwine_host_hook_js, (U32 eip, const U8* text, U32 len), {
+    var bytes = HEAPU8.slice(text, text + len);
+    if (typeof boxedwineTextHook === "function") {
+        boxedwineTextHook(eip, bytes);
+        return;
+    }
+    console.log("[texthook] " + eip.toString(16) + " " + JSON.stringify(new TextDecoder("shift_jis").decode(bytes)));
+});
+#endif
+
+// The engine's markup, as dc00's PC_Albatross_Koukairoku.js cleans it: ^dNN
+// dropped, ^n is a line break, | and [ruby] dropped. Shift-JIS trail bytes can
+// look like ASCII, so lead bytes take their trail byte with them.
+static U32 cleanAlbatrossText(const U8* in, U32 len, U8* out) {
+    U32 n = 0;
+    for (U32 i = 0; i < len; i++) {
+        U8 c = in[i];
+        if (((c >= 0x81 && c <= 0x9f) || (c >= 0xe0 && c <= 0xfc)) && i + 1 < len) {
+            out[n++] = c;
+            out[n++] = in[++i];
+        } else if (c == '^' && i + 1 < len && in[i + 1] == 'd') {
+            i++;
+            while (i + 1 < len && in[i + 1] >= '0' && in[i + 1] <= '9') i++;
+        } else if (c == '^' && i + 1 < len && in[i + 1] == 'n') {
+            i++;
+            while (i + 1 < len && (in[i + 1] == ' ' || in[i + 1] == '\t' || in[i + 1] == '\r' || in[i + 1] == '\n')) i++;
+            out[n++] = '\n';
+        } else if (c == '[') {
+            i++;
+            while (i < len && in[i] != ']') i += ((in[i] >= 0x81 && in[i] <= 0x9f) || (in[i] >= 0xe0 && in[i] <= 0xfc)) ? 2 : 1;
+        } else if (c != '|') {
+            out[n++] = c;
+        }
+    }
+    return n;
+}
+
+static void OPCALL hostHookOp(CPU* cpu, DecodedOp* op) {
+    if (!cpu->reg[5].u32) {
+        U32 address = cpu->reg[0].u32;
+        U8 text[4096];
+        U32 len = 0;
+        while (len < sizeof(text) && cpu->memory->canRead(address + len, 1) && (text[len] = cpu->memory->readb(address + len))) {
+            len++;
+        }
+        static U8 last[4096];
+        static U32 lastLen = 0;
+        if (len != lastLen || memcmp(text, last, len)) { // the engine calls this again with the same line on redraws
+            memcpy(last, text, len);
+            lastLen = len;
+            U8 clean[4096];
+            U32 cleanLen = cleanAlbatrossText(text, len, clean);
+#ifdef __EMSCRIPTEN__
+            boxedwine_host_hook_js(cpu->seg[CS].address + cpu->eip.u32, clean, cleanLen);
+#else
+            (void)cleanLen;
+#endif
+        }
+    }
+    DecodedOp* real = reinterpret_cast<DecodedOp*>(op->data.nextJump);
+#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT)
+    MUSTTAIL return normalDispatch(cpu, real);
+#else
+    real->pfn(cpu, real);
+#endif
+}
+
 static void initNormalOps() {
     if (normalOpsInitialized)
         return;
@@ -447,9 +546,25 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                 U32 eipLen = 0;
                 U32 address = startIp;
 
-                op = decodeBlock(this, startIp, this->isBig(), opCount, eipLen);
+                bool hooked = hostHookMatches(memory, startIp);
+                op = decodeBlock(this, startIp, this->isBig(), opCount, eipLen, hooked ? 0 : 0xFFFFFFFF);
                 if (!op) {
                     return nullptr;
+                }
+                if (hooked) {
+                    // shortcut: the real op is not in the cache, so it leaks when this code is invalidated; fine for one hook.
+                    op->pfn = getFunctionForOp(op);
+                    DecodedOp* head = DecodedOp::alloc();
+                    head->inst = Custom1;
+                    head->pfn = hostHookOp;
+                    head->len = op->len;
+                    head->flags2 = op->flags2;
+                    head->flags |= OP_FLAG_NO_JIT;
+#ifdef BOXEDWINE_JIT
+                    head->runCount = JIT_RUN_COUNT + 1;
+#endif
+                    head->data.nextJump = reinterpret_cast<DecodedOp**>(op);
+                    op = head;
                 }
                 DecodedOp* nextOp = op;
 

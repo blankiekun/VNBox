@@ -1400,7 +1400,12 @@ U32 CPU::writeCrx(U32 which, U32 value) {
     return 0;
 }
 
+bool hostHookAt(U32 eip);
+
 bool CPU::shouldContinue(U32 eip) {
+    if (hostHookAt(eip)) {
+        return false; // a hooked address starts its own block
+    }
     DecodedOp* op = this->memory->getDecodedOp(eip);
     if (op && ((op->flags2 & OP_FLAG2_DECODED_32BIT) != 0) != this->isBig()) {
         this->memory->removeCode(this->thread, eip, 1, false);
