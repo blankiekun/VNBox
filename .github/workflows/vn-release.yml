@@ -1,0 +1,74 @@
+# VNBox web release: builds the JSPI + wasm JIT web build (make jitJspi) on a v* tag and
+# publishes it with the root fs it was tested with and the Japanese overlay.
+name: VN web release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  EMSDK_VERSION: 5.0.7
+  # boxedwine.org replaces files in place, so the release mirrors the one we tested.
+  ROOT_FS_URL: https://boxedwine.org/v2/23/TinyCore15Wine11.0-web.zip
+  ROOT_FS_SHA256: 4d505092956dd78e36712dac8111c252e5d1b859ce2373fbe7c80242bb65ad47
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install emsdk ${{ env.EMSDK_VERSION }}
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install "$EMSDK_VERSION"
+          "$RUNNER_TEMP/emsdk/emsdk" activate "$EMSDK_VERSION"
+
+      - name: Build jitJspi
+        run: |
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          make -C project/emscripten jitJspi make_jobs="$(nproc)"
+
+      - name: Fetch root fs
+        run: |
+          mkdir -p dist
+          curl -fsSL --retry 3 -o dist/TinyCore15Wine11.0-web.zip "$ROOT_FS_URL"
+          echo "$ROOT_FS_SHA256  dist/TinyCore15Wine11.0-web.zip" | sha256sum -c -
+
+      - name: Package
+        run: |
+          name="vnbox-web-${GITHUB_REF_NAME}"
+          files="boxedwine.html boxedwine.js boxedwine.wasm boxedwine.css boxedwine-shell.js fsfs.js lazyfs.js lazyfs-worker.js frida-compat.js"
+          mkdir "dist/$name"
+          (cd project/emscripten/Build/JitJspi && cp $files "$GITHUB_WORKSPACE/dist/$name/")
+          cp license.txt "dist/$name/LICENSE.txt"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -r "dist/$name"
+          vn/build-jp-overlay.sh dist/TinyCore15Wine11.0-web.zip dist/jp.zip
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          Web build of VNBox (\`make jitJspi\`, Emscripten $EMSDK_VERSION, commit $GITHUB_SHA).
+
+          - \`vnbox-web-$GITHUB_REF_NAME.tar.gz\`: boxedwine.{html,js,wasm,css}, boxedwine-shell.js, fsfs.js, lazyfs.js, lazyfs-worker.js, frida-compat.js. GPL-2.0, source is this tag.
+          - \`TinyCore15Wine11.0-web.zip\`: unmodified mirror of the Boxedwine root file system ($ROOT_FS_URL). It holds Tiny Core Linux, Wine 11.0 and other GPL/LGPL software; build scripts in [tools/buildWine](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_REF_NAME/tools/buildWine), sources from the projects (https://www.winehq.org, http://tinycorelinux.net) and https://boxedwine.org.
+          - \`jp.zip\`: Japanese overlay, IPA fonts (IPA Font License v1.0, included in the zip) and a ja_JP.utf8 locale name, built by vn/build-jp-overlay.sh.
+          - \`SHA256SUMS\`
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/* --title "VNBox $GITHUB_REF_NAME" --notes-file notes.md
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: vnbox-web
+          path: dist/
