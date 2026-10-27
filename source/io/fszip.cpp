@@ -103,6 +103,14 @@ bool FsZip::setupZipRead(U64 zipOffset, U64 zipFileOffset) {
     }
     U8 discard[16384];
     while (lastZipFileOffset < zipFileOffset) {
+        // Keep whole blocks passed on the way: mapped files fault pages in at random.
+        if (lastZipFileOffset % blockSize == 0 && zipFileOffset - lastZipFileOffset >= blockSize &&
+                !blocks.count(std::make_pair(zipOffset, lastZipFileOffset / blockSize))) {
+            if (!readBlock(zipOffset)) {
+                return false;
+            }
+            continue;
+        }
         U32 count = (U32)std::min<U64>(sizeof(discard), zipFileOffset - lastZipFileOffset);
         if (readCurrent(discard, count) <= 0) {
             resetZipRead();
@@ -112,30 +120,72 @@ bool FsZip::setupZipRead(U64 zipOffset, U64 zipFileOffset) {
     return true;
 }
 
+// Inflates the block at the current, block aligned, position into the cache.
+const std::vector<U8>* FsZip::readBlock(U64 zipOffset) {
+    auto key = std::make_pair(zipOffset, lastZipFileOffset / blockSize);
+    std::vector<U8> bytes(blockSize);
+    U32 got = 0;
+    while (got < blockSize) {
+        S32 count = readCurrent(bytes.data() + got, (U32)(blockSize - got));
+        if (count < 0) {
+            resetZipRead();
+            return nullptr;
+        }
+        if (count == 0) {
+            break;
+        }
+        got += count;
+    }
+    if (unzeof(zipfile) == 1) {
+        if (unzCloseCurrentFile(zipfile) != UNZ_OK) { // CRC mismatch
+            resetZipRead();
+            return nullptr;
+        }
+        lastZipOffset = UINT64_MAX;
+        lastZipFileOffset = 0;
+    }
+    bytes.resize(got);
+    if (blocks.size() == maxBlocks) {
+        auto oldest = blocks.begin();
+        for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+            if (it->second.used < oldest->second.used) {
+                oldest = it;
+            }
+        }
+        blocks.erase(oldest);
+    }
+    Block& block = blocks[key];
+    block.bytes = std::move(bytes);
+    block.used = ++checkpointClock;
+    return &block.bytes;
+}
+
 S32 FsZip::readZip(U64 zipOffset, U64 zipFileOffset, U8* buffer, U32 len) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(readMutex);
     if (!len) {
         return 0;
     }
-    if (!zipfile || !setupZipRead(zipOffset, zipFileOffset)) {
+    if (!zipfile) {
         return -K_EIO;
     }
     U32 total = 0;
     while (total < len) {
-        S32 count = readCurrent(buffer + total, len - total);
-        if (count <= 0) {
-            resetZipRead();
+        U64 at = zipFileOffset + total;
+        const std::vector<U8>* bytes = nullptr;
+        auto found = blocks.find(std::make_pair(zipOffset, at / blockSize));
+        if (found != blocks.end()) {
+            found->second.used = ++checkpointClock;
+            bytes = &found->second.bytes;
+        } else if (setupZipRead(zipOffset, at - at % blockSize)) {
+            bytes = readBlock(zipOffset);
+        }
+        U32 within = (U32)(at % blockSize);
+        if (!bytes || within >= bytes->size()) {
             return total ? (S32)total : -K_EIO;
         }
+        U32 count = std::min<U32>(len - total, (U32)bytes->size() - within);
+        memcpy(buffer + total, bytes->data() + within, count);
         total += count;
-    }
-    if (unzeof(zipfile) == 1) {
-        if (unzCloseCurrentFile(zipfile) != UNZ_OK) {
-            resetZipRead();
-            return -K_EIO;
-        }
-        lastZipOffset = UINT64_MAX;
-        lastZipFileOffset = 0;
     }
     return (S32)total;
 }
