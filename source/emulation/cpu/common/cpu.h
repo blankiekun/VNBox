@@ -186,15 +186,18 @@ union SSE {
 };
 
 #ifndef JIT_RUN_COUNT
+// wasm: 2000 measured best (sweep of 200/500/1000/2000 on a VN: -130 MB renderer, no title or MIPS loss).
 #if defined(BOXEDWINE_WASM_JIT) && defined(__EMSCRIPTEN__)
-#define JIT_RUN_COUNT 200
+#define JIT_RUN_COUNT 2000
 #else
 #define JIT_RUN_COUNT 50
 #endif
 #endif
 
-#if JIT_RUN_COUNT > 254
+#if JIT_RUN_COUNT > 254 && !defined(BOXEDWINE_WASM_JIT)
 #error "JIT_RUN_COUNT must fit in DecodedOp::runCount (U8) and leave room for the JIT_RUN_COUNT + 1 sentinel"
+#elif JIT_RUN_COUNT > 65534
+#error "JIT_RUN_COUNT must fit in DecodedOp::runCount (U16) and leave room for the JIT_RUN_COUNT + 1 sentinel"
 #endif
 
 #ifdef BOXEDWINE_WASM_JIT

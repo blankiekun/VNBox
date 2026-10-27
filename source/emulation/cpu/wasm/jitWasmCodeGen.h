@@ -998,6 +998,9 @@ public:
     DecodedOp* m_profileSplitTargetOp = nullptr;
     U32 m_profileSplitBlockStartEip = 0;
     U32 m_profileSplitTargetEip = 0;
+    // Op before the one shouldStopBlockBefore is looking at (block scan order).
+    DecodedOp* m_stopScanPrev = nullptr;
+    U32 m_stopScanPrevEip = 0;
 
     // virtual commitJIT is inherited from JitCodeGen and calls createStartJITCode
     void commitJIT(DecodedOp* op) override;

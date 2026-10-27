@@ -355,10 +355,14 @@ bool JitCodeGen::calculateLongestBlock(DecodedOp* op) {
     BHashTable<U32, DecodedOp*> jumpTo;
 
     // opentdd will trigger this isValid check
+    U32 stopPrevEip = 0;
+    this->stopBeforeEip = 0;
     while (nextOp && nextOp->isValid()) {
         if (eip != this->startingEip && shouldStopBlockBefore(eip, nextOp)) {
+            this->stopBeforeEip = eip;
             break;
         }
+        stopPrevEip = eip;
         // could be ret, call, int.  Basically this is an instruction where we are not guaranteed to see a next instruction
         if (nextOp->isBranch() && !nextOp->isDirectJumpBranch()) {
             // Stop on a ret unless a known direct branch reaches code after it.
@@ -494,6 +498,12 @@ bool JitCodeGen::calculateLongestBlock(DecodedOp* op) {
         // since we didn't make it to the end of the ops, try again
         // an op we just looked at might be going to a place between lastFurthestEip and data.lastOpEip which is not valid since it is now passed the end of the block
         lastFurthestEip = lastEip;
+    }
+    // The trim walk lands on the op the block stopped before; end on the op ahead of it instead.
+    if (this->stopBeforeEip && this->lastOpEip == this->stopBeforeEip) {
+        this->lastOpEip = stopPrevEip;
+    } else {
+        this->stopBeforeEip = 0;
     }
 
     analyzeBlockControlFlow(op);
@@ -1069,6 +1079,14 @@ bool JitCodeGen::compileOps(DecodedOp* op) {
         }
         postCompile(nextOp);
         if (this->currentEip > this->lastOpEip) {
+            if (this->stopBeforeEip && this->currentEip == this->stopBeforeEip) {
+                if (!nextOp->isBranch()) {
+                    writeCurrentEip(0);
+                }
+                RegPtr eip = getTmpReg();
+                movValue(JitWidth::b32, eip, currentEip - cpu->seg[CS].address);
+                jumpEip(eip);
+            }
             break;
         } else {
             if (nextOp->next && nextOp->next->inst == Done) {
@@ -1228,11 +1246,11 @@ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
     }
 #endif
 #if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
-    if (!(op->flags2 & OP_FLAG2_WASM_JIT_PENDING) && !wasmJitCompilationPaused() && op->runCount != 0xff) {
+    if (!(op->flags2 & OP_FLAG2_WASM_JIT_PENDING) && !wasmJitCompilationPaused() && op->runCount != JIT_RUN_COUNT_MAX) {
         op->runCount++;
     }
 #elif defined(BOXEDWINE_WASM_JIT)
-    if (op->runCount != 0xff) {
+    if (op->runCount != JIT_RUN_COUNT_MAX) {
         op->runCount++;
     }
 #else
