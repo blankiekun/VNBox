@@ -29,4 +29,13 @@ struct VnboxStats {
 };
 extern VnboxStats vnboxStats;
 
+// prof=1 in the page URL (emscripten): where guest JIT time goes. Every compiled block entry adds the time since the
+// previous entry to the previous block (key: process id << 32 | block eip); the main loop prints the top entries.
+struct VnboxProfEntry {
+    double ms = 0;
+    unsigned long long instr = 0, entries = 0;
+};
+extern bool vnboxProfOn;
+extern std::unordered_map<unsigned long long, VnboxProfEntry> vnboxProfBlocks;
+
 #endif
