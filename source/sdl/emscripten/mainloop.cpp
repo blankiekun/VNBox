@@ -250,11 +250,21 @@ bool doMainLoop() {
     // emscripten's main loop callback is not: drive mainloop from JS through one, never
     // re-entering while a tick is suspended, paced like updateMainLoopTiming paces
     // emscripten's loop (a message while the guest has work, a timeout while it sleeps).
+    // Firefox runs a chain of messages ahead of painting (one frame per ~80 ms while the
+    // guest is busy, during movies and loads): once a frame is due, the next tick waits for it.
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
-        var next = function() { tick().then(function(delay) { if (delay < 0) channel.port2.postMessage(0); else setTimeout(next, delay); }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", e); else console.error("tick failed: " + e); }); };
+        var lastFrame = performance.now();
+        var frame = function() { lastFrame = performance.now(); requestAnimationFrame(frame); };
+        var post = function() { channel.port2.postMessage(0); };
+        var next = function() { tick().then(function(delay) {
+            if (delay >= 0) setTimeout(next, delay);
+            else if (!document.hidden && performance.now() - lastFrame > 12) requestAnimationFrame(post);
+            else post();
+        }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", e); else console.error("tick failed: " + e); }); };
         channel.port1.onmessage = next;
+        requestAnimationFrame(frame);
         next();
     });
     emscripten_exit_with_live_runtime();
