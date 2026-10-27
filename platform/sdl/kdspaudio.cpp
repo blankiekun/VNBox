@@ -28,6 +28,11 @@
 #endif
 
 #define DSP_BUFFER_SIZE (1024*32)
+#ifdef __EMSCRIPTEN__
+#include "vnboxstats.h"
+// Kept queued beyond one SDL period, for Wine's 10 ms timer arriving late on the busy main thread.
+#define SDL_RESERVE_MS 30
+#endif
 
 #ifdef __EMSCRIPTEN__
 extern "C" {
@@ -110,7 +115,10 @@ public:
 		if (this->useWorkletBufferLayout) {
 			return getWriteCapacityWant();
 		}
-		return maxFragments ? std::min((U32)DSP_BUFFER_SIZE, getFragmentSize() * maxFragments) : DSP_BUFFER_SIZE;
+		// DevDsp passes its fragment count with every query; writes and the poll timer reuse it,
+		// so GETOSPACE, writes and POLLOUT agree on one capacity.
+		if (maxFragments) this->maxFragments = maxFragments;
+		return this->maxFragments ? std::min((U32)DSP_BUFFER_SIZE, getFragmentSize() * this->maxFragments) : DSP_BUFFER_SIZE;
 #else
 		return this->getWriteCapacityWant();
 #endif
@@ -180,7 +188,7 @@ public:
 
 #ifdef __EMSCRIPTEN__
 	U32 getGuestQueuedAudioSizeWant() {
-		if (this->useWorkletBufferLayout && !KSystem::soundEnabled) {
+		if (!KSystem::soundEnabled) {
 			this->drainNoSoundAudioBuffer();
 			return (U32)this->audioBuffer.size();
 		}
@@ -193,7 +201,7 @@ public:
 			U32 frames = KDspAudioMath::getGuestVisibleQueuedFrames(queued < 0 ? 0 : (U32)queued, this->want.freq);
 			return frames * this->want.channels * bytesPerSampleWant();
 		}
-		return this->getEstimatedRealQueuedWant();
+		return this->getSdlGuestVisibleQueuedWant();
 	}
 #endif
 
@@ -207,6 +215,7 @@ public:
 	U32 getDeviceQueuedBytes() {
 #ifdef __EMSCRIPTEN__
 		if (this->webDevice) return bw_audio_queued(this->webDevice) * this->got.channels * sizeof(float);
+		return this->deviceId ? (U32)this->pcm.size() : 0;
 #endif
 		return this->deviceId ? SDL_GetQueuedAudioSize(this->deviceId) : 0;
 	}
@@ -222,6 +231,11 @@ public:
 			SDL_CloseAudioDevice(this->deviceId);
 			this->deviceId = 0;
 		}
+#ifdef __EMSCRIPTEN__
+		this->pcm.clear();
+		this->fadeIn = true;
+		this->wasFull = false;
+#endif
 	}
 
 	void queueDeviceAudio(const void* data, U32 bytes) {
@@ -233,8 +247,12 @@ public:
 			}
 			return;
 		}
-#endif
+		SDL_LockAudioDevice(this->deviceId);
+		this->pcm.insert(this->pcm.end(), (const U8*)data, (const U8*)data + bytes);
+		SDL_UnlockAudioDevice(this->deviceId);
+#else
 		SDL_QueueAudio(this->deviceId, data, bytes);
+#endif
 	}
 
 #ifdef __EMSCRIPTEN__
@@ -301,54 +319,62 @@ public:
 	bool useWorkletBufferLayout = false;
 	int webDevice = 0;
 	bool webFailed = false;
-	U32 realQueuedWant = 0;
-	U32 lastRealQueuedTime = 0;
-	std::vector<U8> silenceBuffer;
+	U32 maxFragments = 0;
+	// SDL path: output in the device format, pulled by sdlCallback (one ScriptProcessor period at a time)
+	std::vector<U8> pcm;
+	bool fadeIn = true; // the next samples follow silence
+	bool wasFull = false; // the last callback found a full period
 
-	U32 getEstimatedRealQueuedWant() {
-		U32 now = KSystem::getMilliesSinceStart();
-		if (!this->lastRealQueuedTime) {
-			this->lastRealQueuedTime = now;
-			return this->realQueuedWant;
-		}
-		U32 elapsed = now - this->lastRealQueuedTime;
-		if (elapsed) {
-			U32 consumed = (U32)(((U64)bytesPerSecondWant() * elapsed) / 1000);
-			this->realQueuedWant = consumed >= this->realQueuedWant ? 0 : this->realQueuedWant - consumed;
-			this->lastRealQueuedTime = now;
-		}
-		return this->realQueuedWant;
-	}
-
-	void addRealQueuedWant(U32 bytes) {
-		U32 queued = getEstimatedRealQueuedWant();
-		this->realQueuedWant = std::min((U32)DSP_BUFFER_SIZE, queued + bytes);
-	}
-
-	U32 topUpSilence() {
-		if (!this->deviceId) {
-			return 0;
-		}
+	// What the guest sees queued: the real queue minus one SDL period and a margin. The callback takes a whole
+	// period (4096 frames by default, 85 ms) at once, while Wine keeps only ~30 ms queued (3 x 10 ms periods),
+	// so without this reserve every callback would find less than a period and pad silence.
+	U32 getSdlGuestVisibleQueuedWant() {
 		U32 gotBytesPerSecond = bytesPerSecondGot();
+		if (!this->deviceId || !gotBytesPerSecond) {
+			return 0;
+		}
 		U32 frameSize = bytesPerSampleGot() * this->got.channels;
-		if (!gotBytesPerSecond || !frameSize) {
+		U32 reserve = (this->got.samples + this->got.freq * SDL_RESERVE_MS / 1000) * frameSize;
+		U32 queued = (U32)this->pcm.size() + (this->stream ? std::max(SDL_AudioStreamAvailable(this->stream), 0) : 0);
+		if (queued <= reserve) {
 			return 0;
 		}
-		U32 queued = SDL_GetQueuedAudioSize(this->deviceId);
-		U32 target = KDspAudioMath::getAlignedDurationBytes(gotBytesPerSecond, 48, frameSize);
-		if (queued >= target) {
-			return 0;
+		return (U32)std::min<U64>((U64)(queued - reserve) * bytesPerSecondWant() / gotBytesPerSecond, 0xFFFFFFFFu);
+	}
+
+	void sdlCallback(U8* out, int len) {
+		U32 frameSize = bytesPerSampleGot() * this->got.channels;
+		U32 have = (U32)std::min<size_t>((size_t)len, this->pcm.size());
+		have -= frameSize ? have % frameSize : have;
+		if (vnboxStats.on && this->got.freq && frameSize) {
+			double ms = 1000.0 * this->pcm.size() / frameSize / this->got.freq;
+			if (vnboxStats.audioQueuedMinMs < 0 || ms < vnboxStats.audioQueuedMinMs) vnboxStats.audioQueuedMinMs = ms;
 		}
-		U32 bytes = (target - queued) & ~(frameSize - 1);
-		if (!bytes) {
-			return 0;
+		memcpy(out, this->pcm.data(), have);
+		this->pcm.erase(this->pcm.begin(), this->pcm.begin() + have);
+		SDL_memset(out + have, this->got.silence, len - have);
+		bool shortfall = have < (U32)len;
+		if (shortfall && this->wasFull) {
+			vnboxStats.audioUnderruns++; // ran dry mid-stream
 		}
-		if (this->silenceBuffer.size() < bytes) {
-			this->silenceBuffer.resize(bytes);
+		this->wasFull = !shortfall;
+		if (this->got.format == AUDIO_F32SYS && have) {
+			// Ramp ~2 ms from or to silence around a gap: a hard step clicks.
+			float* f = (float*)out;
+			U32 ch = this->got.channels, frames = have / frameSize;
+			U32 ramp = std::min(frames, std::max((U32)this->got.freq / 500, (U32)1));
+			for (U32 i = 0; i < ramp; i++) {
+				for (U32 c = 0; c < ch; c++) {
+					if (this->fadeIn) f[i * ch + c] *= (float)i / ramp;
+					if (shortfall) f[(frames - 1 - i) * ch + c] *= (float)i / ramp;
+				}
+			}
 		}
-		SDL_memset(this->silenceBuffer.data(), this->got.silence, bytes);
-		SDL_QueueAudio(this->deviceId, this->silenceBuffer.data(), bytes);
-		return bytes;
+		this->fadeIn = shortfall;
+	}
+
+	static void SDLCALL sdlCallbackThunk(void* userdata, Uint8* out, int len) {
+		((KDspAudioSdl*)userdata)->sdlCallback(out, len);
 	}
 #endif
 };
@@ -523,6 +549,10 @@ void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
 #endif
 	{
     SDL_AudioSpec requested = this->want;
+#ifdef __EMSCRIPTEN__
+    requested.callback = sdlCallbackThunk; // our own queue, so underruns can be counted and faded
+    requested.userdata = this;
+#endif
 #ifdef __MACH__
     if (requested.freq < 44100) {
         requested.freq = 44100;
@@ -589,7 +619,7 @@ void KDspAudioSdl::closeAudio() {
 	if (!this->deviceId) {
 		return;
 	}
-	if (SDL_GetQueuedAudioSize(this->deviceId) > 0) {
+	if (getDeviceQueuedBytes() > 0) {
 		// Leave the device open so the queue can drain; the poll timer will finalize.
 		ensureDrainTimer();
 		pendingCloses.push_back(shared_from_this());
@@ -697,12 +727,6 @@ U32 KDspAudioSdl::writeAudio(U8* data, U32 len) {
 	} else {
 		queueDeviceAudio(data, len);
 	}
-#ifdef __EMSCRIPTEN__
-	if (!this->webDevice) {
-		addRealQueuedWant(len);
-		topUpSilence();
-	}
-#endif
 	return len;
 }
 

@@ -14,6 +14,7 @@ struct VnboxStats {
     double sysMs = 0, wineserverMs = 0, zipMs = 0;
     unsigned long long instr = 0, sysPadInstr = 0, jitInstr = 0;
     unsigned jitEntries = 0, blocksCompiled = 0, wineserverRequests = 0, signals = 0, faults = 0, zipMisses = 0;
+    unsigned audioUnderruns = 0; double audioQueuedMinMs = -1; // SDL audio path: callbacks that ran dry, least queued at a callback
     unsigned sysCount[440] = {};
     double sysMsBy[440] = {};
     unsigned sysBlocked[440] = {}; // calls that blocked (K_WAIT); a woken thread runs the call again, so sysCount includes the retry
