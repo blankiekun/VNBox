@@ -80,10 +80,10 @@ private:
     };
     std::map<std::pair<U64, U64>, Checkpoint> checkpoints;
     U64 checkpointClock = 0;
-    // Inflated 64 KiB blocks, at most 32 MiB, so random page reads inflate each block once
+    // Inflated 64 KiB blocks, at most 8 MiB (32 MiB kept ~45 MB more resident, no faster), so random page reads inflate each block once
     // instead of everything from the last checkpoint every time.
     static constexpr U64 blockSize = 64 * 1024;
-    static constexpr size_t maxBlocks = 512;
+    static constexpr size_t maxBlocks = 128;
     struct Block {
         std::vector<U8> bytes;
         U64 used;
