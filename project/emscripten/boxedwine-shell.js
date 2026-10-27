@@ -2006,12 +2006,13 @@
             } else {
                 params.push("/bin/wine");
                 if (Config.registryCommands.length > 0) {
-                    // cmd /c reg add ... && reg add ... && <program>
+                    // cmd /c reg add ... & reg add ... & <program>: & so a failed one (a .reg missing
+                    // from an older overlay) leaves the setting out instead of not starting the game
                     params.push("cmd");
                     params.push("/c");
                     for (let i = 0; i < Config.registryCommands.length; i++) {
                         params.push(...Config.registryCommands[i]);
-                        params.push("&&");
+                        params.push("&");
                     }
                 }
                 if(Config.Program.length > 0 && !Config.loadDesktop){
