@@ -114,6 +114,16 @@ U32 WasmEmitter::addFunctionImport(const char* module, const char* field, U32 ty
     return m_numImportedFunctions++;
 }
 
+void WasmEmitter::addTableImport(const char* module, const char* field) {
+    appendStr(m_importSection, module);
+    appendStr(m_importSection, field);
+    m_importSection.push_back(0x01);  // import kind = table
+    m_importSection.push_back(0x70);  // funcref
+    m_importSection.push_back(0x00);  // limits: min only
+    appendULEB128(m_importSection, 0);
+    m_hasTableImport = true;
+}
+
 U32 WasmEmitter::addGlobalImport(const char* module, const char* field) {
     appendStr(m_importSection, module);
     appendStr(m_importSection, field);
@@ -322,6 +332,12 @@ void WasmEmitter::emitCallIndirect(U32 typeIdx, U32 tableIdx) {
     appendULEB128(m_currentBody, tableIdx);
 }
 
+void WasmEmitter::emitReturnCallIndirect(U32 typeIdx, U32 tableIdx) {
+    m_currentBody.push_back(WASM_RETURN_CALL_INDIRECT);
+    appendULEB128(m_currentBody, typeIdx);
+    appendULEB128(m_currentBody, tableIdx);
+}
+
 void WasmEmitter::setNextBranchHint(WasmBranchHint hint) {
     m_nextBranchHint = (U8)hint;
     m_hasNextBranchHint = true;
@@ -461,7 +477,7 @@ std::vector<U8> WasmEmitter::finalize() {
     // Import section
     if (!m_importSection.empty()) {
         std::vector<U8> importContent;
-        U32 importCount = m_numImportedFunctions + m_numImportedGlobals + (m_hasMemoryImport ? 1 : 0);
+        U32 importCount = m_numImportedFunctions + m_numImportedGlobals + (m_hasMemoryImport ? 1 : 0) + (m_hasTableImport ? 1 : 0);
         appendULEB128(importContent, importCount);
         importContent.insert(importContent.end(),
                              m_importSection.begin(), m_importSection.end());

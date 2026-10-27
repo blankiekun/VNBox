@@ -83,6 +83,7 @@ enum WasmOp : U8 {
     WASM_RETURN         = 0x0f,
     WASM_CALL           = 0x10,
     WASM_CALL_INDIRECT  = 0x11,
+    WASM_RETURN_CALL_INDIRECT = 0x13, // tail-call proposal
     WASM_DROP           = 0x1a,
     WASM_SELECT         = 0x1b,
     WASM_LOCAL_GET      = 0x20,
@@ -382,6 +383,8 @@ public:
     // Globals have their own index space, so this can be added at any point
     // before finalize() without disturbing function import indices.
     U32  addGlobalImport(const char* module, const char* field);
+    // Import a funcref table (Emscripten's wasmTable) as table 0.
+    void addTableImport(const char* module, const char* field);
 
     U32 numImportedFunctions() const { return m_numImportedFunctions; }
 
@@ -440,6 +443,7 @@ public:
     void emitV128Store(U32 offset, U32 align = 4);
     void emitCall(U32 funcIdx);
     void emitCallIndirect(U32 typeIdx, U32 tableIdx = 0);
+    void emitReturnCallIndirect(U32 typeIdx, U32 tableIdx = 0);
 
     void emitIf(WasmType blockType = WasmType::Void);
     void emitElse();
@@ -486,6 +490,7 @@ private:
 
     std::vector<U8> m_importSection;
     bool            m_hasMemoryImport = false;
+    bool            m_hasTableImport = false;
     U32             m_numImportedFunctions = 0;
     U32             m_numImportedGlobals = 0;
 
