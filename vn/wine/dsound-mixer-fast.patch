@@ -1,0 +1,96 @@
+diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
+--- a/dlls/dsound/mixer.c
++++ b/dlls/dsound/mixer.c
+@@ -277,9 +277,66 @@
+ {
+     if (mixpos >= buflen && !(dsb->playflags & DSBPLAY_LOOPING))
+         return 0.0f;
++    /* VNBox: 16-bit PCM inline, see cp_run_fast */
++    if (dsb->get == getbpp[1])
++        return ((const SHORT *)(buffer + (mixpos % buflen)))[channel] / (float)0x8000;
+     return dsb->get(dsb, buffer + (mixpos % buflen), channel);
+ }
+ 
++/* VNBox: under Boxedwine's x86 JIT every call costs far more than the work here, and the generic
++ * loops make two indirect calls (get, put) per sample. This converts the common cases (16-bit PCM
++ * or float input, same channel count or mono to stereo, plain store) in a call-free loop.
++ * Frames from..to-1 of the run starting at byte mixpos; same results as the generic loop.
++ * Returns FALSE (nothing done) for other formats. */
++static BOOL cp_run_fast(IDirectSoundBufferImpl *dsb, BYTE *buffer, DWORD buflen, DWORD mixpos, UINT from, UINT to)
++{
++    UINT istride = dsb->pwfx->nBlockAlign, ochannels = dsb->device->pwfx->nChannels;
++    UINT channels = dsb->mix_channels, n, c;
++    BOOL s16 = dsb->get == getbpp[1];
++    BOOL dup = dsb->put == put_mono2stereo && dsb->put_aux == putieee32;
++    float *out = dsb->device->tmp_buffer + from * ochannels;
++    const BYTE *p;
++
++    if ((!s16 && dsb->get != getbpp[4]) || (dsb->put != putieee32 && !dup))
++        return FALSE;
++
++    while (from < to)
++    {
++        if (mixpos >= buflen)
++        {
++            if (!(dsb->playflags & DSBPLAY_LOOPING))
++            {
++                for (; from < to; from++, out += ochannels)
++                    for (c = 0; c < channels + dup; c++) out[c] = 0.0f;
++                break;
++            }
++            mixpos %= buflen;
++        }
++        n = (buflen - mixpos + istride - 1) / istride; /* frames before the end of the buffer */
++        if (n > to - from) n = to - from;
++        p = buffer + mixpos;
++        from += n;
++        mixpos += n * istride;
++        if (s16 && channels == 2)
++            for (; n; n--, p += istride, out += ochannels)
++            {
++                out[0] = ((const SHORT *)p)[0] / (float)0x8000;
++                out[1] = ((const SHORT *)p)[1] / (float)0x8000;
++            }
++        else if (s16 && dup)
++            for (; n; n--, p += istride, out += ochannels)
++                out[0] = out[1] = *(const SHORT *)p / (float)0x8000;
++        else
++            for (; n; n--, p += istride, out += ochannels)
++            {
++                for (c = 0; c < channels; c++)
++                    out[c] = s16 ? ((const SHORT *)p)[c] / (float)0x8000 : ((const float *)p)[c];
++                if (dup) out[1] = out[0];
++            }
++    }
++    return TRUE;
++}
++
+ static UINT cp_fields_noresample(IDirectSoundBufferImpl *dsb, UINT count)
+ {
+     UINT istride = dsb->pwfx->nBlockAlign;
+@@ -295,6 +352,13 @@
+         committed_samples = committed_samples <= count ? committed_samples : count;
+     }
+ 
++    if (cp_run_fast(dsb, dsb->committedbuff, dsb->writelead, dsb->committed_mixpos, 0, committed_samples))
++    {
++        cp_run_fast(dsb, dsb->buffer->memory, dsb->buflen, dsb->sec_mixpos + committed_samples * istride,
++                committed_samples, count);
++        return count;
++    }
++
+     for (i = 0; i < committed_samples; i++)
+         for (channel = 0; channel < dsb->mix_channels; channel++)
+             dsb->put(dsb, i * ostride, channel, get_current_sample(dsb, dsb->committedbuff,
+@@ -387,7 +451,10 @@
+             float* cache = &intermediate[channel * required_input + ipos];
+             for (j = 0; j < fir_used; j++)
+                 sum += fir_copy[j] * cache[j];
+-            dsb->put(dsb, i * ostride, channel, sum * dsb->firgain);
++            if (dsb->put == putieee32) /* VNBox: inline, see cp_run_fast */
++                dsb->device->tmp_buffer[i * (ostride / sizeof(float)) + channel] = sum * dsb->firgain;
++            else
++                dsb->put(dsb, i * ostride, channel, sum * dsb->firgain);
+         }
+     }
+ 

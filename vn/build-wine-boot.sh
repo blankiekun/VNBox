@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Builds VNBox's patched Wine 11.0 wineboot, explorer and quartz (vn/wine/*.patch) for jp.zip: the
+# Builds VNBox's patched Wine 11.0 wineboot, explorer, quartz and dsound (vn/wine/*.patch) for jp.zip: the
 # root fs's Wine is built --without-mingw, so the code is in i386-unix/<name>.so (ELF, gcc -m32)
 # and only those files change. Same compiler as the root fs (Ubuntu 24.04's GCC 13.3) and the
 # same flags as tools/buildWine/wine_builds.json; no other Wine 11.0 patch touches these modules.
 # Wine is LGPL-2.1: jp.zip also carries the patches (opt/wine/share/wine/vnbox-patches/).
 # Built without the patches, wineboot and explorer are byte-identical to the root fs's (v0.1.3); translated
 # resources need gettext's msgfmt. Needs Docker.
-# Usage: vn/build-wine-boot.sh <out dir>  (writes wineboot.exe.so, explorer.exe.so, quartz.dll.so)
+# Usage: vn/build-wine-boot.sh <out dir>  (writes wineboot.exe.so, explorer.exe.so, quartz.dll.so, dsound.dll.so)
 set -euo pipefail
 out=$(realpath -m "$1")
 here=$(cd "$(dirname "$0")" && pwd)
@@ -31,7 +31,7 @@ docker run --rm -v "$work:/w" -v "$out:/out" -e HOST_UID="$(id -u)" ubuntu:24.04
     --without-gnutls --without-gstreamer --without-sdl --without-fontconfig --without-opengl \
     --without-vulkan --without-oss --without-alsa --without-pulse --without-cups --without-dbus >/dev/null
   make -j"${JOBS:-4}" programs/wineboot/wineboot.exe.so programs/explorer/explorer.exe.so \
-    dlls/quartz/quartz.dll.so >/tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+    dlls/quartz/quartz.dll.so dlls/dsound/dsound.dll.so >/tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
   install -o "$HOST_UID" -g "$HOST_UID" -m 755 programs/wineboot/wineboot.exe.so programs/explorer/explorer.exe.so \
-    dlls/quartz/quartz.dll.so /out/
+    dlls/quartz/quartz.dll.so dlls/dsound/dsound.dll.so /out/
 '
