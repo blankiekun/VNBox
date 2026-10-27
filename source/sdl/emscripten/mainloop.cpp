@@ -214,7 +214,12 @@ void mainloop() {
     static bool statsChecked = false;
     if (!statsChecked) {
         statsChecked = true;
-        vnboxStats.on = EM_ASM_INT({ return /[?&]stats=1(&|$)/.test(location.search) ? 1 : 0; }) != 0;
+        // on this page's URL or, for a player embedded in an iframe, the embedding page's
+        vnboxStats.on = EM_ASM_INT({
+            var q = location.search;
+            try { if (parent !== window) q += "&" + parent.location.search.slice(1); } catch (e) {}
+            return /[?&]stats=1(&|$)/.test(q) ? 1 : 0;
+        }) != 0;
     }
     if (vnboxStats.on) {
         statsTickStart();
