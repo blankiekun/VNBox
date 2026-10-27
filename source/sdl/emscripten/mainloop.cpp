@@ -202,7 +202,7 @@ static const char* statsSyscallName(U32 n) { // i386 numbers; the ones a Wine ga
     case 195: return "stat64"; case 196: return "lstat64"; case 197: return "fstat64"; case 220: return "getdents64";
     case 221: return "fcntl64"; case 240: return "futex"; case 256: return "epoll_wait"; case 265: return "clock_gettime";
     case 295: return "openat"; case 300: return "fstatat64"; case 308: return "pselect6"; case 309: return "ppoll";
-    case 319: return "epoll_pwait"; case 403: return "clock_gettime64"; case 407: return "clock_nanosleep64";
+    case 319: return "epoll_pwait"; case 383: return "statx"; case 403: return "clock_gettime64"; case 407: return "clock_nanosleep64";
     case 413: return "pselect6_64"; case 414: return "ppoll64"; case 422: return "futex64";
     default: return nullptr;
     }
