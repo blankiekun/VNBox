@@ -20,6 +20,7 @@
 
 #include "kscheduler.h"
 #include "ksignal.h"
+#include "vnboxstats.h"
 #include "../io/fsfilenode.h"
 #include "bufferaccess.h"
 #include "kstat.h"
@@ -1457,6 +1458,10 @@ void OPCALL onExitSignal(CPU* cpu, DecodedOp* op) {
 
 // interrupted and condStartWaitTime are pushed because syscall's during the signal will clobber them
 void KThread::runSignal(U32 signal, U32 trapNo, U32 errorNo) {
+    if (vnboxStats.on) {
+        vnboxStats.signals++;
+        if (signal == K_SIGSEGV || signal == K_SIGILL || signal == K_SIGFPE || signal == K_SIGBUS || signal == K_SIGTRAP) vnboxStats.faults++; // SEH exceptions
+    }
     KSigAction* action = &this->process->sigActions[signal];
     if (action->handlerAndSigAction==K_SIG_DFL) {
         //klog("%x/%x default runSignal %d", this->id, this->process->id, signal);
