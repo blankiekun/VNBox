@@ -336,6 +336,10 @@ bool runSlice() {
             vnboxStats.sysMs += sysCallTime / 1000.0;
             vnboxStats.instr += currentThread->cpu->blockInstructionCount;
             if (currentThread->process->name == "wineserver") vnboxStats.wineserverMs += diff / 1000.0;
+            unsigned long long key = ((unsigned long long)currentThread->process->id << 24) | (currentThread->id & 0xFFFFFF);
+            vnboxStats.threadMs[key] += diff / 1000.0;
+            vnboxStats.threadRuns[key]++;
+            if (!vnboxStats.processNames.count(currentThread->process->id)) vnboxStats.processNames[currentThread->process->id] = currentThread->process->name;
         }
         elapsedInstructionsMIPS+=currentThread->cpu->blockInstructionCount;
 

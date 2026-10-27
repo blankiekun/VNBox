@@ -2696,6 +2696,25 @@ static const SyscallFunc syscallFunc[] = {
 extern S32 contextTime; // about the # instruction per 10 ms
 #endif
 void hostHookSyscall(KThread* thread);
+#ifndef BOXEDWINE_MULTI_THREADED
+// stats=1: a Wine client sends each wineserver request as a 64-byte header with write(), or writev() when data follows.
+static void vnboxStatsClientRequest(CPU* cpu, U32 no, U32 buf, U32 len) {
+    KThread* thread = cpu->thread;
+    if (thread->process->name == "wineserver") return; // its replies
+    if (no == 146) { // writev(fd, iov, count): the header is iov[0]
+        if (!len) return;
+        len = thread->memory->readd(buf + 4);
+        buf = thread->memory->readd(buf);
+    }
+    if (len != 64) return;
+    U32 req = thread->memory->readd(buf);
+    if (req >= sizeof(vnboxStats.wineReq) / sizeof(vnboxStats.wineReq[0])) return;
+    vnboxStats.wineReq[req]++;
+    if (!vnboxStats.processNames.count(thread->process->id)) vnboxStats.processNames[thread->process->id] = thread->process->name;
+    vnboxStats.wineReqByThread[((unsigned long long)thread->process->id << 40) | ((unsigned long long)(thread->id & 0xFFFFFF) << 16) | req]++;
+}
+#endif
+
 void ksyscall(CPU* cpu, U32 eipCount) {
     hostHookSyscall(cpu->thread);
     U32 result = -K_ENOSYS;
@@ -2723,7 +2742,7 @@ void ksyscall(CPU* cpu, U32 eipCount) {
     } else {
 #ifndef BOXEDWINE_MULTI_THREADED
         U64 startTime = KSystem::getMicroCounter();
-        U32 statsNo = EAX, statsLen = EDX;
+        U32 statsNo = EAX, statsArg2 = ECX, statsLen = EDX;
 #endif
         result = syscallFunc[EAX](cpu, eipCount);
 #ifndef BOXEDWINE_MULTI_THREADED
@@ -2735,7 +2754,9 @@ void ksyscall(CPU* cpu, U32 eipCount) {
             vnboxStats.sysMsBy[statsNo] += diff / 1000.0;
             vnboxStats.sysPadInstr += (U32)(contextTime*diff/10000);
             // wineserver reads each request's fixed 64-byte header with one read()
-            if (statsNo == 3 && statsLen == 64 && cpu->thread->process->name == "wineserver") vnboxStats.wineserverRequests++;
+            if (statsNo == 3 && statsLen == 64 && result == 64 && cpu->thread->process->name == "wineserver") vnboxStats.wineserverRequests++;
+            if (result == (U32)(-K_WAIT)) vnboxStats.sysBlocked[statsNo]++;
+            else if ((statsNo == 4 || statsNo == 146) && result < 0x80000000) vnboxStatsClientRequest(cpu, statsNo, statsArg2, statsLen);
         }
 #endif
     }    

@@ -23,6 +23,9 @@
 #include "kbrowsersocket.h"
 #include "knativesystem.h"
 #include "vnboxstats.h"
+#include "vnboxwinereq.h"
+#include <algorithm>
+#include <vector>
 
 #ifdef BOXEDWINE_MULTI_THREADED
 #include "knativethread.h"
@@ -221,11 +224,77 @@ static BString statsTopSyscalls(const VnboxStats& s) {
         used[best] = true;
         const char* name = statsSyscallName(best);
         char item[64];
-        if (name) snprintf(item, sizeof(item), "%s%s %ux/%.0fms", k ? ", " : "", name, s.sysCount[best], s.sysMsBy[best]);
-        else snprintf(item, sizeof(item), "%s#%d %ux/%.0fms", k ? ", " : "", best, s.sysCount[best], s.sysMsBy[best]);
+        char blocked[24] = "";
+        if (s.sysBlocked[best]) snprintf(blocked, sizeof(blocked), " (%u blocked)", s.sysBlocked[best]);
+        if (name) snprintf(item, sizeof(item), "%s%s %ux/%.0fms%s", k ? ", " : "", name, s.sysCount[best], s.sysMsBy[best], blocked);
+        else snprintf(item, sizeof(item), "%s#%d %ux/%.0fms%s", k ? ", " : "", best, s.sysCount[best], s.sysMsBy[best], blocked);
         out += item;
     }
     return out.length() ? out : B("-");
+}
+
+static const char* statsWineRequestName(unsigned req) {
+    return req < vnboxWineRequestCount ? vnboxWineRequestNames[req] : "?";
+}
+
+// wineserver requests sent in this window: the 6 most frequent per second, then the 3 busiest sending threads
+// (process:thread id) with their 3 most frequent requests.
+static BString statsWineRequests(const VnboxStats& s, double sec) {
+    const unsigned n = sizeof(s.wineReq) / sizeof(s.wineReq[0]);
+    BString out;
+    unsigned total = 0;
+    for (unsigned i = 0; i < n; i++) total += s.wineReq[i];
+    char item[160];
+    snprintf(item, sizeof(item), "sent/s=%.0f top:", total / sec);
+    out += item;
+    std::vector<std::pair<unsigned, unsigned>> reqs; // count, request
+    for (unsigned i = 0; i < n; i++) if (s.wineReq[i]) reqs.push_back({s.wineReq[i], i});
+    std::sort(reqs.rbegin(), reqs.rend());
+    for (size_t k = 0; k < reqs.size() && k < 6; k++) {
+        snprintf(item, sizeof(item), "%s %s %.0f", k ? "," : "", statsWineRequestName(reqs[k].second), reqs[k].first / sec);
+        out += item;
+    }
+    std::unordered_map<unsigned long long, unsigned> threads; // process << 24 | thread -> count
+    for (auto& e : s.wineReqByThread) threads[e.first >> 16] += e.second;
+    std::vector<std::pair<unsigned, unsigned long long>> busiest;
+    for (auto& e : threads) busiest.push_back({e.second, e.first});
+    std::sort(busiest.rbegin(), busiest.rend());
+    out += " | reqBy:";
+    for (size_t k = 0; k < busiest.size() && k < 3; k++) {
+        unsigned long long key = busiest[k].second;
+        unsigned pid = (unsigned)(key >> 24), tid = (unsigned)(key & 0xFFFFFF);
+        auto name = s.processNames.find(pid);
+        snprintf(item, sizeof(item), "%s %s:%u/%u %.0f (", k ? ";" : "", name != s.processNames.end() ? name->second.c_str() : "?", pid, tid, busiest[k].first / sec);
+        out += item;
+        std::vector<std::pair<unsigned, unsigned>> mine;
+        for (auto& e : s.wineReqByThread) if ((e.first >> 16) == key) mine.push_back({e.second, (unsigned)(e.first & 0xFFFF)});
+        std::sort(mine.rbegin(), mine.rend());
+        for (size_t j = 0; j < mine.size() && j < 3; j++) {
+            snprintf(item, sizeof(item), "%s%s %.0f", j ? ", " : "", statsWineRequestName(mine[j].second), mine[j].first / sec);
+            out += item;
+        }
+        out += ")";
+    }
+    return out;
+}
+
+// The 4 threads with the most guest slice time in this window: "process:pid/tid ms/s (slices/s)".
+static BString statsBusyThreads(const VnboxStats& s, double sec) {
+    std::vector<std::pair<double, unsigned long long>> busiest;
+    for (auto& e : s.threadMs) busiest.push_back({e.second, e.first});
+    std::sort(busiest.rbegin(), busiest.rend());
+    BString out;
+    char item[128];
+    for (size_t k = 0; k < busiest.size() && k < 4; k++) {
+        unsigned long long key = busiest[k].second;
+        unsigned pid = (unsigned)(key >> 24), tid = (unsigned)(key & 0xFFFFFF);
+        auto name = s.processNames.find(pid);
+        auto runs = s.threadRuns.find(key);
+        snprintf(item, sizeof(item), "%s %s:%u/%u %.0fms (%.0f slices)", k ? "," : "", name != s.processNames.end() ? name->second.c_str() : "?", pid, tid,
+            busiest[k].first / sec, runs != s.threadRuns.end() ? runs->second / sec : 0);
+        out += item;
+    }
+    return out.length() ? out : B(" -");
 }
 
 // stats=1: how a tick waited (asked vs real), then every ~2 s one console line with the counters.
@@ -257,18 +326,18 @@ static void statsTickStart() {
         klog_fmt("[stats] %.1fs mips=%u guestBusy=%.0f%% ticks busy=%u idle=%u | timeoutWaits=%u late avg=%.1f max=%.1fms | msg/rAF waits=%u gap avg=%.1f max=%.1fms"
             " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f"
             " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f | input/s=%.1f motion/s=%.0f"
-            " | sys ms/s=%.0f user ms/s=%.0f | topSys: %s | jit instr=%.0f%% (interp %.0f%%) entries/s=%.0f blocksCompiled/s=%.0f"
-            " | wineserver ms/s=%.0f req/s=%.0f | signals/s=%.1f faults/s=%.1f | zipMiss/s=%.1f zipMs/s=%.0f%s",
+            " | sys ms/s=%.0f user ms/s=%.0f | threads/s:%s | topSys: %s | jit instr=%.0f%% (interp %.0f%%) entries/s=%.0f blocksCompiled/s=%.0f"
+            " | wineserver ms/s=%.0f req/s=%.0f | wineReq %s | signals/s=%.1f faults/s=%.1f | zipMiss/s=%.1f zipMs/s=%.0f%s",
             sec, statsLastMips, s.sliceMs / sec / 10.0, s.ticksBusy, s.ticksIdle,
             s.tickWaits, s.tickWaits ? s.tickLateMs / s.tickWaits : 0, s.tickLateMaxMs,
             s.msgWaits, s.msgWaits ? s.msgGapMs / s.msgWaits : 0, s.msgGapMaxMs,
             s.timers, s.timers ? s.timerLateMs / s.timers : 0, s.timerLateMaxMs,
             s.presentsGl / sec, s.presentsGl ? s.presentGlMs / s.presentsGl : 0, s.draws / sec, s.draws ? s.drawMs / s.draws : 0,
             s.glCalls / sec, s.glGetErrors / sec, s.glMs / sec, s.inputs / sec, s.motions / sec,
-            s.sysMs / sec, (s.sliceMs - s.sysMs) / sec, statsTopSyscalls(s).c_str(),
+            s.sysMs / sec, (s.sliceMs - s.sysMs) / sec, statsBusyThreads(s, sec).c_str(), statsTopSyscalls(s).c_str(),
             guestInstr ? 100.0 * s.jitInstr / guestInstr : 0, guestInstr ? 100.0 - 100.0 * s.jitInstr / guestInstr : 0,
             s.jitEntries / sec, s.blocksCompiled / sec,
-            s.wineserverMs / sec, s.wineserverRequests / sec, s.signals / sec, s.faults / sec, s.zipMisses / sec, s.zipMs / sec, js);
+            s.wineserverMs / sec, s.wineserverRequests / sec, statsWineRequests(s, sec).c_str(), s.signals / sec, s.faults / sec, s.zipMisses / sec, s.zipMs / sec, js);
         s = VnboxStats();
         s.on = true;
         statsLastLog = now;
