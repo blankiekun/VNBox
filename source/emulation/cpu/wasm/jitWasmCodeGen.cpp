@@ -4195,19 +4195,24 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     U64 statsPadStart = vnboxStats.sysPadInstr; // syscalls made from compiled blocks add their time as instructions
     WASM_JIT_PROFILE_ONLY(bool loopProfileSample = wasmJitProfileLoopSample();)
     const bool eipProf = vnboxProfOn; // prof=1: time per block, see VnboxProfEntry
-    double eipProfT = eipProf ? emscripten_get_now() : 0;
+    double eipProfT = 0;
     unsigned long long eipProfKey = 0;
     U32 eipProfInstr = 0;
     while (op && op->pfnJitCode && chainedBlocks < WASM_JIT_CHAIN_BLOCK_LIMIT && !cpu->yield) {
         if (eipProf) {
-            double n = emscripten_get_now();
+            // Times one block entry in VNBOX_PROF_EVERY (until the next entry) and scales it: timing every
+            // entry slowed guests about 15x.
             if (eipProfKey) {
                 VnboxProfEntry& e = vnboxProfBlocks[eipProfKey];
-                e.ms += n - eipProfT; e.instr += eipProfInstr; e.entries++;
+                e.ms += (emscripten_get_now() - eipProfT) * VNBOX_PROF_EVERY; e.instr += eipProfInstr * VNBOX_PROF_EVERY; e.entries += VNBOX_PROF_EVERY;
+                eipProfKey = 0;
             }
-            eipProfT = n;
-            eipProfKey = ((unsigned long long)cpu->thread->process->id << 32) | cpu->getEipAddress();
-            eipProfInstr = op->blockOpCount;
+            vnboxProfTick = vnboxProfTick * 1103515245u + 12345u; // pseudo-random pick: a fixed stride aliases with loops
+            if ((vnboxProfTick >> 16) % VNBOX_PROF_EVERY == 0) {
+                eipProfT = emscripten_get_now();
+                eipProfKey = ((unsigned long long)cpu->thread->process->id << 32) | cpu->getEipAddress();
+                eipProfInstr = op->blockOpCount;
+            }
         }
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
         bool profileSample = wasmJitProfileStartEntry();
@@ -4261,7 +4266,7 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
 #if !defined(BOXEDWINE_MULTI_THREADED)
     if (eipProf && eipProfKey) {
         VnboxProfEntry& e = vnboxProfBlocks[eipProfKey];
-        e.ms += emscripten_get_now() - eipProfT; e.instr += eipProfInstr; e.entries++;
+        e.ms += (emscripten_get_now() - eipProfT) * VNBOX_PROF_EVERY; e.instr += eipProfInstr * VNBOX_PROF_EVERY; e.entries += VNBOX_PROF_EVERY;
     }
     if (vnboxStats.on) {
         vnboxStats.jitEntries++;
