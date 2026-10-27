@@ -750,6 +750,14 @@ bool StartUpArgs::apply() {
         }
     }
     //envValues.push_back(B("WINEDEBUG=+wgl"));
+#ifdef __EMSCRIPTEN__
+    // While the d3d channel logs errors, WineD3D calls glGetError after nearly every GL call
+    // (checkGLcall); on WebGL each one is a synchronous round trip to the browser's GPU process,
+    // so Direct3D games crawl. An explicit WINEDEBUG (-env) still wins, e.g. err+d3d for triage.
+    if (!hasEnvValue(envValues, "WINEDEBUG")) {
+        envValues.push_back(B("WINEDEBUG=err-d3d"));
+    }
+#endif
      
     if (userId==0) {
         envValues.push_back(B("PATH=/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin"));
