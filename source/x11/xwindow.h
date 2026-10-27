@@ -165,6 +165,7 @@ public:
 	void iterateMappedChildrenBackToFront(std::function<bool(const XWindowPtr& child)> callback, bool includeTransients = false);
 	void iterateAllMappedDescendants(std::function<void(const XWindowPtr& child)> callback);
 	VisualPtr getVisual() {return visual;}
+	bool isDialog();
 
 	void setTextProperty(KThread* thread, XTextProperty* name, Atom property, bool trace = false);
 	int configure(U32 mask, XWindowChanges* changes);
@@ -254,7 +255,6 @@ private:
 	void removeFromParent();
 	void addToParent();
 
-	bool isDialog();
 	bool isTransient();
 	U32 NET_WM_WINDOW_TYPE();
 	U32 WM_TRANSIENT_FOR();
