@@ -58,7 +58,9 @@
         });
         // registry=jpfonts maps the Windows Japanese font names (ＭＳ ゴシック, MS UI Gothic and so
         // on) to jp.zip's IPA fonts. Japanese games ask for them by name, and some check that
-        // they got them (GetTextFace) and stop when they did not. jp.zip carries the file.
+        // they got them (GetTextFace) and stop when they did not. jp.zip carries the file, which also
+        // turns off the Wine services a VN never needs (vn/build-jp-overlay.sh), for prefixes made
+        // before jp.zip carried a trimmed system.reg.
         REGISTRY_PRESETS.jpfonts = 'reg import Z:\\opt\\wine\\share\\wine\\jp-fonts.reg';
         // wine-override=[name,...] adds these to WINEDLLOVERRIDES
         let WINE_OVERRIDE_PRESETS = {
