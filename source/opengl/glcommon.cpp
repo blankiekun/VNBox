@@ -29,6 +29,7 @@
 #endif
 #include "knativesystem.h"
 #include "glcommon.h"
+#include "vnboxstats.h"
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED)
 #include <SDL.h>
 #include <emscripten/html5_webgl.h>
@@ -2459,6 +2460,16 @@ static void callOpenGLCallback(CPU* cpu, U32 index) {
 #endif
 #if defined(BOXEDWINE_OPENGL) && defined(__EMSCRIPTEN__) && defined(BOXEDWINE_WEBGL_COUNTERS)
     glCallCounters.record(index);
+#endif
+#ifdef __EMSCRIPTEN__
+    if (vnboxStats.on) {
+        double start = emscripten_get_now();
+        int99Callback[index](cpu);
+        vnboxStats.glMs += emscripten_get_now() - start;
+        vnboxStats.glCalls++;
+        if (index == GetError) vnboxStats.glGetErrors++;
+        return;
+    }
 #endif
     int99Callback[index](cpu);
 }

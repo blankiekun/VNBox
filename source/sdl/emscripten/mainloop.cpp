@@ -22,6 +22,7 @@
 #include "knativesocket.h"
 #include "kbrowsersocket.h"
 #include "knativesystem.h"
+#include "vnboxstats.h"
 
 #ifdef BOXEDWINE_MULTI_THREADED
 #include "knativethread.h"
@@ -168,7 +169,56 @@ bool isMainthread() {
     return true;
 }
 
+static double statsLastTickEnd = 0;
+static double statsLastLog = 0;
+static U32 statsLastMips = 0;
+
+// stats=1: how a tick waited (asked vs real), then every ~2 s one console line with the counters.
+static void statsTickStart() {
+    double now = emscripten_get_now();
+    if (statsLastTickEnd) {
+        double gap = now - statsLastTickEnd;
+        int asked = mainLoopTimingMode == EM_TIMING_SETTIMEOUT ? mainLoopTimingValue : -1;
+        if (asked >= 0) {
+            double late = gap - asked;
+            vnboxStats.tickWaits++;
+            vnboxStats.tickLateMs += late;
+            if (late > vnboxStats.tickLateMaxMs) vnboxStats.tickLateMaxMs = late;
+        } else {
+            vnboxStats.msgWaits++;
+            vnboxStats.msgGapMs += gap;
+            if (gap > vnboxStats.msgGapMaxMs) vnboxStats.msgGapMaxMs = gap;
+        }
+    }
+    if (!statsLastLog) {
+        statsLastLog = now;
+    } else if (now - statsLastLog >= 2000) {
+        VnboxStats& s = vnboxStats;
+        double sec = (now - statsLastLog) / 1000.0;
+        klog_fmt("[stats] %.1fs mips=%u guestBusy=%.0f%% ticks busy=%u idle=%u | timeoutWaits=%u late avg=%.1f max=%.1fms | msg/rAF waits=%u gap avg=%.1f max=%.1fms"
+            " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f"
+            " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f | input/s=%.1f motion/s=%.0f",
+            sec, statsLastMips, s.sliceMs / sec / 10.0, s.ticksBusy, s.ticksIdle,
+            s.tickWaits, s.tickWaits ? s.tickLateMs / s.tickWaits : 0, s.tickLateMaxMs,
+            s.msgWaits, s.msgWaits ? s.msgGapMs / s.msgWaits : 0, s.msgGapMaxMs,
+            s.timers, s.timers ? s.timerLateMs / s.timers : 0, s.timerLateMaxMs,
+            s.presentsGl / sec, s.presentsGl ? s.presentGlMs / s.presentsGl : 0, s.draws / sec, s.draws ? s.drawMs / s.draws : 0,
+            s.glCalls / sec, s.glGetErrors / sec, s.glMs / sec, s.inputs / sec, s.motions / sec);
+        s = VnboxStats();
+        s.on = true;
+        statsLastLog = now;
+    }
+}
+
 void mainloop() {
+    static bool statsChecked = false;
+    if (!statsChecked) {
+        statsChecked = true;
+        vnboxStats.on = EM_ASM_INT({ return /[?&]stats=1(&|$)/.test(location.search) ? 1 : 0; }) != 0;
+    }
+    if (vnboxStats.on) {
+        statsTickStart();
+    }
     U64 startTime = KSystem::getMicroCounter();
     checkBrowserSocketEvents();
     bool idle = false;
@@ -201,6 +251,7 @@ void mainloop() {
         if (lastTitleUpdate+1000 < t) {
             lastTitleUpdate = t;
             U32 mipsRaw = getMIPS();
+            statsLastMips = mipsRaw;
             U32 mipsMin = 0, mipsMax = 0;
             U32 mipsAvg = recordMipsSample(mipsRaw, &mipsMin, &mipsMax);
             mipsLogCount++;
@@ -233,6 +284,10 @@ void mainloop() {
         }
     };
     updateMainLoopTiming(idle);
+    if (vnboxStats.on) {
+        if (idle) vnboxStats.ticksIdle++; else vnboxStats.ticksBusy++;
+        statsLastTickEnd = emscripten_get_now();
+    }
 }
 
 #endif

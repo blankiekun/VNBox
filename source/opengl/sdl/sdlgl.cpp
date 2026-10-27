@@ -24,6 +24,7 @@
 #include "sdlglInternal.h"
 #include <SDL_opengl.h>
 #include "../glcommon.h"
+#include "vnboxstats.h"
 
 #include <SDL.h>
 #include "knativesystem.h"
@@ -1057,6 +1058,9 @@ void KOpenGLSdl::glSwapBuffers(KThread* thread, const std::shared_ptr<XDrawable>
         window = sdlWindowById.get(d->id);
     }
     if (window) {
+#ifdef __EMSCRIPTEN__
+        double swapStart = vnboxStats.on ? emscripten_get_now() : 0;
+#endif
         window->showWindow(true);
 #ifdef BOXEDWINE_LOCAL_SERVER
         captureGlFrame(d);
@@ -1126,6 +1130,10 @@ void KOpenGLSdl::glSwapBuffers(KThread* thread, const std::shared_ptr<XDrawable>
 #endif
         presented = true;
 #ifdef __EMSCRIPTEN__
+        if (vnboxStats.on) {
+            vnboxStats.presentsGl++;
+            vnboxStats.presentGlMs += emscripten_get_now() - swapStart;
+        }
         if (thread && thread->cpu) {
             thread->cpu->yield = true;
         }
