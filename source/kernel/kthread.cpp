@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "devntsync.h"
 
 #include "kscheduler.h"
 #include "ksignal.h"
@@ -81,6 +82,7 @@ void KThread::internalCleanup() {
     }
 #endif    
     this->clearFutexes();    
+    ntsyncThreadExit(this);
     this->exitRobustList();
     this->robustList = 0;
     if (this->process) {

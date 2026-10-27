@@ -2402,6 +2402,7 @@ U32 KProcess::clone3(KThread* thread, U32 args, U32 size) {
 
 U32 KProcess::clone(KThread* thread, U32 flags, U32 child_stack, U32 ptid, U32 tls, U32 ctid) {    
     flags &= ~CSIGNAL;
+    flags &= ~0x00400000; // CLONE_DETACHED: Linux ignores it, musl's pthread_create still passes it
     
     if (!(flags & K_CLONE_THREAD)) { // new thread group (process)
         bool vFork = false;
