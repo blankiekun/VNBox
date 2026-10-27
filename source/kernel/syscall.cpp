@@ -2730,7 +2730,7 @@ void ksyscall(CPU* cpu, U32 eipCount) {
         U64 diff = KSystem::getMicroCounter()-startTime;
         sysCallTime+=diff;  
         cpu->blockInstructionCount+=(U32)(contextTime*diff/10000);
-        if (vnboxStats.on) {
+        if (vnboxStats.on && statsNo < 440) { // EAX is guest-chosen; the arrays cover the known syscalls
             vnboxStats.sysCount[statsNo]++;
             vnboxStats.sysMsBy[statsNo] += diff / 1000.0;
             vnboxStats.sysPadInstr += (U32)(contextTime*diff/10000);
