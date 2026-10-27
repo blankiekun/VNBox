@@ -16,6 +16,7 @@ var vnboxMovies = new Map(); // id → movie
 
 var VNBOX_MOVIE_CHUNK = 1 << 20;
 var VNBOX_MOVIE_AHEAD = 2 << 20; // keep this much undecoded data in the ring buffer
+var vnboxMovieStats = new URLSearchParams(location.search).get("stats") === "1";
 
 function VnboxMovie(blob, canvas) {
     this.blob = blob;
@@ -79,6 +80,7 @@ VnboxMovie.prototype.run = function () {
     this.gain.connect(vnboxMovieAudio.destination);
     this.last = performance.now() / 1000;
     this.clock = null; // set from the first decode, once the decoder is ready
+    this.stats = null;
     var step = () => {
         if (!this.running) return;
         this.frame = requestAnimationFrame(step);
@@ -111,7 +113,27 @@ VnboxMovie.prototype.draw = function () {
     var D = this.D, m = this.m, w = D._vm_width(m), h = D._vm_height(m);
     if (this.canvas.width !== w || this.canvas.height !== h) { this.canvas.width = w; this.canvas.height = h; }
     this.context.putImageData(new ImageData(new Uint8ClampedArray(D.HEAPU8.buffer, D._vm_rgba(m), w * h * 4), w, h), 0, 0);
-    if (!this.decoded) { this.decoded = true; vnboxMoviePlace(this); }
+    if (!this.decoded) {
+        this.decoded = true;
+        console.log("[movie] playing " + w + "x" + h + " at " + D._vm_framerate(m).toFixed(2) + " fps");
+        vnboxMoviePlace(this);
+    }
+    this.noteShown(D._vm_frames(m));
+};
+
+// stats=1: every ~2 s while it plays, the frames shown and decoded per second and the longest gap between two shown.
+VnboxMovie.prototype.noteShown = function (decoded) {
+    if (!vnboxMovieStats) return;
+    var now = performance.now(), s = this.stats;
+    if (!s) s = this.stats = { start: now, last: now, shown: 0, decoded: decoded, gap: 0 };
+    s.shown++;
+    s.gap = Math.max(s.gap, now - s.last);
+    s.last = now;
+    var sec = (now - s.start) / 1000;
+    if (sec < 2) return;
+    console.log("[movie] stats shown/s=" + (s.shown / sec).toFixed(1) + " decoded/s=" + ((decoded - s.decoded) / sec).toFixed(1) +
+        " maxGap=" + s.gap.toFixed(0) + "ms");
+    this.stats = { start: now, last: now, shown: 0, decoded: decoded, gap: 0 };
 };
 
 VnboxMovie.prototype.play = function (time, pointer) {
