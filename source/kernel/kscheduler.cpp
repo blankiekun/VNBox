@@ -19,11 +19,14 @@
 #include "boxedwine.h"
 #include "../x11/x11.h"
 #include "knativeaudio.h"
+#include "vnboxstats.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #else
 #include <chrono>
 #endif
+
+VnboxStats vnboxStats;
 
 #ifdef BOXEDWINE_MULTI_THREADED
 static KList<KTimerCallback*> timers;
@@ -252,6 +255,12 @@ void runTimers() {
         KTimerCallback* timer = node->data;
 
         if (timer->millies<=millies) {
+            if (vnboxStats.on) {
+                double late = (double)(millies - timer->millies);
+                vnboxStats.timers++;
+                vnboxStats.timerLateMs += late;
+                if (late > vnboxStats.timerLateMaxMs) vnboxStats.timerLateMaxMs = late;
+            }
             if (timer->run()) {                
                 timer->node.remove();
             }
@@ -272,7 +281,16 @@ bool runSlice() {
     XServer* server = XServer::getServer(true);
     if (server) {
         server->isDisplayDirty = true; // a bit of a hack, sometimes popups in Basstour get missed and don't draw
+#ifdef __EMSCRIPTEN__
+        double drawStart = vnboxStats.on ? emscripten_get_now() : 0;
+#endif
         server->draw();
+#ifdef __EMSCRIPTEN__
+        if (vnboxStats.on) {
+            vnboxStats.draws++;
+            vnboxStats.drawMs += emscripten_get_now() - drawStart;
+        }
+#endif
     }
 
     U64 elapsedTime = 0;
@@ -312,7 +330,8 @@ bool runSlice() {
 
         elapsedTime = schedulerMicroCounter() - sliceStart;
 
-        elapsedTimeMIPS+=diff;        
+        elapsedTimeMIPS+=diff;
+        if (vnboxStats.on) vnboxStats.sliceMs += diff / 1000.0;
         elapsedInstructionsMIPS+=currentThread->cpu->blockInstructionCount;
 
         currentThread->userTime+=diff-sysCallTime;

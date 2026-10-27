@@ -26,6 +26,7 @@
 #include "kdspaudio.h"
 #include "devcdrom.h"
 #include "sdlStatusBar.h"
+#include "vnboxstats.h"
 
 #ifdef __APPLE__
 #include "../mac/macCursor.h"
@@ -907,9 +908,15 @@ bool KNativeInputSDL::processEvents() {
             callback->run();
         } else
 #endif
+        {
+            if (vnboxStats.on) {
+                if (e.type == SDL_MOUSEMOTION) vnboxStats.motions++;
+                else if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP || e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) vnboxStats.inputs++;
+            }
             if (!handlSdlEvent(&e)) {
                 return false;
             }
+        }
     }
     return true;
 }
