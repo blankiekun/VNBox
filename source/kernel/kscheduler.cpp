@@ -331,7 +331,12 @@ bool runSlice() {
         elapsedTime = schedulerMicroCounter() - sliceStart;
 
         elapsedTimeMIPS+=diff;
-        if (vnboxStats.on) vnboxStats.sliceMs += diff / 1000.0;
+        if (vnboxStats.on) {
+            vnboxStats.sliceMs += diff / 1000.0;
+            vnboxStats.sysMs += sysCallTime / 1000.0;
+            vnboxStats.instr += currentThread->cpu->blockInstructionCount;
+            if (currentThread->process->name == "wineserver") vnboxStats.wineserverMs += diff / 1000.0;
+        }
         elapsedInstructionsMIPS+=currentThread->cpu->blockInstructionCount;
 
         currentThread->userTime+=diff-sysCallTime;

@@ -23,7 +23,8 @@ var LAZY_READAHEAD = 4 * LAZY_BLOCK; // read past the requested range when reads
 var LAZY_RUN_MAX = 1 << 22; // longest single read (and the sab buffer)
 var LAZY_EAGER_MAX = 1 << 20;
 var LAZY_CACHE_BLOCKS = 64; // 4 MiB
-var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, waitMs: 0, files: 0, mode: "", overlay: 0, copied: 0 };
+// win: the stats=1 window (jspi reads), set and taken by the [stats] line every ~2 s; null when stats are off.
+var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, waitMs: 0, files: 0, mode: "", overlay: 0, copied: 0, win: null };
 window.__lazyStats = lazyStats;
 var lazyCache = new Map(); // "file:block" → Uint8Array, insertion order = LRU order
 var lazyFiles = []; // jspi mode: File objects by index
@@ -59,6 +60,7 @@ function lazyKeepRun(file, start, bytes) {
         lazyStats.blocksFetched++;
     }
     lazyStats.bytesFetched += bytes.length;
+    if (lazyStats.win) { lazyStats.win.fetches++; lazyStats.win.fetchBytes += bytes.length; }
     while (lazyCache.size > LAZY_CACHE_BLOCKS) lazyCache.delete(lazyCache.keys().next().value);
     return { start: start, bytes: bytes };
 }
@@ -118,7 +120,7 @@ function lazyReadRunAsync(file, start, length) {
 // fd_read/fd_pread for lazy nodes in jspi mode (lazyfs-jspi-lib.js): reads every iovec, then
 // stores the count. Returns a promise, which suspends the wasm caller.
 async function lazyReadvAsync(stream, iov, iovcnt, offset) {
-    var total = 0, pos = offset === undefined ? stream.position : offset;
+    var total = 0, pos = offset === undefined ? stream.position : offset, t = performance.now();
     for (var i = 0; i < iovcnt; i++) {
         var ptr = HEAPU32[(iov + i * 8) >> 2], len = HEAPU32[(iov + i * 8 + 4) >> 2];
         var n = await lazyCopy(stream.node, HEAPU8, ptr, len, pos + total, lazyReadRunAsync);
@@ -126,6 +128,11 @@ async function lazyReadvAsync(stream, iov, iovcnt, offset) {
         if (n < len) break;
     }
     if (offset === undefined) stream.position += total;
+    var w = lazyStats.win;
+    if (w) { // the whole suspension, cache hits included: the guest slice waits all of it
+        var ms = performance.now() - t, name = stream.node.name;
+        w.reads++; w.bytes += total; w.ms += ms; w.files[name] = (w.files[name] || 0) + ms;
+    }
     return total;
 }
 

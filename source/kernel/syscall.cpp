@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 
 #include "kinotify.h"
+#include "vnboxstats.h"
 
 #include "log.h"
 #include "kscheduler.h"
@@ -2722,12 +2723,20 @@ void ksyscall(CPU* cpu, U32 eipCount) {
     } else {
 #ifndef BOXEDWINE_MULTI_THREADED
         U64 startTime = KSystem::getMicroCounter();
+        U32 statsNo = EAX, statsLen = EDX;
 #endif
         result = syscallFunc[EAX](cpu, eipCount);
 #ifndef BOXEDWINE_MULTI_THREADED
         U64 diff = KSystem::getMicroCounter()-startTime;
         sysCallTime+=diff;  
         cpu->blockInstructionCount+=(U32)(contextTime*diff/10000);
+        if (vnboxStats.on) {
+            vnboxStats.sysCount[statsNo]++;
+            vnboxStats.sysMsBy[statsNo] += diff / 1000.0;
+            vnboxStats.sysPadInstr += (U32)(contextTime*diff/10000);
+            // wineserver reads each request's fixed 64-byte header with one read()
+            if (statsNo == 3 && statsLen == 64 && cpu->thread->process->name == "wineserver") vnboxStats.wineserverRequests++;
+        }
 #endif
     }    
 #ifdef BOXEDWINE_MULTI_THREADED

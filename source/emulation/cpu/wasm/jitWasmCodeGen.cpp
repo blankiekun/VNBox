@@ -25,6 +25,7 @@
 #include "wasmJitBatchPolicy.h"
 #include "wasmMemoryOrdering.h"
 #include "wasmModuleMerger.h"
+#include "vnboxstats.h"
 #include "../jit/jitCodeGen.h"
 #include "../jit/jitCodeLifecycle.h"
 #ifdef __TEST
@@ -1972,6 +1973,7 @@ static inline void wasmJitProfileSlotMiss() {
 }
 
 static inline void wasmJitProfileCompiledBlock(U32 opCount) {
+    if (vnboxStats.on) vnboxStats.blocksCompiled++;
     g_wasmJitProfileCompiledBlocks.fetch_add(1, std::memory_order_relaxed);
     g_wasmJitProfileCompiledOps.fetch_add(opCount, std::memory_order_relaxed);
     if (opCount <= 1) {
@@ -2305,7 +2307,9 @@ EM_JS(int, boxedwine_wasm_instantiate,
         }
 #endif
         var wasmBytes = new Uint8Array(HEAPU8.buffer, bytes >>> 0, size);
+        var statsT = performance.now();
         var mod = new WebAssembly.Module(wasmBytes);
+        if (Module.vnboxJit) { Module.vnboxJit.ms += performance.now() - statsT; Module.vnboxJit.n++; }
 
         // Build the helper imports object.  Each entry in importFns is a C++
         // function pointer that already lives in wasmTable (since all Emscripten
@@ -2412,7 +2416,9 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int siz
             throw new Error('out of memory');
         }
 #endif
+        var statsT = performance.now();
         var module = new WebAssembly.Module(new Uint8Array(HEAPU8.buffer, bytes >>> 0, size));
+        if (Module.vnboxJit) { Module.vnboxJit.ms += performance.now() - statsT; Module.vnboxJit.n++; }
         var helpers = {};
         var imports = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
         for (var i = 0; i < importCount; ++i) {
@@ -2797,7 +2803,9 @@ EM_JS(int, boxedwine_wasm_lookup_cached,
                 data[off + 4] = ((v >>> 21) & 0x7f) | 0x80;
                 data[off + 5] = ((v >>> 28) & 0x0f) | ((v & 0x80000000) ? 0x70 : 0);
             });
+            var statsT = performance.now();
             mod = new WebAssembly.Module(data); // per-(group, process) compile
+            if (Module.vnboxJit) { Module.vnboxJit.ms += performance.now() - statsT; Module.vnboxJit.n++; }
         }
 
         var helpers = {};
@@ -2910,7 +2918,9 @@ EM_JS(int, boxedwine_wasm_lookup_cached,
     }
     try {
         if (!mod) {
+            var statsT = performance.now();
             mod = new WebAssembly.Module(cached);
+            if (Module.vnboxJit) { Module.vnboxJit.ms += performance.now() - statsT; Module.vnboxJit.n++; }
             if (!Module.wasmJitCompiledCache) Module.wasmJitCompiledCache = new Map();
             Module.wasmJitCompiledCache.set(key, mod);
         }
@@ -4179,6 +4189,8 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     U32 chainedBlocks = 0;
     U32 chainedInstructionCount = 0;
     bool memoryArraysChecked = false;
+    U32 statsStart = cpu->blockInstructionCount - op->blockOpCount; // run() counted the first block before calling in
+    U64 statsPadStart = vnboxStats.sysPadInstr; // syscalls made from compiled blocks add their time as instructions
     WASM_JIT_PROFILE_ONLY(bool loopProfileSample = wasmJitProfileLoopSample();)
     while (op && op->pfnJitCode && chainedBlocks < WASM_JIT_CHAIN_BLOCK_LIMIT && !cpu->yield) {
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
@@ -4233,6 +4245,10 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     }
 #if !defined(BOXEDWINE_MULTI_THREADED)
     cpu->blockInstructionCount += chainedInstructionCount;
+    if (vnboxStats.on) {
+        vnboxStats.jitEntries++;
+        vnboxStats.jitInstr += cpu->blockInstructionCount - statsStart - (U32)(vnboxStats.sysPadInstr - statsPadStart);
+    }
     WASM_JIT_PROFILE_ONLY(if (loopProfileSample) { bool stoppedAtLimit = chainedBlocks == WASM_JIT_CHAIN_BLOCK_LIMIT && wasmJitCanChainTo(cpu, op); wasmJitProfileLoop(chainedBlocks, stoppedAtLimit, WASM_JIT_PROFILE_TIMING_SAMPLE); if (!stoppedAtLimit) { wasmJitProfileChainStop(cpu, op, WASM_JIT_PROFILE_TIMING_SAMPLE); } })
 #endif
 #endif

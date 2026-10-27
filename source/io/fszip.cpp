@@ -27,6 +27,7 @@ extern "C"
 #include "fsfilenode.h"
 #include "fszip.h"
 #include "fszipnode.h"
+#include "vnboxstats.h"
 
 void FsZip::resetZipRead() {
     auto first = checkpoints.lower_bound(std::make_pair(lastZipOffset, (U64)0));
@@ -123,6 +124,7 @@ bool FsZip::setupZipRead(U64 zipOffset, U64 zipFileOffset) {
 // Inflates the block at the current, block aligned, position into the cache.
 const std::vector<U8>* FsZip::readBlock(U64 zipOffset) {
     auto key = std::make_pair(zipOffset, lastZipFileOffset / blockSize);
+    U64 statsStart = vnboxStats.on ? KSystem::getMicroCounter() : 0;
     std::vector<U8> bytes(blockSize);
     U32 got = 0;
     while (got < blockSize) {
@@ -157,6 +159,10 @@ const std::vector<U8>* FsZip::readBlock(U64 zipOffset) {
     Block& block = blocks[key];
     block.bytes = std::move(bytes);
     block.used = ++checkpointClock;
+    if (vnboxStats.on) {
+        vnboxStats.zipMisses++;
+        vnboxStats.zipMs += (KSystem::getMicroCounter() - statsStart) / 1000.0;
+    }
     return &block.bytes;
 }
 

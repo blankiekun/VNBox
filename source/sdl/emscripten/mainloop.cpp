@@ -173,6 +173,61 @@ static double statsLastTickEnd = 0;
 static double statsLastLog = 0;
 static U32 statsLastMips = 0;
 
+// stats=1: the browser side of the line (JIT module compiles, lazy game/zip file reads), taken and reset per window.
+EM_JS(void, statsJsPart, (char* out, int len, double sec), {
+    var j = Module.vnboxJit || { ms: 0, n: 0 };
+    Module.vnboxJit = { ms: 0, n: 0 };
+    var s = " | jitCompile ms/s=" + (j.ms / sec).toFixed(0) + " modules/s=" + (j.n / sec).toFixed(1);
+    var l = globalThis.__lazyStats;
+    if (l) {
+        var w = l.win || { reads: 0, bytes: 0, ms: 0, fetches: 0, fetchBytes: 0, files: {} };
+        l.win = { reads: 0, bytes: 0, ms: 0, fetches: 0, fetchBytes: 0, files: {} };
+        var top = Object.entries(w.files).sort(function(a, b) { return b[1] - a[1]; }).slice(0, 3)
+            .map(function(e) { return e[0] + " " + e[1].toFixed(0) + "ms"; }).join(", ");
+        s += " | lazy wait ms/s=" + (w.ms / sec).toFixed(0) + " reads/s=" + (w.reads / sec).toFixed(0) +
+            " KB/s=" + (w.bytes / 1024 / sec).toFixed(0) + " avgRead=" + (w.reads ? w.bytes / 1024 / w.reads : 0).toFixed(1) + "KB" +
+            " fetches/s=" + (w.fetches / sec).toFixed(1) + " fetchKB/s=" + (w.fetchBytes / 1024 / sec).toFixed(0) + " top: " + (top || "-");
+    }
+    stringToUTF8(s, out, len);
+});
+
+static const char* statsSyscallName(U32 n) { // i386 numbers; the ones a Wine game tends to spend time in
+    switch (n) {
+    case 3: return "read"; case 4: return "write"; case 5: return "open"; case 6: return "close"; case 19: return "lseek";
+    case 33: return "access"; case 45: return "brk"; case 54: return "ioctl"; case 77: return "getrusage"; case 78: return "gettimeofday";
+    case 90: return "mmap"; case 91: return "munmap"; case 102: return "socketcall"; case 125: return "mprotect";
+    case 140: return "llseek"; case 142: return "select"; case 145: return "readv"; case 146: return "writev";
+    case 158: return "sched_yield"; case 162: return "nanosleep"; case 168: return "poll"; case 174: return "rt_sigaction";
+    case 175: return "rt_sigprocmask"; case 180: return "pread64"; case 181: return "pwrite64"; case 192: return "mmap2";
+    case 195: return "stat64"; case 196: return "lstat64"; case 197: return "fstat64"; case 220: return "getdents64";
+    case 221: return "fcntl64"; case 240: return "futex"; case 256: return "epoll_wait"; case 265: return "clock_gettime";
+    case 295: return "openat"; case 300: return "fstatat64"; case 308: return "pselect6"; case 309: return "ppoll";
+    case 319: return "epoll_pwait"; case 403: return "clock_gettime64"; case 407: return "clock_nanosleep64";
+    case 413: return "pselect6_64"; case 414: return "ppoll64"; case 422: return "futex64";
+    default: return nullptr;
+    }
+}
+
+// The 5 syscalls with the most ms in this window: "name count/ms, ...".
+static BString statsTopSyscalls(const VnboxStats& s) {
+    BString out;
+    bool used[440] = {};
+    for (int k = 0; k < 5; k++) {
+        int best = -1;
+        for (int i = 0; i < 440; i++) {
+            if (!used[i] && s.sysCount[i] && (best < 0 || s.sysMsBy[i] > s.sysMsBy[best])) best = i;
+        }
+        if (best < 0) break;
+        used[best] = true;
+        const char* name = statsSyscallName(best);
+        char item[64];
+        if (name) snprintf(item, sizeof(item), "%s%s %ux/%.0fms", k ? ", " : "", name, s.sysCount[best], s.sysMsBy[best]);
+        else snprintf(item, sizeof(item), "%s#%d %ux/%.0fms", k ? ", " : "", best, s.sysCount[best], s.sysMsBy[best]);
+        out += item;
+    }
+    return out.length() ? out : B("-");
+}
+
 // stats=1: how a tick waited (asked vs real), then every ~2 s one console line with the counters.
 static void statsTickStart() {
     double now = emscripten_get_now();
@@ -195,15 +250,25 @@ static void statsTickStart() {
     } else if (now - statsLastLog >= 2000) {
         VnboxStats& s = vnboxStats;
         double sec = (now - statsLastLog) / 1000.0;
+        // instructions the guest ran; syscalls also add their time as made-up instructions (kept out of the share)
+        double guestInstr = s.instr > s.sysPadInstr ? (double)(s.instr - s.sysPadInstr) : 0;
+        char js[512];
+        statsJsPart(js, sizeof(js), sec);
         klog_fmt("[stats] %.1fs mips=%u guestBusy=%.0f%% ticks busy=%u idle=%u | timeoutWaits=%u late avg=%.1f max=%.1fms | msg/rAF waits=%u gap avg=%.1f max=%.1fms"
             " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f"
-            " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f | input/s=%.1f motion/s=%.0f",
+            " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f | input/s=%.1f motion/s=%.0f"
+            " | sys ms/s=%.0f user ms/s=%.0f | topSys: %s | jit instr=%.0f%% (interp %.0f%%) entries/s=%.0f blocksCompiled/s=%.0f"
+            " | wineserver ms/s=%.0f req/s=%.0f | signals/s=%.1f faults/s=%.1f | zipMiss/s=%.1f zipMs/s=%.0f%s",
             sec, statsLastMips, s.sliceMs / sec / 10.0, s.ticksBusy, s.ticksIdle,
             s.tickWaits, s.tickWaits ? s.tickLateMs / s.tickWaits : 0, s.tickLateMaxMs,
             s.msgWaits, s.msgWaits ? s.msgGapMs / s.msgWaits : 0, s.msgGapMaxMs,
             s.timers, s.timers ? s.timerLateMs / s.timers : 0, s.timerLateMaxMs,
             s.presentsGl / sec, s.presentsGl ? s.presentGlMs / s.presentsGl : 0, s.draws / sec, s.draws ? s.drawMs / s.draws : 0,
-            s.glCalls / sec, s.glGetErrors / sec, s.glMs / sec, s.inputs / sec, s.motions / sec);
+            s.glCalls / sec, s.glGetErrors / sec, s.glMs / sec, s.inputs / sec, s.motions / sec,
+            s.sysMs / sec, (s.sliceMs - s.sysMs) / sec, statsTopSyscalls(s).c_str(),
+            guestInstr ? 100.0 * s.jitInstr / guestInstr : 0, guestInstr ? 100.0 - 100.0 * s.jitInstr / guestInstr : 0,
+            s.jitEntries / sec, s.blocksCompiled / sec,
+            s.wineserverMs / sec, s.wineserverRequests / sec, s.signals / sec, s.faults / sec, s.zipMisses / sec, s.zipMs / sec, js);
         s = VnboxStats();
         s.on = true;
         statsLastLog = now;
@@ -220,6 +285,10 @@ void mainloop() {
             try { if (parent !== window) q += "&" + parent.location.search.slice(1); } catch (e) {}
             return /[?&]stats=1(&|$)/.test(q) ? 1 : 0;
         }) != 0;
+        if (vnboxStats.on) {
+            char js[512];
+            statsJsPart(js, sizeof(js), 1); // starts the JS side's counting
+        }
     }
     if (vnboxStats.on) {
         statsTickStart();
