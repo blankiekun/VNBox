@@ -8,7 +8,7 @@ What changed:
 - Lazy game folders: games are read on demand from OPFS or a directory handle, so they are never copied into memory; saves go to an IndexedDB overlay.
 - Root fs zips are streamed once into OPFS and read in blocks.
 - A Frida-compatible layer (`frida-compat.js`) runs text hook scripts and hands each dialogue line to the page.
-- A Japanese overlay, `jp.zip`: IPA fonts and a `ja_JP.utf8` locale name (`vn/`).
+- A Japanese overlay, `jp.zip`: IPA fonts, a `ja_JP.utf8` locale name and a Wine prefix registry without the services a VN never needs, so Wine boots faster (`vn/`).
 
 Build (Emscripten 5.0.7): `make -C project/emscripten jitJspi`; output in `project/emscripten/Build/JitJspi`. `vn/build-jp-overlay.sh <root fs zip> jp.zip` builds the overlay.
 
