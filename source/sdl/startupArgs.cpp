@@ -379,6 +379,9 @@ std::vector<BString> StartUpArgs::buildArgs() {
     if (this->forceRelativeMouse) {
         args.push_back(B("-forceRelativeMouse"));
     }
+    if (this->fitWindow) {
+        args.push_back(B("-fitWindow"));
+    }
     if (this->rel_mouse_sensitivity) {
         args.push_back(B("-rel_mouse_sensitivity"));
         args.push_back(BString::valueOf(this->rel_mouse_sensitivity));
@@ -435,11 +438,12 @@ static std::vector<BString> cdromInstallerArgs(const BString& drive) {
 // starts, so the value has to be in system.reg before launch ("reg add" from the
 // launched command would only take effect on the next run). winecfg writes the
 // same value when a drive's type is set to CD-ROM.
-static void setWineDriveType(const char* drive, const char* type) {
-    std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(B(""), B("/home/username/.wine/system.reg"), true);
+// file is system.reg (HKLM) or user.reg (HKCU); section is the key's line, backslashes escaped.
+static void setWineRegValue(const char* file, const std::string& section, const char* valueName, const char* value) {
+    std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(B(""), B("/home/username/.wine/") + BString::copy(file), true);
     FsOpenNode* openNode = node ? node->open(K_O_RDONLY) : nullptr;
     if (!openNode) {
-        klog_fmt("could not set drive %s to %s: system.reg was not found", drive, type);
+        klog_fmt("could not set %s to %s: %s was not found", valueName, value, file);
         return;
     }
     std::string reg;
@@ -455,10 +459,8 @@ static void setWineDriveType(const char* drive, const char* type) {
         std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)tolower(c); });
         return s;
     };
-    // system.reg keys are relative to HKLM and escape their backslashes
-    const std::string section = "[Software\\\\Wine\\\\Drives]";
-    const std::string name = std::string("\"") + drive + "\"=";
-    const std::string entry = name + "\"" + type + "\"";
+    const std::string name = std::string("\"") + valueName + "\"=";
+    const std::string entry = name + "\"" + value + "\"";
     size_t insertAt = std::string::npos;
     bool inSection = false;
     bool replaced = false;
@@ -508,13 +510,13 @@ static void setWineDriveType(const char* drive, const char* type) {
 
     openNode = node->open(K_O_WRONLY | K_O_TRUNC);
     if (!openNode) {
-        klog_fmt("could not set drive %s to %s: system.reg could not be written", drive, type);
+        klog_fmt("could not set %s to %s: %s could not be written", valueName, value, file);
         return;
     }
     if (openNode->writeNative((U8*)reg.data(), (U32)reg.size()) != reg.size()) {
-        klog_fmt("could not set drive %s to %s: system.reg write failed", drive, type);
+        klog_fmt("could not set %s to %s: %s write failed", valueName, value, file);
     } else {
-        klog_fmt("set Wine drive %s to %s in system.reg", drive, type);
+        klog_fmt("set %s to %s in %s", valueName, value, file);
     }
     openNode->close();
     delete openNode;
@@ -537,6 +539,7 @@ bool StartUpArgs::apply() {
 #endif
     KSystem::disableHideCursor = this->disableHideCursor;
     KSystem::forceRelativeMouse = this->forceRelativeMouse;
+    KSystem::fitWindow = this->fitWindow;
     KSystem::relativeMouseSensitivity = this->rel_mouse_sensitivity ? this->rel_mouse_sensitivity : 100;
     KSystem::cacheReads = this->cacheReads;
     KSystem::disableWasmJitForWrittenCode = this->disableWasmJitForWrittenCode;
@@ -811,6 +814,12 @@ bool StartUpArgs::apply() {
         }
     }
 #endif
+    if (this->fitWindow) {
+        // Wine then leaves the game window's title bar and frame to the window manager, and
+        // the X server shows only its client area, filling the screen (XServer::fitWindow).
+        setWineRegValue("user.reg", "[Software\\\\Wine\\\\X11 Driver]", "Decorated", "Y");
+        setWineRegValue("user.reg", "[Software\\\\Wine\\\\X11 Driver]", "Managed", "Y");
+    }
     if (configureCdrom) {
         // The drive letter links to the disc while one is in the drive (see cdromInit).
         // Disc 1 goes in now: Wine's mountmgr only sets up drives whose link exists
@@ -823,7 +832,7 @@ bool StartUpArgs::apply() {
             link = BString::empty;
         } else if (dosdevParent) {
             Fs::addFileNode(link + ":", B("/dev/sr0"), B(""), false, dosdevParent);
-            setWineDriveType(drive.c_str(), "cdrom");
+            setWineRegValue("system.reg", "[Software\\\\Wine\\\\Drives]", drive.c_str(), "cdrom");
         } else {
             link = BString::empty;
         }
@@ -1277,6 +1286,8 @@ bool StartUpArgs::parseStartupArgs(int argc, const char **argv) {
             this->disableHideCursor = true;
         } else if (!strcmp(argv[i], "-forceRelativeMouse")) {
             this->forceRelativeMouse = true;
+        } else if (!strcmp(argv[i], "-fitWindow")) {
+            this->fitWindow = true;
         }  else if (!strcmp(argv[i], "-cacheReads")) {
             this->cacheReads = true;
         }  else if (!strcmp(argv[i], "-disableWasmJitForWrittenCode")) {

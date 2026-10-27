@@ -670,6 +670,7 @@ int XWindow::mapWindow() {
 		return Success;
 	}
 	isMapped = true;
+	fitToScreen();
 	setDirty();
 	setWmState(NormalState, 0);
 	if (parent) {
@@ -1042,6 +1043,29 @@ void XWindow::configureNotify() {
 		});	
 }
 
+// -fitWindow: as a window manager would maximize it, the game's main window (a managed
+// top-level window with a frame, not a dialog) stays at 0,0 and the screen takes its size.
+// With Wine's Decorated=Y (StartUpArgs::apply) such an X window is only the client area, so
+// the game fills the screen without a title bar or desktop around it. Frameless windows
+// (a game's own full screen) are left where the game puts them.
+void XWindow::fitToScreen() {
+	if (!KSystem::fitWindow || !isMapped || parent != XServer::getServer()->getRoot() || attributes.override_redirect || isDialog()) {
+		return;
+	}
+	XPropertyPtr hints = getProperty(_MOTIF_WM_HINTS);
+	const U32* mwm = hints && hints->length >= 12 ? (const U32*)hints->value : nullptr;
+	if (!mwm || !(mwm[0] & 2) || !mwm[2]) { // MWM_HINTS_DECORATIONS, decorations
+		return;
+	}
+	KNativeScreenPtr screen = KNativeSystem::getScreen();
+	if (screen && (screen->screenWidth() != width() || screen->screenHeight() != height())) {
+		XServer::getServer()->changeScreen(width(), height());
+	}
+	if (left || top) {
+		moveResize(0, 0, width(), height());
+	}
+}
+
 int XWindow::moveResize(S32 x, S32 y, U32 width, U32 height) {
 	if (this->left == x && this->top == y && this->width() == width && this->height() == height) {
 		return Success;
@@ -1104,6 +1128,9 @@ int XWindow::configure(U32 mask, XWindowChanges* changes) {
 		KNativeSystem::moveWindow(shared_from_this());
 	}
 	configureNotify();
+	if (sizeChanged) {
+		fitToScreen();
+	}
 	// :TODO:
 	if (c_class == InputOutput && isMapped) {
 		XServer::getServer()->iterateEventMask(id, ExposureMask, [this](const DisplayDataPtr& data) {
