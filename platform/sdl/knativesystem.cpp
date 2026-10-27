@@ -209,7 +209,9 @@ void KNativeSystem::showWindow(const XWindowPtr & wnd, bool bShow) {
         // WineD3D can map the non-GL parent window after the GL drawable is
         // active. In the single-threaded build that software window shares the
         // browser canvas stack, so showing it can cover the real GL frame.
-        if (opengl && opengl->isActive() && !screen->isVisible() && wnd) {
+        // A dialog (a movie error, a MessageBox) has no GL frame of its own: it
+        // needs the software screen, or it waits unseen behind the game's frame.
+        if (opengl && opengl->isActive() && !screen->isVisible() && wnd && !wnd->isDialog()) {
             return;
         }
 #endif
