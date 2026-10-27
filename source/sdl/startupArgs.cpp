@@ -931,6 +931,13 @@ bool StartUpArgs::apply() {
 #endif
         }
     }
+    if (this->fitWindow && !this->resolutionSet) {
+        // Wine caps a new top-level window at the screen size plus its frame, so a game wider or
+        // taller than the screen (Muramasa: 1024x576 on 800x600) would be fitted at the capped
+        // size and cut off. Start big enough for any game; XWindow::fitToScreen then shrinks it.
+        this->screenCx = 2560;
+        this->screenCy = 1600;
+    }
     KSystem::videoOption = this->videoOption;
 #ifdef __EMSCRIPTEN__
     if (this->audioFreq) {
