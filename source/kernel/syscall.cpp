@@ -1325,6 +1325,13 @@ static U32 syscall_vfork(CPU* cpu, U32 eipCount) {
     return result;
 }
 
+// musl's fork() (static test binaries) uses fork(2); glibc's goes through clone
+static U32 syscall_fork(CPU* cpu, U32 eipCount) {
+    U32 result = cpu->thread->process->clone(cpu->thread, 17 /* SIGCHLD */, 0, 0, 0, 0);
+    SYS_LOG1(SYSCALL_SYSTEM, cpu, "fork: result=%d(0x%X)\n", result, result);
+    return result;
+}
+
 static U32 syscall_ugetrlimit(CPU* cpu, U32 eipCount) {
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "ugetrlimit: resource=%d rlim=%X", ARG1, ARG2);
     U32 result = KSystem::ugetrlimit(cpu->thread, ARG1, ARG2);
@@ -2252,7 +2259,7 @@ U32 syscall_sigtimedwait_time64(CPU* cpu, U32 eipCount) {
 static const SyscallFunc syscallFunc[] = {
     nullptr,                  // 0
     syscall_exit,       // 1 __NR_exit
-    nullptr,                  // 2
+    syscall_fork,       // 2 __NR_fork
     syscall_read,       // 3 __NR_read
     syscall_write,      // 4 __NR_write
     syscall_open,       // 5 __NR_open
