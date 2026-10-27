@@ -20,6 +20,7 @@
 #define __FSFILEOPENNODE_H__
 
 #include "fsopennode.h"
+#include "readahead.h"
 
 class FsFileNode;
 
@@ -52,10 +53,17 @@ public:
 
 private:
     void openPositionedWriteHandle();
+    S32 readAt(U8* buffer, S64 offset, U32 len);
 
     std::shared_ptr<FsFileNode> fileNode;
     U32 handle;
     U32 positionedWriteHandle = 0xFFFFFFFF;
+    // Read-only opens read through readAhead; pos is then the file position and nativePos the
+    // handle's (-1 unknown).
+    bool readAheadOn;
+    ReadAheadBuffer readAhead;
+    S64 pos = 0;
+    S64 nativePos = 0;
 };
 
 #endif

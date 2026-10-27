@@ -43,6 +43,9 @@ public:
     // Page-load backing reads intentionally do not acquire this gate.
     BOXEDWINE_MUTEX_NR mutationOperationMutex;
     std::weak_ptr<MappedFileCache> fileCache;
+    // Bumped by every write, truncate or resize of the data (FsFileNode::clearModifiedTimeOverride, allocate):
+    // read-ahead blocks of other open files on it are dropped.
+    std::atomic<U32> dataGeneration{0};
 #ifdef __TEST
     std::function<void()> testAfterBackingMutationBeforeCacheNotification;
     std::function<void()> testAfterMappedLengthReadBeforeCacheReconcile;
