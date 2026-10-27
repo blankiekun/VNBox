@@ -1246,7 +1246,7 @@ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
     }
 #endif
 #if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
-    if (!(op->flags2 & OP_FLAG2_WASM_JIT_PENDING) && !wasmJitCompilationPaused() && op->runCount != JIT_RUN_COUNT_MAX) {
+    if (!(op->flags2 & OP_FLAG2_WASM_JIT_PENDING) && op->runCount != JIT_RUN_COUNT_MAX && !wasmJitCompilationPaused()) {
         op->runCount++;
     }
 #elif defined(BOXEDWINE_WASM_JIT)

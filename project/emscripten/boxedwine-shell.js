@@ -1431,11 +1431,7 @@
             } else {
                 console.log(message);
             }
-            var output = document.getElementById('output');
-            if (output) {
-                output.value += message + "\n";
-                output.scrollTop = output.scrollHeight;
-            }
+            appendOutput(message);
         }
         function setHostFolderStatus(message, isError) {
             if (message) {
@@ -1531,9 +1527,10 @@
                 refreshHostFolderFromHost(reason);
             }, 0);
         }
+        // Watches the host folder; resolves false when there is no observer, and polling has to stand in for it.
         async function startHostFolderObserver() {
             if (typeof FileSystemObserver !== "function" || !Config.hostFolderHandle) {
-                return;
+                return false;
             }
             try {
                 hostFolderRefreshObserver = new FileSystemObserver(function(records) {
@@ -1544,6 +1541,7 @@
                                 hostFolderRefreshObserver.disconnect();
                             }
                             hostFolderRefreshObserver = null;
+                            startHostFolderPolling();
                             return;
                         }
                     }
@@ -1551,13 +1549,24 @@
                 });
                 await hostFolderRefreshObserver.observe(Config.hostFolderHandle, {recursive: true});
                 logHostFolderMessage("Watching D: folder for host changes", false);
+                return true;
             } catch (e) {
                 hostFolderRefreshObserver = null;
                 logHostFolderMessage("Host folder change observer is unavailable; using periodic refresh", false);
+                return false;
             }
         }
-        function startHostFolderRefresh() {
+        // Each poll walks the whole host folder, so it only runs without a working observer.
+        function startHostFolderPolling() {
             if (!Config.hostFolderMounted || hostFolderRefreshTimer) {
+                return;
+            }
+            hostFolderRefreshTimer = setInterval(function() {
+                refreshHostFolderFromHost("poll");
+            }, HOST_FOLDER_REFRESH_INTERVAL_MS);
+        }
+        function startHostFolderRefresh() {
+            if (!Config.hostFolderMounted || hostFolderRefreshTimer || hostFolderRefreshObserver) {
                 return;
             }
             if (!hostFolderRefreshEventsConfigured) {
@@ -1571,10 +1580,11 @@
                     }
                 }, false);
             }
-            hostFolderRefreshTimer = setInterval(function() {
-                refreshHostFolderFromHost("poll");
-            }, HOST_FOLDER_REFRESH_INTERVAL_MS);
-            startHostFolderObserver();
+            startHostFolderObserver().then(function(watching) {
+                if (!watching) {
+                    startHostFolderPolling();
+                }
+            });
         }
         function stopHostFolderRefresh() {
             if (hostFolderRefreshTimer) {
@@ -2142,10 +2152,7 @@
             //text = text.replace(/>/g, "&gt;");
             //text = text.replace('\n', '<br>', 'g');
             console.log(text);
-            if (element) {
-              element.value += text + "\n";
-              element.scrollTop = element.scrollHeight; // focus on bottom
-            }
+            appendOutput(text);
           };
         })(),
         printErr: function(text) {
@@ -2154,11 +2161,7 @@
             dump(text + '\n'); // fast, straight to the real console
           } else {
 			console.error(text);
-            var element = document.getElementById('output');
-            if (element) {
-              element.value += text + "\n";
-              element.scrollTop = element.scrollHeight;
-            }
+            appendOutput(text);
           }
         },
         boxedwinePresentFrame: (function() {
@@ -2375,6 +2378,24 @@ function createFile(dir, name, buf) {
         console.log("Unable to create file:" + dir + "/" + name + "  error:" + e);
     }
 }
+// The log textarea shows the last OUTPUT_KEPT_LINES lines, rewritten at most every 250 ms:
+// appending each line copied the whole, ever-growing log and forced a layout per line.
+var OUTPUT_KEPT_LINES = 200;
+var outputLines = [];
+var outputFlushTimer = null;
+function appendOutput(text) {
+    if (!document.getElementById('output')) return;
+    outputLines.push(text);
+    if (outputLines.length > 2 * OUTPUT_KEPT_LINES) outputLines.splice(0, outputLines.length - OUTPUT_KEPT_LINES);
+    if (!outputFlushTimer) outputFlushTimer = setTimeout(flushOutput, 250);
+}
+function flushOutput() {
+    outputFlushTimer = null;
+    var element = document.getElementById('output');
+    if (outputLines.length > OUTPUT_KEPT_LINES) outputLines.splice(0, outputLines.length - OUTPUT_KEPT_LINES);
+    element.value = outputLines.join("\n") + "\n";
+    element.scrollTop = element.scrollHeight;
+}
 function toggleConsole() {
     var el = document.getElementById('showConsole');
     var console = document.getElementById('output');
@@ -2564,24 +2585,27 @@ async function importJitModulesFromBuffer(bytes) {
                     dataStart + cSize <= bytes.length) {
                 var fn  = dec.decode(bytes.subarray(pos + 30, pos + 30 + fnLen));
                 var cacheKey = parseWasmJitCacheKey(fn);
+                // deflated data is inflated into a new buffer, so a view is enough; stored data is
+                // kept (and may go to IndexedDB, which would clone a view's whole buffer), so copy it
+                var entryData = method === 8 ? bytes.subarray(dataStart, dataStart + cSize) : null;
                 if (cacheKey) {
                     entries.push({
                         key:       cacheKey.key,
                         eip:       cacheKey.eip,
                         blockHash: cacheKey.blockHash,
                         method:    method,
-                        data:      bytes.slice(dataStart, dataStart + cSize)
+                        data: entryData || bytes.slice(dataStart, dataStart + cSize)
                     });
                 } else if (fn === 'boxedwine-jit-grouped-manifest.json') {
                     manifests.push({
                         method: method,
-                        data: bytes.slice(dataStart, dataStart + cSize)
+                        data: entryData || bytes.slice(dataStart, dataStart + cSize)
                     });
                 } else if (fn.indexOf('groups/') === 0 && fn.toLowerCase().endsWith('.wasm')) {
                     groupModules.push({
                         path: fn,
                         method: method,
-                        data: bytes.slice(dataStart, dataStart + cSize)
+                        data: entryData || bytes.slice(dataStart, dataStart + cSize)
                     });
                 }
             }
