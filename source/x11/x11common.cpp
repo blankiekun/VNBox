@@ -1630,7 +1630,7 @@ static X11FlushState x11FlushState;
 // int XFlush(Display* display)
 static void x11_Flush(CPU* cpu) {
     XServer* server = XServer::getServer();
-    // Keep drawing flushes immediate, but let input-only polling use the
+    // Drawing flushes draw at once (within the fps cap), but let input-only polling use the
     // normal redraw cadence instead of synchronously presenting stale pixels.
     server->draw(x11FlushState.takePendingRequests());
     EAX = Success;

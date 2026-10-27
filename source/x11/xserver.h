@@ -107,7 +107,10 @@ public:
 	void changeScreen(U32 width, U32 height);
 	void processExit(U32 pid);
 
-	void draw(bool drawNow = false);
+	// true when the frame was composited (passed the fps gate)
+	bool draw(bool drawNow = false);
+	static U32 drawFps; // frames shown per second at most, 0 = no limit (the fps= URL param on the web)
+	static U64 nextDrawUs; // KSystem::getMicroCounter() time the next frame may be drawn
 	void colorMapChanged(const XColorMapPtr& colorMap);
 	const XWindowPtr& getRoot();
 	U32 getEventTime();

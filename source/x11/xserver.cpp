@@ -31,6 +31,8 @@
 std::atomic_int XServer::nextId = 0x10000;
 
 XServer* XServer::server;
+U32 XServer::drawFps = 60;
+U64 XServer::nextDrawUs;
 
 XServer* XServer::getServer(bool existingOnly) {
 	if (server) {
@@ -541,28 +543,32 @@ void XServer::colorMapChanged(const XColorMapPtr& colorMap) {
 	isDisplayDirty = true;
 }
 
-void XServer::draw(bool drawNow) {
-	static U32 lastDraw;
-
+bool XServer::draw(bool drawNow) {
 	if (!isDisplayDirty || !root) {
-		return;
+		return false;
 	}
 	{
 		BOXEDWINE_CRITICAL_SECTION;
 		if (!isDisplayDirty) {
-			return;
+			return false;
 		}
-		U32 now = KSystem::getMilliesSinceStart();
-		if (!drawNow && (now - lastDraw < 16)) {
-			return;
+		if (drawFps) {
+			// Flushes are capped too, or fps=30 would not mean 30 for GDI games: a frame they
+			// flush early stays dirty and is drawn at the deadline (runSlice checks every 1 ms).
+			U64 now = KSystem::getMicroCounter();
+			if (now < nextDrawUs) {
+				return false;
+			}
+			U64 interval = 1000000 / drawFps;
+			// next deadline from this one, so 60 means 60; a frame later than one interval starts over
+			nextDrawUs = now - nextDrawUs < interval ? nextDrawUs + interval : now + interval;
 		}
-		lastDraw = now;
 		isDisplayDirty = false;
 	}
 
 	KNativeScreenPtr screen = KNativeSystem::getScreen();
 	if (!screen->canBltToScreen()) {
-		return;
+		return false;
 	}
 	screen->getInput()->runOnUiThread([screen, this]() {
 		bool childWasDrawn = false;
@@ -596,6 +602,7 @@ void XServer::draw(bool drawNow) {
 #endif
 		screen->present();
 	});	
+	return true;
 }
 
 XWindowPtr XServer::getWindow(U32 window) {

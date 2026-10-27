@@ -8,6 +8,7 @@ struct VnboxStats {
     bool on = false;
     unsigned glCalls = 0, glGetErrors = 0, presentsGl = 0, draws = 0, timers = 0, ticksBusy = 0, ticksIdle = 0;
     unsigned tickWaits = 0, msgWaits = 0, inputs = 0, motions = 0;
+    unsigned presentsSw = 0, skippedSame = 0, busyDropped = 0; // software presents: shown, unchanged (skipped), JS side busy
     double glMs = 0, presentGlMs = 0, drawMs = 0, sliceMs = 0, timerLateMs = 0, timerLateMaxMs = 0;
     double tickLateMs = 0, tickLateMaxMs = 0, msgGapMs = 0, msgGapMaxMs = 0;
     // where guest slice time goes: syscalls (by number), JIT vs interpreter, wineserver, faults, root fs zip
