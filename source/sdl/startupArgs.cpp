@@ -1117,10 +1117,10 @@ bool StartUpArgs::parseStartupArgs(int argc, const char **argv) {
 #ifdef __EMSCRIPTEN__
         } else if (!strcmp(argv[i], "-audioFreq") && i+1<argc) {
             U32 audioFreq = atoi(argv[i+1]);
-            if (audioFreq == 11025 || audioFreq == 22050) {
+            if (audioFreq == 11025 || audioFreq == 22050 || audioFreq == 44100) {
                 this->audioFreq = audioFreq;
             } else {
-                klog("-audioFreq must be 11025 or 22050");
+                klog("-audioFreq must be 11025, 22050 or 44100");
             }
             i++;
 #endif

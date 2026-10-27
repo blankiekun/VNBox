@@ -79,7 +79,7 @@ void dspShutdown() {
 
 #ifdef __EMSCRIPTEN__
 void dspSetMaxOutputFreq(U32 freq) {
-    if (freq == 11025 || freq == 22050) {
+    if (freq == 11025 || freq == 22050 || freq == 44100) {
         dspMaxOutputFreq = freq;
     } else {
         kwarn_fmt("Unsupported Emscripten audio frequency %d, using %d", freq, dspMaxOutputFreq);
