@@ -509,8 +509,8 @@
             var audioFreq = getParameter("audioFreq");
             if (!allowParameterOverride()) {
                 audioFreq = DEFAULT_AUDIO_FREQ;
-            } else if (audioFreq == "22050") {
-                audioFreq = 22050;
+            } else if (audioFreq == "22050" || audioFreq == "44100") {
+                audioFreq = parseInt(audioFreq);
             } else if (audioFreq == "11025" || audioFreq == "") {
                 audioFreq = DEFAULT_AUDIO_FREQ;
             } else {
