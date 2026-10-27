@@ -23,6 +23,7 @@
 
 #include "platformBoxedwine.h"
 #include <map>
+#include <vector>
 
 #undef OF
 #define STRICTUNZIP
@@ -79,6 +80,16 @@ private:
     };
     std::map<std::pair<U64, U64>, Checkpoint> checkpoints;
     U64 checkpointClock = 0;
+    // Inflated 64 KiB blocks, at most 32 MiB, so random page reads inflate each block once
+    // instead of everything from the last checkpoint every time.
+    static constexpr U64 blockSize = 64 * 1024;
+    static constexpr size_t maxBlocks = 512;
+    struct Block {
+        std::vector<U8> bytes;
+        U64 used;
+    };
+    std::map<std::pair<U64, U64>, Block> blocks;
+    const std::vector<U8>* readBlock(U64 zipOffset);
     bool setupZipRead(U64 zipOffset, U64 zipFileOffset);
     S32 readCurrent(U8* buffer, U32 len);
     void saveCheckpoint();
