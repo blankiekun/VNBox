@@ -20,6 +20,8 @@ assert.equal(ptr(0x100).readShiftJisString(2), '日');
 assert.equal(ptr(0x200).readUtf8String(), 'héllo');
 assert.equal(ptr(0x300).readUtf16String(), 'あい');
 assert.equal(ptr(0x1ffe).readCString(), 'AB');
+mem.set(new TextEncoder().encode('x'.repeat(300) + '\0'), 0x400); // longer than the first 256-byte read
+assert.equal(ptr(0x400).readCString(), 'x'.repeat(300));
 assert.throws(() => ptr(0x2000).readU8(), /access violation/);
 assert.equal(ptr('0x10').add(8).sub(ptr(4)).toString(), '0x14');
 const { bytes, masks } = F.test.parsePattern('e8 ?? 4? : ff ff fe');

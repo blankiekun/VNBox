@@ -52,8 +52,8 @@
     function readTerminated(addr, unit, max) {
         const parts = [];
         let total = 0;
-        for (;;) {
-            const want = Math.min(4096, max < 0 ? 4096 : (max - total / unit) * unit);
+        for (let step = 256; ; step = 4096) { // most strings (export names) fit the first, small read
+            const want = Math.min(step, max < 0 ? step : (max - total / unit) * unit);
             if (want <= 0) break;
             const chunk = readPrefix(addr + total, want);
             if (!chunk.length && !total) throw new Error('access violation accessing ' + ptr(addr));
@@ -191,9 +191,15 @@
         };
     }
     // PE32 export directory → [[name, address]]. Forwarders and ordinal-only exports left out.
+    // Kept per module (base + PE timestamp, so another DLL loaded at the same base is read anew):
+    // findExportByName(null, …) walks every module's table.
+    const exportsCache = new Map();
     function exportsOf(base) {
         try {
-            const pe = base + u32(base + 0x3c), rva = u32(pe + 0x78), dirSize = u32(pe + 0x7c);
+            const pe = base + u32(base + 0x3c), key = base + ':' + u32(pe + 8);
+            const cached = exportsCache.get(key);
+            if (cached) return cached;
+            const rva = u32(pe + 0x78), dirSize = u32(pe + 0x7c);
             if (!rva) return [];
             const d = view(base + rva, 0x28);
             const count = d.getUint32(0x18, true), funcs = base + d.getUint32(0x1c, true);
@@ -204,6 +210,7 @@
                 if (f >= rva && f < rva + dirSize) continue;
                 out.push([ptr(base + names.getUint32(4 * i, true)).readCString(), base + f]);
             }
+            exportsCache.set(key, out);
             return out;
         } catch (e) {
             return []; // a page not loaded (bw_read never loads file pages)

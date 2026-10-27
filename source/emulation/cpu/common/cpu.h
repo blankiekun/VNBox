@@ -187,7 +187,10 @@ union SSE {
 
 #ifndef JIT_RUN_COUNT
 // wasm: 2000 measured best (sweep of 200/500/1000/2000 on a VN: -130 MB renderer, no title or MIPS loss).
-#if defined(BOXEDWINE_WASM_JIT) && defined(__EMSCRIPTEN__)
+#if defined(BOXEDWINE_WASM_JIT) && defined(__EMSCRIPTEN__) && !defined(__TEST)
+extern U32 jitRunCount; // the jitRunCount= URL param (emscripten doMainLoop), 2000 by default
+#define JIT_RUN_COUNT jitRunCount
+#elif defined(BOXEDWINE_WASM_JIT) && defined(__EMSCRIPTEN__)
 #define JIT_RUN_COUNT 2000
 #else
 #define JIT_RUN_COUNT 50

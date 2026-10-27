@@ -36,9 +36,12 @@ namespace KDspAudioMath {
 		return queuedFrames > reserveFrames ? queuedFrames - reserveFrames : 0;
 	}
 
+#ifdef __EMSCRIPTEN__
+	inline U32 sdlPeriodFrames = 4096; // the audioPeriod= URL param (emscripten doMainLoop)
+#endif
 	inline U32 getRequestedSdlPeriodFrames() {
 #ifdef __EMSCRIPTEN__
-		return 4096;
+		return sdlPeriodFrames;
 #else
 		return 1024;
 #endif

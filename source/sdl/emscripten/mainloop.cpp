@@ -23,6 +23,7 @@
 #include "kbrowsersocket.h"
 #include "knativesystem.h"
 #include "vnboxstats.h"
+#include "kdspaudio_math.h"
 
 #ifdef BOXEDWINE_MULTI_THREADED
 #include "knativethread.h"
@@ -98,6 +99,7 @@ static int mainLoopTimingValue = -1;
 #ifdef BOXEDWINE_JSPI
 static int jspiTickDelay = -1; // what boxedwine_tick returns: ms to wait before the next tick, -1 = next message
 #endif
+static U32 idleWaitMs = 16; // the idleWait= URL param: longest idle wait while no guest timer is due sooner
 
 static void updateMainLoopTiming(bool idle) {
     int mode = EM_TIMING_SETTIMEOUT;
@@ -120,8 +122,17 @@ static void updateMainLoopTiming(bool idle) {
             if (nextTimer == 0 || mainLoopTimingMode == EM_TIMING_SETTIMEOUT) {
                 mode = EM_TIMING_SETIMMEDIATE;
             } else {
+#ifdef BOXEDWINE_JSPI
+                value = (int)nextTimer; // straight to setTimeout, which never fires early
+#else
                 value = (int)nextTimer + 1; // emscripten rounds the delay down
+#endif
             }
+        } else {
+            // Sleep until the next guest timer (getNextTimer is taken after the tick, so the tick's
+            // own run time is already left out), at most idleWaitMs: a sleeping guest used to be
+            // woken every 1 ms. Input wakes the JSPI loop at once (doMainLoop).
+            value = (int)std::min(nextTimer, idleWaitMs);
         }
     }
 #ifdef BOXEDWINE_JSPI
@@ -366,7 +377,23 @@ void mainloop() {
 
 #endif
 
+// A whole-number URL param of the player page, clamped to [lo, hi]; dflt when absent.
+EM_JS(int, vnboxUrlInt, (const char* name, int dflt, int lo, int hi), {
+    var v = parseInt(new URLSearchParams(location.search).get(UTF8ToString(name)), 10);
+    return isNaN(v) ? dflt : Math.min(hi, Math.max(lo, v));
+});
+
 bool doMainLoop() {
+    // Smoothness knobs, read before the guest runs. jitRunCount: interpreted runs before a block
+    // is compiled; audioPeriod: frames per SDL audio callback (the non-worklet audio path).
+#ifndef BOXEDWINE_MULTI_THREADED
+    idleWaitMs = vnboxUrlInt("idleWait", idleWaitMs, 1, 1000);
+#endif
+#if defined(BOXEDWINE_WASM_JIT) && !defined(__TEST)
+    jitRunCount = vnboxUrlInt("jitRunCount", jitRunCount, 1, JIT_RUN_COUNT_MAX - 1);
+#endif
+    U32 period = vnboxUrlInt("audioPeriod", KDspAudioMath::sdlPeriodFrames, 256, 16384);
+    KDspAudioMath::sdlPeriodFrames = 1u << (31 - __builtin_clz(period)); // a power of two, as SDL wants
     EM_ASM(
 #ifndef SDL2
             SDL.defaults.copyOnLock = false;
@@ -381,14 +408,21 @@ bool doMainLoop() {
     // emscripten's loop (a message while the guest has work, a timeout while it sleeps).
     // Firefox runs a chain of messages ahead of painting (one frame per ~80 ms while the
     // guest is busy, during movies and loads): once a frame is due, the next tick waits for it.
+    // Input during an idle wait runs the next tick right after the event's handlers have queued it.
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
         var lastFrame = performance.now();
         var frame = function() { lastFrame = performance.now(); requestAnimationFrame(frame); };
         var post = function() { channel.port2.postMessage(0); };
+        var timer = 0;
+        var wait = function(delay) { timer = setTimeout(function() { timer = 0; next(); }, delay); };
+        var wake = function() { if (timer) { clearTimeout(timer); wait(0); } };
+        "keydown keyup mousedown mouseup mousemove wheel touchstart touchend touchmove".split(" ").forEach(function(type) {
+            window.addEventListener(type, wake, true);
+        });
         var next = function() { tick().then(function(delay) {
-            if (delay >= 0) setTimeout(next, delay);
+            if (delay >= 0) wait(delay);
             else if (!document.hidden && performance.now() - lastFrame > 12) requestAnimationFrame(post);
             else post();
         }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", e); else console.error("tick failed: " + e); }); };
