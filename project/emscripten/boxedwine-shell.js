@@ -56,6 +56,10 @@
         ["win95", "win98", "winme", "win2k", "winxp", "win7", "win10"].forEach(function(version) {
             REGISTRY_PRESETS[version] = 'reg add "HKCU\\Software\\Wine" /v Version /t REG_SZ /d ' + version + ' /f';
         });
+        // registry=jpfonts maps the Windows Japanese font names (ＭＳ ゴシック, MS UI Gothic and so
+        // on) to jp.zip's IPA fonts. Japanese games ask for them by name, and some check that
+        // they got them (GetTextFace) and stop when they did not. jp.zip carries the file.
+        REGISTRY_PRESETS.jpfonts = 'reg import Z:\\opt\\wine\\share\\wine\\jp-fonts.reg';
         // wine-override=[name,...] adds these to WINEDLLOVERRIDES
         let WINE_OVERRIDE_PRESETS = {
             nomono: "mscoree,mshtml=" // skip the Wine Mono and Gecko installs
