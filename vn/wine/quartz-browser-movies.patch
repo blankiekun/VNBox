@@ -1,0 +1,593 @@
+diff --git a/dlls/quartz/Makefile.in b/dlls/quartz/Makefile.in
+index 6eeeac9..2c4ff1f 100644
+--- a/dlls/quartz/Makefile.in
++++ b/dlls/quartz/Makefile.in
+@@ -6,6 +6,7 @@ DELAYIMPORTS = ddraw
+ SOURCES = \
+ 	acmwrapper.c \
+ 	avidec.c \
++	browsermovie.c \
+ 	control_tlb.idl \
+ 	decoder.c \
+ 	dsoundrender.c \
+diff --git a/dlls/quartz/browsermovie.c b/dlls/quartz/browsermovie.c
+new file mode 100644
+index 0000000..c1c3c06
+--- /dev/null
++++ b/dlls/quartz/browsermovie.c
+@@ -0,0 +1,544 @@
++/*
++ * VNBox: movies played by the browser page
++ *
++ * When a graph renders a file the page can decode (an MPEG-1 program stream), RenderFile adds
++ * this filter alone instead of a source, splitter, decoders and renderers. It owns a real video
++ * window (window.c: owner, position, message drain and full screen work as with the video
++ * renderer) and hands the file, the window's screen rectangle, state changes, seeks and volume to
++ * VNBox through /dev/vnbox-movie; the page draws the movie over the canvas at that rectangle and
++ * says when it has ended, which becomes EC_COMPLETE. Anything else, or no page, takes Wine's
++ * normal path.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include "quartz_private.h"
++#include "evcode.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(quartz);
++
++struct browser_movie
++{
++    struct strmbase_filter filter;
++    struct video_window window;
++    /* Never exposed: window.c only checks that its pin is connected and reads its format. */
++    struct strmbase_pin pin;
++    VIDEOINFOHEADER format;
++    SourceSeeking seeking;
++    IBasicAudio IBasicAudio_iface;
++    LONG volume, balance;
++
++    HANDLE device, thread, stop_event;
++    RECT shown;
++    BOOL ended;
++};
++
++static struct browser_movie *impl_from_strmbase_filter(struct strmbase_filter *iface)
++{
++    return CONTAINING_RECORD(iface, struct browser_movie, filter);
++}
++
++static void send_command(struct browser_movie *movie, const char *format, ...)
++{
++    char line[1024];
++    DWORD written;
++    va_list args;
++    int len;
++
++    va_start(args, format);
++    len = vsnprintf(line, sizeof(line), format, args);
++    va_end(args);
++    if (len > 0 && len < sizeof(line))
++        WriteFile(movie->device, line, len, &written, NULL);
++}
++
++/* -1: the page didn't take the file, 0: playing, 1: ended. */
++static int read_status(HANDLE device)
++{
++    char buffer[8] = {0};
++    DWORD size;
++
++    if (!ReadFile(device, buffer, sizeof(buffer) - 1, &size, NULL))
++        return -1;
++    return atoi(buffer);
++}
++
++static LONGLONG read_scr(const BYTE *p)
++{
++    return ((LONGLONG)(p[0] >> 1 & 7) << 30) | (p[1] << 22) | (p[2] >> 1 << 15) | (p[3] << 7) | (p[4] >> 1);
++}
++
++/* An MPEG-1 program stream (what the page decodes): its picture size from the first sequence
++ * header and its duration from the first and last pack's system clock reference. */
++static BOOL probe_mpeg1_ps(HANDLE file, LONG *width, LONG *height, REFERENCE_TIME *duration)
++{
++    enum { SIZE = 65536 };
++    LONGLONG first, last = -1;
++    LARGE_INTEGER size, pos;
++    DWORD len, i;
++    BYTE *buffer;
++    BOOL ret = FALSE;
++
++    if (!(buffer = malloc(SIZE)))
++        return FALSE;
++    if (!ReadFile(file, buffer, SIZE, &len, NULL) || len < 12
++            || buffer[0] || buffer[1] || buffer[2] != 1 || buffer[3] != 0xba || (buffer[4] & 0xf1) != 0x21)
++        goto done;
++    first = read_scr(buffer + 4);
++    *width = *height = 0;
++    for (i = 0; i + 7 <= len; ++i)
++    {
++        if (!buffer[i] && !buffer[i + 1] && buffer[i + 2] == 1 && buffer[i + 3] == 0xb3)
++        {
++            *width = buffer[i + 4] << 4 | buffer[i + 5] >> 4;
++            *height = (buffer[i + 5] & 0xf) << 8 | buffer[i + 6];
++            break;
++        }
++    }
++    if (!*width || !*height)
++        goto done;
++
++    GetFileSizeEx(file, &size);
++    pos.QuadPart = max(0, size.QuadPart - SIZE);
++    if (SetFilePointerEx(file, pos, NULL, FILE_BEGIN) && ReadFile(file, buffer, SIZE, &len, NULL))
++    {
++        for (i = 0; i + 9 <= len; ++i)
++            if (!buffer[i] && !buffer[i + 1] && buffer[i + 2] == 1 && buffer[i + 3] == 0xba && (buffer[i + 4] & 0xf1) == 0x21)
++                last = read_scr(buffer + i + 4);
++    }
++    *duration = last > first ? (last - first) * 1000 / 9 : 0;
++    ret = TRUE;
++done:
++    free(buffer);
++    return ret;
++}
++
++/* Mirrors the video window onto the page and turns the page's end into EC_COMPLETE. */
++static DWORD WINAPI watch_thread(void *arg)
++{
++    struct browser_movie *movie = arg;
++    IMediaEventSink *sink;
++    FILTER_STATE state;
++    IFilterGraph *graph;
++    RECT rect;
++
++    while (WaitForSingleObject(movie->stop_event, 50) == WAIT_TIMEOUT)
++    {
++        EnterCriticalSection(&movie->filter.filter_cs);
++        state = movie->filter.state;
++        graph = movie->filter.graph;
++        LeaveCriticalSection(&movie->filter.filter_cs);
++
++        SetRectEmpty(&rect);
++        if (state != State_Stopped && IsWindowVisible(movie->window.hwnd))
++            GetWindowRect(movie->window.hwnd, &rect);
++        if (!EqualRect(&rect, &movie->shown))
++        {
++            movie->shown = rect;
++            send_command(movie, "rect %ld %ld %ld %ld", rect.left, rect.top,
++                    rect.right - rect.left, rect.bottom - rect.top);
++        }
++
++        if (state == State_Running && !movie->ended && read_status(movie->device) == 1)
++        {
++            movie->ended = TRUE;
++            if (graph && SUCCEEDED(IFilterGraph_QueryInterface(graph, &IID_IMediaEventSink, (void **)&sink)))
++            {
++                IMediaEventSink_Notify(sink, EC_COMPLETE, S_OK, (LONG_PTR)&movie->filter.IBaseFilter_iface);
++                IMediaEventSink_Release(sink);
++            }
++        }
++    }
++    return 0;
++}
++
++static struct strmbase_pin *movie_get_pin(struct strmbase_filter *iface, unsigned int index)
++{
++    return NULL;
++}
++
++static void movie_destroy(struct strmbase_filter *iface)
++{
++    struct browser_movie *movie = impl_from_strmbase_filter(iface);
++
++    SetEvent(movie->stop_event);
++    WaitForSingleObject(movie->thread, INFINITE);
++    CloseHandle(movie->thread);
++    CloseHandle(movie->stop_event);
++    CloseHandle(movie->device);
++    video_window_cleanup(&movie->window);
++    strmbase_seeking_cleanup(&movie->seeking);
++    strmbase_filter_cleanup(&movie->filter);
++    free(movie);
++}
++
++static HRESULT movie_query_interface(struct strmbase_filter *iface, REFIID iid, void **out)
++{
++    struct browser_movie *movie = impl_from_strmbase_filter(iface);
++
++    if (IsEqualGUID(iid, &IID_IVideoWindow))
++        *out = &movie->window.IVideoWindow_iface;
++    else if (IsEqualGUID(iid, &IID_IBasicVideo))
++        *out = &movie->window.IBasicVideo_iface;
++    else if (IsEqualGUID(iid, &IID_IMediaSeeking))
++        *out = &movie->seeking.IMediaSeeking_iface;
++    else if (IsEqualGUID(iid, &IID_IBasicAudio))
++        *out = &movie->IBasicAudio_iface;
++    else
++        return E_NOINTERFACE;
++
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
++}
++
++static HRESULT movie_init_stream(struct strmbase_filter *iface)
++{
++    struct browser_movie *movie = impl_from_strmbase_filter(iface);
++
++    if (movie->window.AutoShow)
++        ShowWindow(movie->window.hwnd, SW_SHOW);
++    send_command(movie, "pause");
++    return S_OK;
++}
++
++static HRESULT movie_start_stream(struct strmbase_filter *iface, REFERENCE_TIME time)
++{
++    send_command(impl_from_strmbase_filter(iface), "run");
++    return S_OK;
++}
++
++static HRESULT movie_stop_stream(struct strmbase_filter *iface)
++{
++    send_command(impl_from_strmbase_filter(iface), "pause");
++    return S_OK;
++}
++
++static HRESULT movie_cleanup_stream(struct strmbase_filter *iface)
++{
++    send_command(impl_from_strmbase_filter(iface), "stop");
++    return S_OK;
++}
++
++static const struct strmbase_filter_ops filter_ops =
++{
++    .filter_get_pin = movie_get_pin,
++    .filter_destroy = movie_destroy,
++    .filter_query_interface = movie_query_interface,
++    .filter_init_stream = movie_init_stream,
++    .filter_start_stream = movie_start_stream,
++    .filter_stop_stream = movie_stop_stream,
++    .filter_cleanup_stream = movie_cleanup_stream,
++};
++
++static void movie_get_default_rect(struct video_window *window, RECT *rect)
++{
++    struct browser_movie *movie = CONTAINING_RECORD(window, struct browser_movie, window);
++
++    SetRect(rect, 0, 0, movie->format.bmiHeader.biWidth, movie->format.bmiHeader.biHeight);
++}
++
++static HRESULT movie_get_current_image(struct video_window *window, LONG *size, LONG *image)
++{
++    return E_NOTIMPL;
++}
++
++static const struct video_window_ops window_ops =
++{
++    .get_default_rect = movie_get_default_rect,
++    .get_current_image = movie_get_current_image,
++};
++
++static const IVideoWindowVtbl video_window_vtbl =
++{
++    BaseControlWindowImpl_QueryInterface,
++    BaseControlWindowImpl_AddRef,
++    BaseControlWindowImpl_Release,
++    BaseControlWindowImpl_GetTypeInfoCount,
++    BaseControlWindowImpl_GetTypeInfo,
++    BaseControlWindowImpl_GetIDsOfNames,
++    BaseControlWindowImpl_Invoke,
++    BaseControlWindowImpl_put_Caption,
++    BaseControlWindowImpl_get_Caption,
++    BaseControlWindowImpl_put_WindowStyle,
++    BaseControlWindowImpl_get_WindowStyle,
++    BaseControlWindowImpl_put_WindowStyleEx,
++    BaseControlWindowImpl_get_WindowStyleEx,
++    BaseControlWindowImpl_put_AutoShow,
++    BaseControlWindowImpl_get_AutoShow,
++    BaseControlWindowImpl_put_WindowState,
++    BaseControlWindowImpl_get_WindowState,
++    BaseControlWindowImpl_put_BackgroundPalette,
++    BaseControlWindowImpl_get_BackgroundPalette,
++    BaseControlWindowImpl_put_Visible,
++    BaseControlWindowImpl_get_Visible,
++    BaseControlWindowImpl_put_Left,
++    BaseControlWindowImpl_get_Left,
++    BaseControlWindowImpl_put_Width,
++    BaseControlWindowImpl_get_Width,
++    BaseControlWindowImpl_put_Top,
++    BaseControlWindowImpl_get_Top,
++    BaseControlWindowImpl_put_Height,
++    BaseControlWindowImpl_get_Height,
++    BaseControlWindowImpl_put_Owner,
++    BaseControlWindowImpl_get_Owner,
++    BaseControlWindowImpl_put_MessageDrain,
++    BaseControlWindowImpl_get_MessageDrain,
++    BaseControlWindowImpl_get_BorderColor,
++    BaseControlWindowImpl_put_BorderColor,
++    BaseControlWindowImpl_get_FullScreenMode,
++    BaseControlWindowImpl_put_FullScreenMode,
++    BaseControlWindowImpl_SetWindowForeground,
++    BaseControlWindowImpl_NotifyOwnerMessage,
++    BaseControlWindowImpl_SetWindowPosition,
++    BaseControlWindowImpl_GetWindowPosition,
++    BaseControlWindowImpl_GetMinIdealImageSize,
++    BaseControlWindowImpl_GetMaxIdealImageSize,
++    BaseControlWindowImpl_GetRestorePosition,
++    BaseControlWindowImpl_HideCursor,
++    BaseControlWindowImpl_IsCursorHidden
++};
++
++static struct browser_movie *impl_from_IMediaSeeking(IMediaSeeking *iface)
++{
++    return CONTAINING_RECORD(iface, struct browser_movie, seeking.IMediaSeeking_iface);
++}
++
++static HRESULT WINAPI seeking_QueryInterface(IMediaSeeking *iface, REFIID iid, void **out)
++{
++    return IUnknown_QueryInterface(impl_from_IMediaSeeking(iface)->filter.outer_unk, iid, out);
++}
++
++static ULONG WINAPI seeking_AddRef(IMediaSeeking *iface)
++{
++    return IUnknown_AddRef(impl_from_IMediaSeeking(iface)->filter.outer_unk);
++}
++
++static ULONG WINAPI seeking_Release(IMediaSeeking *iface)
++{
++    return IUnknown_Release(impl_from_IMediaSeeking(iface)->filter.outer_unk);
++}
++
++static HRESULT WINAPI seeking_change_start(IMediaSeeking *iface)
++{
++    struct browser_movie *movie = impl_from_IMediaSeeking(iface);
++
++    movie->ended = FALSE;
++    send_command(movie, "seek %d", (int)(movie->seeking.llCurrent / 10000));
++    return S_OK;
++}
++
++static HRESULT WINAPI seeking_change_stop_or_rate(IMediaSeeking *iface)
++{
++    return S_OK;
++}
++
++static const IMediaSeekingVtbl seeking_vtbl =
++{
++    seeking_QueryInterface,
++    seeking_AddRef,
++    seeking_Release,
++    SourceSeekingImpl_GetCapabilities,
++    SourceSeekingImpl_CheckCapabilities,
++    SourceSeekingImpl_IsFormatSupported,
++    SourceSeekingImpl_QueryPreferredFormat,
++    SourceSeekingImpl_GetTimeFormat,
++    SourceSeekingImpl_IsUsingTimeFormat,
++    SourceSeekingImpl_SetTimeFormat,
++    SourceSeekingImpl_GetDuration,
++    SourceSeekingImpl_GetStopPosition,
++    SourceSeekingImpl_GetCurrentPosition,
++    SourceSeekingImpl_ConvertTimeFormat,
++    SourceSeekingImpl_SetPositions,
++    SourceSeekingImpl_GetPositions,
++    SourceSeekingImpl_GetAvailable,
++    SourceSeekingImpl_SetRate,
++    SourceSeekingImpl_GetRate,
++    SourceSeekingImpl_GetPreroll,
++};
++
++static struct browser_movie *impl_from_IBasicAudio(IBasicAudio *iface)
++{
++    return CONTAINING_RECORD(iface, struct browser_movie, IBasicAudio_iface);
++}
++
++static HRESULT WINAPI basic_audio_QueryInterface(IBasicAudio *iface, REFIID iid, void **out)
++{
++    return IUnknown_QueryInterface(impl_from_IBasicAudio(iface)->filter.outer_unk, iid, out);
++}
++
++static ULONG WINAPI basic_audio_AddRef(IBasicAudio *iface)
++{
++    return IUnknown_AddRef(impl_from_IBasicAudio(iface)->filter.outer_unk);
++}
++
++static ULONG WINAPI basic_audio_Release(IBasicAudio *iface)
++{
++    return IUnknown_Release(impl_from_IBasicAudio(iface)->filter.outer_unk);
++}
++
++static HRESULT WINAPI basic_audio_GetTypeInfoCount(IBasicAudio *iface, UINT *count)
++{
++    *count = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI basic_audio_GetTypeInfo(IBasicAudio *iface, UINT index, LCID lcid, ITypeInfo **typeinfo)
++{
++    return strmbase_get_typeinfo(IBasicAudio_tid, typeinfo);
++}
++
++static HRESULT WINAPI basic_audio_GetIDsOfNames(IBasicAudio *iface, REFIID iid, LPOLESTR *names, UINT count,
++        LCID lcid, DISPID *ids)
++{
++    ITypeInfo *typeinfo;
++    HRESULT hr;
++
++    if (SUCCEEDED(hr = strmbase_get_typeinfo(IBasicAudio_tid, &typeinfo)))
++    {
++        hr = ITypeInfo_GetIDsOfNames(typeinfo, names, count, ids);
++        ITypeInfo_Release(typeinfo);
++    }
++    return hr;
++}
++
++static HRESULT WINAPI basic_audio_Invoke(IBasicAudio *iface, DISPID id, REFIID iid, LCID lcid, WORD flags,
++        DISPPARAMS *params, VARIANT *result, EXCEPINFO *excepinfo, UINT *error_arg)
++{
++    ITypeInfo *typeinfo;
++    HRESULT hr;
++
++    if (SUCCEEDED(hr = strmbase_get_typeinfo(IBasicAudio_tid, &typeinfo)))
++    {
++        hr = ITypeInfo_Invoke(typeinfo, iface, id, flags, params, result, excepinfo, error_arg);
++        ITypeInfo_Release(typeinfo);
++    }
++    return hr;
++}
++
++static HRESULT WINAPI basic_audio_put_Volume(IBasicAudio *iface, LONG volume)
++{
++    struct browser_movie *movie = impl_from_IBasicAudio(iface);
++
++    if (volume > 0 || volume < -10000)
++        return E_INVALIDARG;
++    movie->volume = volume;
++    /* hundredths of a decibel -> thousandths of full scale */
++    send_command(movie, "volume %d", volume <= -10000 ? 0 : (int)(pow(10.0, volume / 2000.0) * 1000));
++    return S_OK;
++}
++
++static HRESULT WINAPI basic_audio_get_Volume(IBasicAudio *iface, LONG *volume)
++{
++    *volume = impl_from_IBasicAudio(iface)->volume;
++    return S_OK;
++}
++
++static HRESULT WINAPI basic_audio_put_Balance(IBasicAudio *iface, LONG balance)
++{
++    if (balance < -10000 || balance > 10000)
++        return E_INVALIDARG;
++    impl_from_IBasicAudio(iface)->balance = balance;
++    return S_OK;
++}
++
++static HRESULT WINAPI basic_audio_get_Balance(IBasicAudio *iface, LONG *balance)
++{
++    *balance = impl_from_IBasicAudio(iface)->balance;
++    return S_OK;
++}
++
++static const IBasicAudioVtbl basic_audio_vtbl =
++{
++    basic_audio_QueryInterface,
++    basic_audio_AddRef,
++    basic_audio_Release,
++    basic_audio_GetTypeInfoCount,
++    basic_audio_GetTypeInfo,
++    basic_audio_GetIDsOfNames,
++    basic_audio_Invoke,
++    basic_audio_put_Volume,
++    basic_audio_get_Volume,
++    basic_audio_put_Balance,
++    basic_audio_get_Balance,
++};
++
++/* S_OK with the filter when the page takes the file, else S_FALSE (render it the normal way). */
++HRESULT browser_movie_create(const WCHAR *path, IBaseFilter **out)
++{
++    struct browser_movie *movie;
++    REFERENCE_TIME duration;
++    LONG width, height;
++    HANDLE file, device;
++    char *unix_path;
++    BOOL ok;
++
++    *out = NULL;
++    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++    if (file == INVALID_HANDLE_VALUE)
++        return S_FALSE;
++    ok = probe_mpeg1_ps(file, &width, &height, &duration);
++    CloseHandle(file);
++    if (!ok)
++        return S_FALSE;
++
++    device = CreateFileW(L"\\\\?\\unix\\dev\\vnbox-movie", GENERIC_READ | GENERIC_WRITE,
++            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++    if (device == INVALID_HANDLE_VALUE)
++        return S_FALSE;
++    if (!(unix_path = wine_get_unix_file_name(path)) || !(movie = calloc(1, sizeof(*movie))))
++    {
++        HeapFree(GetProcessHeap(), 0, unix_path);
++        CloseHandle(device);
++        return S_FALSE;
++    }
++    movie->device = device;
++    send_command(movie, "open %s", unix_path);
++    HeapFree(GetProcessHeap(), 0, unix_path);
++    if (read_status(device) < 0)
++    {
++        CloseHandle(device);
++        free(movie);
++        return S_FALSE;
++    }
++
++    strmbase_filter_init(&movie->filter, NULL, &GUID_NULL, &filter_ops);
++    movie->format.bmiHeader.biSize = sizeof(movie->format.bmiHeader);
++    movie->format.bmiHeader.biWidth = width;
++    movie->format.bmiHeader.biHeight = height;
++    movie->format.bmiHeader.biPlanes = 1;
++    movie->format.bmiHeader.biBitCount = 32;
++    movie->pin.peer = &movie->pin.IPin_iface;
++    movie->pin.mt.majortype = MEDIATYPE_Video;
++    movie->pin.mt.subtype = MEDIASUBTYPE_RGB32;
++    movie->pin.mt.formattype = FORMAT_VideoInfo;
++    movie->pin.mt.cbFormat = sizeof(movie->format);
++    movie->pin.mt.pbFormat = (BYTE *)&movie->format;
++    video_window_init(&movie->window, &video_window_vtbl, &movie->filter, &movie->pin, &window_ops);
++    strmbase_seeking_init(&movie->seeking, &seeking_vtbl, seeking_change_stop_or_rate,
++            seeking_change_start, seeking_change_stop_or_rate);
++    movie->seeking.llDuration = movie->seeking.llStop = duration;
++    movie->IBasicAudio_iface.lpVtbl = &basic_audio_vtbl;
++    movie->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
++
++    if (FAILED(video_window_create_window(&movie->window))
++            || !(movie->thread = CreateThread(NULL, 0, watch_thread, movie, 0, NULL)))
++    {
++        CloseHandle(movie->stop_event);
++        CloseHandle(device);
++        video_window_cleanup(&movie->window);
++        strmbase_seeking_cleanup(&movie->seeking);
++        strmbase_filter_cleanup(&movie->filter);
++        free(movie);
++        return S_FALSE;
++    }
++
++    TRACE("Playing %s in the browser, %ldx%ld, %s.\n", debugstr_w(path), width, height, debugstr_time(duration));
++    *out = &movie->filter.IBaseFilter_iface;
++    return S_OK;
++}
+diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
+index 17e5bb1..fd4a4ba 100644
+--- a/dlls/quartz/filtergraph.c
++++ b/dlls/quartz/filtergraph.c
+@@ -1452,6 +1452,14 @@ static HRESULT WINAPI FilterGraph2_RenderFile(IFilterGraph2 *iface, LPCWSTR lpcw
+     if (lpcwstrPlayList != NULL)
+         return E_INVALIDARG;
+ 
++    /* VNBox: a movie the browser page plays needs no other filter. */
++    if (browser_movie_create(lpcwstrFile, &preader) == S_OK)
++    {
++        hr = IFilterGraph2_AddFilter(iface, preader, L"VNBox movie");
++        IBaseFilter_Release(preader);
++        return hr;
++    }
++
+     hr = IFilterGraph2_AddSourceFilter(iface, lpcwstrFile, L"Reader", &preader);
+     if (FAILED(hr))
+         return hr;
+diff --git a/dlls/quartz/quartz_private.h b/dlls/quartz/quartz_private.h
+index e683dc5..816007e 100644
+--- a/dlls/quartz/quartz_private.h
++++ b/dlls/quartz/quartz_private.h
+@@ -54,6 +54,7 @@ HRESULT acm_wrapper_create(IUnknown *outer, IUnknown **out);
+ HRESULT async_reader_create(IUnknown *outer, IUnknown **out);
+ HRESULT avi_dec_create(IUnknown *outer, IUnknown **out);
+ HRESULT avi_splitter_create(IUnknown *outer, IUnknown **out);
++HRESULT browser_movie_create(const WCHAR *path, IBaseFilter **out);
+ HRESULT dsound_render_create(IUnknown *outer, IUnknown **out);
+ HRESULT filter_graph_create(IUnknown *outer, IUnknown **out);
+ HRESULT filter_graph_no_thread_create(IUnknown *outer, IUnknown **out);
