@@ -242,6 +242,7 @@ void FsFileNode::clearModifiedTimeOverride() {
     FsFileTimeOverride& timeOverride = this->hardLinkState ?
         this->hardLinkState->modifiedTimeOverride : this->modifiedTimeOverride;
     timeOverride.active = false;
+    this->getFileIdentity()->dataGeneration++; // every data mutation comes through here
 }
 
 U64 FsFileNode::lastAccessed() {

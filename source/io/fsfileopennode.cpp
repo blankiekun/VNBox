@@ -26,7 +26,7 @@
 #endif
 #include "fsfilenode.h"
 
-FsFileOpenNode::FsFileOpenNode(const std::shared_ptr<FsFileNode>& node, U32 flags, U32 handle) : FsOpenNode(node, flags), fileNode(node), handle(handle) {
+FsFileOpenNode::FsFileOpenNode(const std::shared_ptr<FsFileNode>& node, U32 flags, U32 handle) : FsOpenNode(node, flags), fileNode(node), handle(handle), readAheadOn((flags & K_O_ACCMODE) == K_O_RDONLY) {
     openPositionedWriteHandle();
 }
 
@@ -85,10 +85,20 @@ bool FsFileOpenNode::setLength(S64 len) {
 }
 
 S64 FsFileOpenNode::getFilePointer() {
+    if (this->readAheadOn) {
+        return this->pos;
+    }
     return lseek64(this->handle, 0, SEEK_CUR);
 }
 
 S64 FsFileOpenNode::seek(S64 pos) {
+    if (this->readAheadOn) {
+        if (pos < 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        return this->pos = pos;
+    }
     return lseek64(this->handle, pos, SEEK_SET);
 }
 
@@ -122,6 +132,8 @@ void FsFileOpenNode::reopen() {
     }
 
     this->handle = Platform::open(this->fileNode->getNativePathForData().c_str(), openFlags, 0666);
+    this->pos = this->nativePos = 0;
+    this->readAhead.drop();
     openPositionedWriteHandle();
 }
 
@@ -171,7 +183,24 @@ bool FsFileOpenNode::canMap() {
 }
 
 U32 FsFileOpenNode::readNative(U8* buffer, U32 len) {
+    if (this->readAheadOn) {
+        return (U32)this->readAhead.read(buffer, len, this->pos, this->fileNode->getFileIdentity()->dataGeneration,
+            [this](U8* dst, S64 offset, U32 n) { return this->readAt(dst, offset, n); });
+    }
     return (U32)::read(this->handle, buffer, len);
+}
+
+S32 FsFileOpenNode::readAt(U8* buffer, S64 offset, U32 len) {
+    if (this->nativePos != offset) {
+        if (lseek64(this->handle, offset, SEEK_SET) != offset) {
+            this->nativePos = -1;
+            return -1;
+        }
+        this->nativePos = offset;
+    }
+    S32 result = (S32)::read(this->handle, buffer, len);
+    this->nativePos = result < 0 ? -1 : offset + result;
+    return result;
 }
 
 U32 FsFileOpenNode::writeNative(U8* buffer, U32 len) {
@@ -189,6 +218,9 @@ U32 FsFileOpenNode::allocate(U64 offset, U64 len) {
         return -K_EFBIG;
     }
     int result = posix_fallocate(this->handle, (off_t)offset, (off_t)len);
+    if (!result) {
+        this->fileNode->getFileIdentity()->dataGeneration++;
+    }
     return result ? -translateErr(result) : 0;
 #else
     return FsOpenNode::allocate(offset, len);
