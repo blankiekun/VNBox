@@ -153,6 +153,8 @@ public:
     static bool noErrorDialog;
     static BString exePath;
     static bool disableHideCursor;
+    // the game's main window fills the screen, without its title bar (XServer::fitWindow)
+    static bool fitWindow;
     static bool forceRelativeMouse;
     static U32 relativeMouseSensitivity;
     static bool cacheReads;

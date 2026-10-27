@@ -121,6 +121,7 @@ public:
     bool cdromInstall = false; // Explicit autorun-or-Explorer startup, not disc-change autoplay.
     bool enableDXVK = false;
     bool disableHideCursor = false;
+    bool fitWindow = false;
     bool forceRelativeMouse = false;
     bool cacheReads = false;
     bool disableWasmJitForWrittenCode = false;

@@ -169,6 +169,7 @@ public:
 	void setTextProperty(KThread* thread, XTextProperty* name, Atom property, bool trace = false);
 	int configure(U32 mask, XWindowChanges* changes);
 	int moveResize(S32 x, S32 y, U32 width, U32 height);
+	void fitToScreen();
 
 	XPropertyPtr getProperty(U32 atom);
 	void setProperty(U32 atom, U32 type, U32 format, U32 length, const U8* value, bool trace = false);
