@@ -419,15 +419,18 @@ static void profReport(double now) {
         klog_fmt("[prof]   %5.1f%% %s:%s+0x%x ms=%.0f instr=%llu entries=%llu", total ? 100 * t.first / total : 0, std::get<0>(t.second).c_str(),
             std::get<1>(t.second).c_str(), std::get<2>(t.second), a.ms, a.instr, a.entries);
     }
-    std::string json = "[";
+    // klog cuts lines at ~400 bytes: 4 items per line, join the [prof-cum] lines' items into one array
+    std::string json;
+    int n = 0;
     for (auto& t : top(cum, 400)) {
         auto& a = cum[t.second];
         char item[256];
-        snprintf(item, sizeof(item), "%s[\"%s\",\"%s\",%u,%.1f,%llu,%llu]", json.size() > 1 ? "," : "", std::get<0>(t.second).c_str(),
+        snprintf(item, sizeof(item), "%s[\"%s\",\"%s\",%u,%.1f,%llu,%llu]", json.empty() ? "" : ",", std::get<0>(t.second).c_str(),
             std::get<1>(t.second).c_str(), std::get<2>(t.second), a.ms, a.instr, a.entries);
         json += item;
+        if (++n % 4 == 0) { klog_fmt("[prof-cum] %s", json.c_str()); json.clear(); }
     }
-    klog_fmt("[prof-cum] %s]", json.c_str());
+    if (!json.empty()) klog_fmt("[prof-cum] %s", json.c_str());
 }
 
 void mainloop() {
