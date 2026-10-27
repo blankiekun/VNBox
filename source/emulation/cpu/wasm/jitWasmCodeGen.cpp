@@ -4195,7 +4195,21 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     U32 statsStart = cpu->blockInstructionCount - op->blockOpCount; // run() counted the first block before calling in
     U64 statsPadStart = vnboxStats.sysPadInstr; // syscalls made from compiled blocks add their time as instructions
     WASM_JIT_PROFILE_ONLY(bool loopProfileSample = wasmJitProfileLoopSample();)
+    const bool eipProf = vnboxProfOn; // prof=1: time per block, see VnboxProfEntry
+    double eipProfT = eipProf ? emscripten_get_now() : 0;
+    unsigned long long eipProfKey = 0;
+    U32 eipProfInstr = 0;
     while (op && op->pfnJitCode && chainedBlocks < WASM_JIT_CHAIN_BLOCK_LIMIT && !cpu->yield) {
+        if (eipProf) {
+            double n = emscripten_get_now();
+            if (eipProfKey) {
+                VnboxProfEntry& e = vnboxProfBlocks[eipProfKey];
+                e.ms += n - eipProfT; e.instr += eipProfInstr; e.entries++;
+            }
+            eipProfT = n;
+            eipProfKey = ((unsigned long long)cpu->thread->process->id << 32) | cpu->getEipAddress();
+            eipProfInstr = op->blockOpCount;
+        }
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
         bool profileSample = wasmJitProfileStartEntry();
         U64 profileStartNs = profileSample ? wasmJitProfileNowNs() : 0;
@@ -4247,6 +4261,10 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
         }
     }
 #if !defined(BOXEDWINE_MULTI_THREADED)
+    if (eipProf && eipProfKey) {
+        VnboxProfEntry& e = vnboxProfBlocks[eipProfKey];
+        e.ms += emscripten_get_now() - eipProfT; e.instr += eipProfInstr; e.entries++;
+    }
     cpu->blockInstructionCount += chainedInstructionCount;
     if (vnboxStats.on) {
         vnboxStats.jitEntries++;
