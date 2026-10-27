@@ -275,23 +275,24 @@ U64 elapsedInstructionsMIPS;
 bool runSlice() {    
     runTimers();
 
-    if (scheduledThreads.isEmpty())
-        return false;
-    
     XServer* server = XServer::getServer(true);
     if (server) {
-        server->isDisplayDirty = true; // a bit of a hack, sometimes popups in Basstour get missed and don't draw
+        // a bit of a hack, sometimes popups in Basstour get missed and don't draw
+        // (only while the guest runs; an idle tick still draws a frame the fps cap held back)
+        if (!scheduledThreads.isEmpty()) server->isDisplayDirty = true;
 #ifdef __EMSCRIPTEN__
         double drawStart = vnboxStats.on ? emscripten_get_now() : 0;
 #endif
         server->draw();
 #ifdef __EMSCRIPTEN__
-        if (vnboxStats.on) {
+        if (vnboxStats.on && !scheduledThreads.isEmpty()) { // slice-start calls, as before idle ticks drew
             vnboxStats.draws++;
             vnboxStats.drawMs += emscripten_get_now() - drawStart;
         }
 #endif
     }
+    if (scheduledThreads.isEmpty())
+        return false;
 
     U64 elapsedTime = 0;
     const U64 sliceStart = schedulerMicroCounter();
@@ -304,6 +305,11 @@ bool runSlice() {
             runTimers();
             nextTimerCheck = elapsedTime + 1000;
             if (scheduledThreads.isEmpty()) {
+                break;
+            }
+            // A frame due mid-slice is shown now, not at the next slice (fps=60/90/120 would
+            // land on ~10 ms slice boundaries); ending the slice lets the browser paint it.
+            if (server && XServer::drawFps && server->draw()) {
                 break;
             }
         }

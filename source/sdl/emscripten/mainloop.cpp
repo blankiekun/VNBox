@@ -23,6 +23,7 @@
 #include "kbrowsersocket.h"
 #include "knativesystem.h"
 #include "vnboxstats.h"
+#include "../../x11/x11.h"
 #include "vnboxwinereq.h"
 #include <algorithm>
 #include <vector>
@@ -136,6 +137,13 @@ static void updateMainLoopTiming(bool idle) {
             // own run time is already left out), at most idleWaitMs: a sleeping guest used to be
             // woken every 1 ms. Input wakes the JSPI loop at once (doMainLoop).
             value = (int)std::min(nextTimer, idleWaitMs);
+        }
+        // a frame the fps cap held back is drawn by the next tick once it is due
+        XServer* server = XServer::getServer(true);
+        if (server && server->isDisplayDirty && server->getRoot() && XServer::drawFps && mode == EM_TIMING_SETTIMEOUT) {
+            U64 now = KSystem::getMicroCounter();
+            int due = XServer::nextDrawUs > now ? (int)((XServer::nextDrawUs - now + 999) / 1000) : 0;
+            value = std::min(value, due);
         }
     }
 #ifdef BOXEDWINE_JSPI
@@ -335,7 +343,7 @@ static void statsTickStart() {
         char js[512];
         statsJsPart(js, sizeof(js), sec);
         klog_fmt("[stats] %.1fs mips=%u guestBusy=%.0f%% ticks busy=%u idle=%u | timeoutWaits=%u late avg=%.1f max=%.1fms | msg/rAF waits=%u gap avg=%.1f max=%.1fms"
-            " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f"
+            " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f shown/s=%.1f skippedSame/s=%.1f busyDropped/s=%.1f"
             " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f | input/s=%.1f motion/s=%.0f"
             " | sys ms/s=%.0f user ms/s=%.0f | threads/s:%s | topSys: %s | jit instr=%.0f%% (interp %.0f%%) entries/s=%.0f blocksCompiled/s=%.0f"
             " | wineserver ms/s=%.0f req/s=%.0f | wineReq %s | signals/s=%.1f faults/s=%.1f | zipMiss/s=%.1f zipMs/s=%.0f%s",
@@ -344,6 +352,7 @@ static void statsTickStart() {
             s.msgWaits, s.msgWaits ? s.msgGapMs / s.msgWaits : 0, s.msgGapMaxMs,
             s.timers, s.timers ? s.timerLateMs / s.timers : 0, s.timerLateMaxMs,
             s.presentsGl / sec, s.presentsGl ? s.presentGlMs / s.presentsGl : 0, s.draws / sec, s.draws ? s.drawMs / s.draws : 0,
+            (s.presentsSw + s.presentsGl) / sec, s.skippedSame / sec, s.busyDropped / sec,
             s.glCalls / sec, s.glGetErrors / sec, s.glMs / sec, s.inputs / sec, s.motions / sec,
             s.sysMs / sec, (s.sliceMs - s.sysMs) / sec, statsBusyThreads(s, sec).c_str(), statsTopSyscalls(s).c_str(),
             guestInstr ? 100.0 * s.jitInstr / guestInstr : 0, guestInstr ? 100.0 - 100.0 * s.jitInstr / guestInstr : 0,
@@ -458,6 +467,7 @@ bool doMainLoop() {
 #ifndef BOXEDWINE_MULTI_THREADED
     idleWaitMs = vnboxUrlInt("idleWait", idleWaitMs, 1, 1000);
 #endif
+    XServer::drawFps = vnboxUrlInt("fps", XServer::drawFps, 0, 240); // frames shown per second at most, 0 = unlocked
 #if defined(BOXEDWINE_WASM_JIT) && !defined(__TEST)
     jitRunCount = vnboxUrlInt("jitRunCount", jitRunCount, 1, JIT_RUN_COUNT_MAX - 1);
 #endif

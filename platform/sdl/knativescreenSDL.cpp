@@ -49,13 +49,15 @@
 
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
 #include <emscripten/emscripten.h>
+#include "vnboxstats.h"
 
 #ifdef __EMSCRIPTEN_PTHREADS__
 // bwCallHandlerCmd comes from boxedwine-multithreaded-helper.js.
 EM_JS_DEPS(boxedwine_present_software_frame_deps, "$bwCallHandlerCmd");
 #endif
 
-EM_JS(void, boxedwinePresentSoftwareFrame, (const U32* pixels, int width, int height), {
+// 0 when an earlier frame is still being shown (the caller keeps this one for the next present)
+EM_JS(int, boxedwinePresentSoftwareFrame, (const U32* pixels, int width, int height), {
     var presentState = null;
     if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {
         if (!Module.__boxedwineSoftwarePresentState) {
@@ -63,7 +65,7 @@ EM_JS(void, boxedwinePresentSoftwareFrame, (const U32* pixels, int width, int he
         }
         presentState = Module.__boxedwineSoftwarePresentState;
         if (Atomics.compareExchange(presentState, 0, 0, 1) !== 0) {
-            return;
+            return 0;
         }
     }
     var count = width * height;
@@ -98,6 +100,7 @@ EM_JS(void, boxedwinePresentSoftwareFrame, (const U32* pixels, int width, int he
             args: [width, height, rgba.buffer, presentState]
         }, [rgba.buffer]);
     }
+    return 1;
 });
 #endif
 
@@ -120,6 +123,16 @@ EM_JS(void, boxedwineSetWebGLPresentSize, (int width, int height), {
 #endif
 
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
+// memcmp is a byte loop in emscripten's libc: compare 8 bytes at a time (frames are 4-byte pixels)
+static bool sameFrame(const U8* a, const U8* b, U32 bytes) {
+    const U64* x = (const U64*)a;
+    const U64* y = (const U64*)b;
+    for (U32 i = 0, n = bytes / 8; i < n; ++i) {
+        if (x[i] != y[i]) return false;
+    }
+    return memcmp(a + (bytes & ~7u), b + (bytes & ~7u), bytes & 7) == 0;
+}
+
 static bool useEmscriptenSoftwareRenderer(bool skipRenderer) {
     return KSystem::videoOption != VIDEO_NO_WINDOW && !skipRenderer;
 }
@@ -165,6 +178,7 @@ KNativeScreenSDL::~KNativeScreenSDL() {
     destroyMainWindow();
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
     delete[] emscriptenSoftwareBuffer;
+    delete[] emscriptenShownFrame;
 #endif
 }
 
@@ -584,11 +598,33 @@ void KNativeScreenSDL::present() {
                 openGL->hideCurrentWindow();
             }
             showWindow(true);
+            emscriptenShownValid = false; // the canvas may hold a GL frame or nothing yet
+        }
+        U32 frameBytes = screenWidth() * screenHeight() * 4;
+        if (emscriptenSoftwareDirty && emscriptenShownValid && emscriptenShownWidth == screenWidth()
+                && emscriptenShownHeight == screenHeight() && sameFrame(emscriptenSoftwareBuffer, emscriptenShownFrame, frameBytes)) {
+            // Every draw composites every window again (overlapping ones too): a frame equal to
+            // the one on the canvas skips the RGBA conversion and putImageData.
+            emscriptenSoftwareDirty = false;
+            if (vnboxStats.on) vnboxStats.skippedSame++;
         }
         if (emscriptenSoftwareDirty) {
-            boxedwinePresentSoftwareFrame((const U32*)emscriptenSoftwareBuffer, screenWidth(), screenHeight());
-            emscriptenSoftwareDirty = false;
-            presented = true;
+            if (boxedwinePresentSoftwareFrame((const U32*)emscriptenSoftwareBuffer, screenWidth(), screenHeight())) {
+                emscriptenSoftwareDirty = false;
+                presented = true;
+                if (emscriptenShownFrameSize < frameBytes) {
+                    delete[] emscriptenShownFrame;
+                    emscriptenShownFrame = new U8[frameBytes];
+                    emscriptenShownFrameSize = frameBytes;
+                }
+                memcpy(emscriptenShownFrame, emscriptenSoftwareBuffer, frameBytes);
+                emscriptenShownValid = true;
+                emscriptenShownWidth = screenWidth();
+                emscriptenShownHeight = screenHeight();
+                if (vnboxStats.on) vnboxStats.presentsSw++;
+            } else if (vnboxStats.on) {
+                vnboxStats.busyDropped++; // kept dirty: shown by the next present
+            }
         }
     }
 #endif

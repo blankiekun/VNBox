@@ -136,6 +136,9 @@ private:
     U8* emscriptenSoftwareBuffer = nullptr;
     U32 emscriptenSoftwareBufferSize = 0;
     bool emscriptenSoftwareDirty = false;
+    U8* emscriptenShownFrame = nullptr; // a copy of the frame on the canvas
+    U32 emscriptenShownFrameSize = 0, emscriptenShownWidth = 0, emscriptenShownHeight = 0;
+    bool emscriptenShownValid = false;
     bool emscriptenSoftwareDisabled = false;
 #endif
 
