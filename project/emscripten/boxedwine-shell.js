@@ -60,8 +60,10 @@
         // on) to jp.zip's IPA fonts. Japanese games ask for them by name, and some check that
         // they got them (GetTextFace) and stop when they did not. jp.zip carries the file, which also
         // turns off the Wine services a VN never needs (vn/build-jp-overlay.sh), for prefixes made
-        // before jp.zip carried a trimmed system.reg.
-        REGISTRY_PRESETS.jpfonts = 'reg import Z:\\opt\\wine\\share\\wine\\jp-fonts.reg';
+        // before jp.zip carried a trimmed system.reg. jp.zip's wineboot imports it once per version
+        // (vn/wine/wineboot-import-jp-fonts.patch), so the preset runs nothing: "cmd /c reg import"
+        // before every game cost about 2 s.
+        REGISTRY_PRESETS.jpfonts = [];
         // wine-override=[name,...] adds these to WINEDLLOVERRIDES
         let WINE_OVERRIDE_PRESETS = {
             nomono: "mscoree,mshtml=" // skip the Wine Mono and Gecko installs
