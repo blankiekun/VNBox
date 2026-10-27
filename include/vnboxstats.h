@@ -1,6 +1,8 @@
 #ifndef __VNBOX_STATS_H__
 #define __VNBOX_STATS_H__
 
+#include <unordered_map>
+
 // stats=1 in the page URL (emscripten): cheap counters, logged and reset every ~2 s by the main loop.
 struct VnboxStats {
     bool on = false;
@@ -14,6 +16,14 @@ struct VnboxStats {
     unsigned jitEntries = 0, blocksCompiled = 0, wineserverRequests = 0, signals = 0, faults = 0, zipMisses = 0;
     unsigned sysCount[440] = {};
     double sysMsBy[440] = {};
+    unsigned sysBlocked[440] = {}; // calls that blocked (K_WAIT); a woken thread runs the call again, so sysCount includes the retry
+    // wineserver requests the clients send (64-byte header write), by request number and by sending thread
+    unsigned wineReq[320] = {};
+    std::unordered_map<unsigned long long, unsigned> wineReqByThread; // (process id << 40 | thread id << 16 | request) -> count
+    std::unordered_map<unsigned, BString> processNames; // process id -> name, for the log line
+    // guest time by thread: (process id << 24 | thread id) -> ms in slices, and how many slices it ran
+    std::unordered_map<unsigned long long, double> threadMs;
+    std::unordered_map<unsigned long long, unsigned> threadRuns;
 };
 extern VnboxStats vnboxStats;
 
