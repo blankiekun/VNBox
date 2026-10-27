@@ -28,6 +28,7 @@
 #include "devinput.h"
 #include "devdsp.h"
 #include "devntsync.h"
+#include "devmovie.h"
 #include "procselfexe.h"
 // Use the guest /proc header, not asmjit's identically named cpuinfo.h.
 #include "../../include/cpuinfo.h"
@@ -216,6 +217,7 @@ void StartUpArgs::buildVirtualFileSystem() {
     Fs::addVirtualFile(B("/dev/input/event4"), openDevInputKeyboard, K__S_IWRITE|K__S_IREAD|K__S_IFCHR, k_mdev(0xd, 0x44), inputNode);
 	Fs::addVirtualFile(B("/dev/dsp"), openDevDsp, K__S_IWRITE | K__S_IREAD | K__S_IFCHR, k_mdev(14, 3), devNode);
     Fs::addVirtualFile(B("/dev/ntsync"), openDevNtsync, K__S_IWRITE | K__S_IREAD | K__S_IFCHR, k_mdev(10, 124), devNode);
+    Fs::addVirtualFile(B("/dev/vnbox-movie"), openDevMovie, K__S_IWRITE | K__S_IREAD | K__S_IFCHR, k_mdev(10, 125), devNode);
 	Fs::addVirtualFile(B("/dev/mixer"), openDevMixer, K__S_IWRITE | K__S_IREAD | K__S_IFCHR, k_mdev(14, 0), devNode);
     Fs::addVirtualFile(B("/dev/sequencer"), openDevSequencer, K__S_IWRITE | K__S_IREAD | K__S_IFCHR, k_mdev(14, 1), devNode);    
 

@@ -4,7 +4,8 @@
 # the name to pick code page 932), plus the root fs's Wine prefix registry with unneeded
 # services turned off (see below), and Wine 11.0's wineboot and explorer with vn/wine/*.patch
 # (build-wine-boot.sh, needs Docker): they skip shell32/wininet/rpcss work a game doesn't use,
-# and wineboot imports jp-fonts.reg (below) once per version of the file; and ntdll.so and
+# and wineboot imports jp-fonts.reg (below) once per version of the file, and quartz hands
+# MPEG-1 movies to the browser page (/dev/vnbox-movie, vnbox-movie.js); and ntdll.so and
 # wineserver built with ntsync support (build-wine-ntsync.sh).
 # Usage: vn/build-jp-overlay.sh <TinyCore15Wine11.0-web.zip> <out/jp.zip>
 set -euo pipefail
@@ -58,11 +59,12 @@ FONTS
 rm "$work/jp-fonts.utf8"
 
 # Faster boot, part 2: patched wineboot (no shell32/wininet for its registry defaults) and explorer
-# (no Program Manager DDE or ShellWindows on a desktop without the shell), with their LGPL source.
+# (no Program Manager DDE or ShellWindows on a desktop without the shell), with their LGPL source;
+# and quartz with browser movies.
 "$here/build-wine-boot.sh" "$work/opt/wine/lib/wine/i386-unix"
 mkdir -p "$work/opt/wine/share/wine/vnbox-patches"
 cp "$here"/wine/*.patch "$work/opt/wine/share/wine/vnbox-patches/"
-printf 'wineboot.exe.so and explorer.exe.so in opt/wine/lib/wine/i386-unix are Wine 11.0\n(LGPL-2.1, https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz) with these\npatches, built by vn/build-wine-boot.sh in https://github.com/blankiekun/VNBox.\n' \
+printf 'wineboot.exe.so, explorer.exe.so and quartz.dll.so in opt/wine/lib/wine/i386-unix are Wine 11.0\n(LGPL-2.1, https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz) with these\npatches, built by vn/build-wine-boot.sh in https://github.com/blankiekun/VNBox.\n' \
   > "$work/opt/wine/share/wine/vnbox-patches/README"
 
 # ntsync: the root fs's ntdll.so and wineserver rebuilt with linux/ntsync.h, so event, mutex and

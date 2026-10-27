@@ -3396,3 +3396,39 @@ async function createZip(items) {
   end.setUint32(16, offset, true);
   return new Blob(parts.concat(directory, [new Uint8Array(end.buffer)]), { type: "application/zip" });
 }
+
+// Movies a game plays through DirectShow (MPEG-1 program streams), which VNBox's quartz hands to
+// the page through /dev/vnbox-movie (devmovie.cpp): vnbox-movie.js decodes and draws them, loaded
+// with vnbox-movie-decoder.js from this file's folder on the first movie. URL parameter movies=0: off, so
+// quartz builds its usual graph. Returns open: 1 taken, -1 not; status: 1 ended (or failed), 0 not.
+var vnboxMovieBase = document.currentScript ? new URL(".", document.currentScript.src).href : "";
+var vnboxMovieLoad = null, vnboxMovieQueue = [];
+
+// The movie file as a Blob, from its Emscripten FS node (the lazy game folder's File in jspi mode).
+function vnboxMovieBlob(path) {
+    var node;
+    try { node = FS.lookupPath(path).node; } catch (e) { return null; }
+    if (node.lazyFile === undefined || node.lazyCopied) return node.contents ? new Blob([node.contents.subarray(0, node.usedBytes)]) : null;
+    if (node.lazyBytes) return new Blob([node.lazyBytes]);
+    return typeof lazyFiles !== "undefined" && lazyFiles[node.lazyFile] || null; // sab mode: the worker has the File
+}
+
+function boxedwineMovie(id, cmd, arg) {
+    if (typeof vnboxMovieCommand === "function") return vnboxMovieCommand(id, cmd, arg);
+    if (cmd === "open") {
+        if (new URLSearchParams(location.search).get("movies") === "0" || !vnboxMovieBlob(arg)) return -1;
+        vnboxMovieLoad = vnboxMovieLoad || ["vnbox-movie-decoder.js", "vnbox-movie.js"].reduce((done, name) => done.then(() => new Promise((resolve, reject) => {
+            var script = document.createElement("script");
+            script.src = vnboxMovieBase + name;
+            script.onload = resolve;
+            script.onerror = () => reject(new Error("could not load " + name));
+            document.head.appendChild(script);
+        })), Promise.resolve()).then(() => {
+            vnboxMovieQueue.forEach(c => vnboxMovieCommand(c[0], c[1], c[2]));
+            vnboxMovieQueue = null;
+        }, error => { vnboxReport("movie", error); vnboxMovieLoad = "failed"; });
+    }
+    if (cmd === "status") return vnboxMovieLoad === "failed" ? 1 : 0;
+    if (vnboxMovieQueue) vnboxMovieQueue.push([id, cmd, arg]);
+    return 1;
+}
