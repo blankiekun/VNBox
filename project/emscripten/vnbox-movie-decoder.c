@@ -15,6 +15,7 @@ typedef struct {
     plm_buffer_t *buffer;
     plm_frame_t *frame;
     uint8_t *rgba;
+    int frames; // decoded so far, for stats=1
     int audio_count;
     double audio_time[MAX_AUDIO];
     float audio[MAX_AUDIO][PLM_AUDIO_SAMPLES_PER_FRAME * 2];
@@ -22,6 +23,7 @@ typedef struct {
 
 static void on_video(plm_t *plm, plm_frame_t *frame, void *user) {
     ((movie_t *)user)->frame = frame;
+    ((movie_t *)user)->frames++;
 }
 
 static void on_audio(plm_t *plm, plm_samples_t *samples, void *user) {
@@ -48,6 +50,8 @@ EMSCRIPTEN_KEEPALIVE double vm_time(movie_t *m) { return plm_get_time(m->plm); }
 EMSCRIPTEN_KEEPALIVE int vm_width(movie_t *m) { return plm_get_width(m->plm); }
 EMSCRIPTEN_KEEPALIVE int vm_height(movie_t *m) { return plm_get_height(m->plm); }
 EMSCRIPTEN_KEEPALIVE int vm_samplerate(movie_t *m) { return plm_get_samplerate(m->plm); }
+EMSCRIPTEN_KEEPALIVE double vm_framerate(movie_t *m) { return plm_get_framerate(m->plm); }
+EMSCRIPTEN_KEEPALIVE int vm_frames(movie_t *m) { return m->frames; }
 EMSCRIPTEN_KEEPALIVE uint8_t *vm_rgba(movie_t *m) { return m->rgba; }
 EMSCRIPTEN_KEEPALIVE int vm_audio_count(movie_t *m) { return m->audio_count; }
 EMSCRIPTEN_KEEPALIVE double vm_audio_time(movie_t *m, int i) { return m->audio_time[i]; }

@@ -3414,6 +3414,7 @@ function vnboxMovieBlob(path) {
 }
 
 function boxedwineMovie(id, cmd, arg) {
+    if (cmd === "open") console.log("[movie] open " + arg);
     if (typeof vnboxMovieCommand === "function") return vnboxMovieCommand(id, cmd, arg);
     if (cmd === "open") {
         if (new URLSearchParams(location.search).get("movies") === "0" || !vnboxMovieBlob(arg)) return -1;
