@@ -1,0 +1,57 @@
+diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -1464,6 +1464,45 @@
+     return 1;
+ }
+ 
++/* VNBox: the player used to start every game as "cmd /c reg import jp-fonts.reg & game", so
++ * conhost, cmd and reg ran before the game on each launch (about 2 s in the emulator). wineboot
++ * imports the file instead, once per version of it, and before services.exe starts, so the
++ * service settings in it apply from that launch on. */
++static void import_vnbox_reg(void)
++{
++    static const WCHAR file[] = L"Z:\\opt\\wine\\share\\wine\\jp-fonts.reg";
++    WIN32_FILE_ATTRIBUTE_DATA data;
++    WCHAR stamp[64], old[64], cmdline[MAX_PATH];
++    DWORD size = sizeof(old), code = 1;
++    STARTUPINFOW si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    HKEY key;
++
++    if (!GetFileAttributesExW( file, GetFileExInfoStandard, &data )) return;
++    swprintf( stamp, ARRAY_SIZE(stamp), L"%lu-%08lx%08lx", data.nFileSizeLow,
++              data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime );
++    if (RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\VNBox", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL ))
++        return;
++    /* the font check: a prefix whose registry was saved without the import's values imports again */
++    if (RegQueryValueExW( key, L"JpFontsReg", NULL, NULL, (BYTE *)old, &size ) || wcscmp( old, stamp ) ||
++        RegGetValueW( HKEY_CURRENT_USER, L"Software\\Wine\\Fonts\\Replacements", L"MS UI Gothic",
++                      RRF_RT_REG_SZ, NULL, NULL, NULL ))
++    {
++        swprintf( cmdline, ARRAY_SIZE(cmdline), L"reg.exe import \"%s\"", file );
++        if (CreateProcessW( L"C:\\windows\\system32\\reg.exe", cmdline, NULL, NULL, FALSE, DETACHED_PROCESS,
++                            NULL, NULL, &si, &pi ))
++        {
++            CloseHandle( pi.hThread );
++            WaitForSingleObject( pi.hProcess, INFINITE );
++            GetExitCodeProcess( pi.hProcess, &code );
++            CloseHandle( pi.hProcess );
++        }
++        if (!code) RegSetValueExW( key, L"JpFontsReg", 0, REG_SZ, (BYTE *)stamp, (wcslen( stamp ) + 1) * sizeof(WCHAR) );
++        else WINE_ERR( "reg import %s failed: %lu\n", wine_dbgstr_w(file), code );
++    }
++    RegCloseKey( key );
++}
++
+ static BOOL start_services_process(void)
+ {
+     static const WCHAR svcctl_started_event[] = SVCCTL_STARTED_EVENT;
+@@ -1938,6 +1977,7 @@
+     if (init || (kill && !restart))
+     {
+         ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServices", FALSE, FALSE );
++        import_vnbox_reg();
+         start_services_process();
+     }
+     if (init || update) update_wineprefix( update );

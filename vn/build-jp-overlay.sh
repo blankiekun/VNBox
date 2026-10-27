@@ -3,7 +3,8 @@
 # ja_JP.utf8 locale, which is the root fs's en_US.utf8 under the ja_JP name (Wine only needs
 # the name to pick code page 932), plus the root fs's Wine prefix registry with unneeded
 # services turned off (see below), and Wine 11.0's wineboot and explorer with vn/wine/*.patch
-# (build-wine-boot.sh, needs Docker): they skip shell32/wininet/rpcss work a game doesn't use.
+# (build-wine-boot.sh, needs Docker): they skip shell32/wininet/rpcss work a game doesn't use,
+# and wineboot imports jp-fonts.reg (below) once per version of the file.
 # Usage: vn/build-jp-overlay.sh <TinyCore15Wine11.0-web.zip> <out/jp.zip>
 set -euo pipefail
 root_zip=$(realpath "$1")
@@ -21,7 +22,7 @@ mv "$work/en/usr/lib/locale/en_US.utf8" "$work/usr/lib/locale/ja_JP.utf8"
 rm -rf "$work/en"
 test -s "$work/usr/lib/locale/ja_JP.utf8/LC_CTYPE"
 
-# Font replacements for boxedwine-shell.js's registry=jpfonts: the Windows Japanese font names
+# Font replacements (jp-fonts.reg, imported by the patched wineboot): the Windows Japanese font names
 # as aliases of the IPA fonts. A version 5 .reg file is UTF-16LE, so the names don't depend on
 # the code page reg import runs under.
 {
