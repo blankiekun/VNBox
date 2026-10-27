@@ -2324,7 +2324,7 @@ EM_JS(int, boxedwine_wasm_instantiate,
         }
 
         var inst = new WebAssembly.Instance(mod, {
-            'env':     { 'memory': wasmMemory },
+            'env':     { 'memory': wasmMemory, 'table': wasmTable },
             'helpers': helpers
         });
 
@@ -2428,7 +2428,7 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int siz
             helpers['fn_' + i] = wasmTable.get(imports[i]);
         }
         var instance = new WebAssembly.Instance(module, {
-            env: {memory: wasmMemory}, helpers: helpers
+            env: {memory: wasmMemory, table: wasmTable}, helpers: helpers
         });
         for (var i = 0; i < entryCount; ++i) {
             var fn = instance.exports['b' + i];
@@ -2817,7 +2817,7 @@ EM_JS(int, boxedwine_wasm_lookup_cached,
             helpers['fn_' + i] = wasmTable.get(view[i]);
         }
         inst = new WebAssembly.Instance(mod, {
-            'env':     { 'memory': wasmMemory },
+            'env':     { 'memory': wasmMemory, 'table': wasmTable },
             'helpers': helpers
         });
         Module.wasmJitGroupInstances.set(instKey, inst);
@@ -2933,7 +2933,7 @@ EM_JS(int, boxedwine_wasm_lookup_cached,
             helpers['fn_' + i] = wasmTable.get(view[i]);
         }
         var inst = new WebAssembly.Instance(mod, {
-            'env':     { 'memory': wasmMemory },
+            'env':     { 'memory': wasmMemory, 'table': wasmTable },
             'helpers': helpers
         });
         var fn = inst.exports['execute'];
@@ -3101,7 +3101,7 @@ EM_JS(int, boxedwine_wasm_instantiate_mt,
         }
 
         var inst = new WebAssembly.Instance(mod, {
-            'env':     { 'memory': wasmMemory },
+            'env':     { 'memory': wasmMemory, 'table': wasmTable },
             'helpers': helpers
         });
 
@@ -3299,7 +3299,7 @@ EM_JS(int, boxedwine_wasm_instantiate_group_mt,
                 helpers['fn_' + i] = wasmTable.get(view[i]);
             }
             inst = new WebAssembly.Instance(lookup.module, {
-                'env':     { 'memory': wasmMemory },
+                'env':     { 'memory': wasmMemory, 'table': wasmTable },
                 'helpers': helpers
             });
             globalThis.bwJitMtGroupInstances.set(instanceKey, inst);
@@ -3422,7 +3422,7 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_group_mt,
                 }
 #endif
                 inst = new WebAssembly.Instance(lookup.module, {
-                    'env':     { 'memory': wasmMemory },
+                    'env':     { 'memory': wasmMemory, 'table': wasmTable },
                     'helpers': helpers
                 });
             } catch (instanceError) {
@@ -3566,7 +3566,7 @@ EM_JS(int, boxedwine_wasm_install_existing_group_mt,
             }
 #endif
             inst = new WebAssembly.Instance(lookup.module, {
-                'env':     { 'memory': wasmMemory },
+                'env':     { 'memory': wasmMemory, 'table': wasmTable },
                 'helpers': helpers
             });
             globalThis.bwJitMtGroupInstances.set(instanceKey, inst);
@@ -3630,7 +3630,7 @@ EM_JS(int, boxedwine_wasm_install_existing_mt,
         }
 
         var inst = new WebAssembly.Instance(mod, {
-            'env':     { 'memory': wasmMemory },
+            'env':     { 'memory': wasmMemory, 'table': wasmTable },
             'helpers': helpers
         });
 
@@ -4190,7 +4190,6 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     } while (wasmJitCanChainTo(cpu, op) && op->runCount > JIT_RUN_COUNT);
 #else
     U32 chainedBlocks = 0;
-    U32 chainedInstructionCount = 0;
     bool memoryArraysChecked = false;
     U32 statsStart = cpu->blockInstructionCount - op->blockOpCount; // run() counted the first block before calling in
     U64 statsPadStart = vnboxStats.sysPadInstr; // syscalls made from compiled blocks add their time as instructions
@@ -4218,9 +4217,8 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
             }
         }
 #endif
-        DecodedOp* executedOp = op;
-        U8 wasmJitSetupFlags = op->flags2 & OP_FLAG2_WASM_JIT_MEM_ARRAYS;
-        if (wasmJitSetupFlags && !memoryArraysChecked) {
+        // Unconditional: blocks this one tail-calls are not seen here (see emitChainToNextOp).
+        if (!memoryArraysChecked) {
             KMemoryData* memoryData = nullptr;
             bool refreshed = wasmMemoryPageArraysNeedRefresh(cpu, &memoryData);
             if (refreshed) {
@@ -4234,20 +4232,19 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
         WASM_JIT_PROFILE_ONLY(if (profileSample) { U64 startPostCallNs = wasmJitProfileNowNs(); wasmJitProfileAddElapsedScaled(g_wasmJitProfileStartPostCallUs, startPostCallNs); wasmJitProfileAddElapsedScaled(g_wasmJitProfileStartUs, profileStartNs); })
         WASM_JIT_PROFILE_ONLY(if (profileSample) { wasmJitProfileChainTarget(cpu, cpu->nextOp, WASM_JIT_PROFILE_TIMING_SAMPLE); })
         // nextOp is updated by the WASM block itself (via helper call).
-        if (chainedBlocks) {
-            chainedInstructionCount += executedOp->blockOpCount;
-        }
         chainedBlocks++;
         op = cpu->nextOp;
-        // Include deferred chain accounting as well as instructions charged by
-        // generated loops; the block-count cap alone can overrun a guest slice.
-        if ((S32)(cpu->blockInstructionCount + chainedInstructionCount) >= contextTimeRemaining ||
+        // Blocks the WASM tail-called and generated loops count their own
+        // instructions; the block-count cap alone can overrun a guest slice.
+        if ((S32)cpu->blockInstructionCount >= contextTimeRemaining ||
                 !wasmJitCanChainTo(cpu, op)) {
             break;
         }
+        // Counted before the call, as run() counts the first block, so the
+        // block's own chain checks see the full total.
+        cpu->blockInstructionCount += op->blockOpCount;
     }
 #if !defined(BOXEDWINE_MULTI_THREADED)
-    cpu->blockInstructionCount += chainedInstructionCount;
     if (vnboxStats.on) {
         vnboxStats.jitEntries++;
         vnboxStats.jitInstr += cpu->blockInstructionCount - statsStart - (U32)(vnboxStats.sysPadInstr - statsPadStart);
@@ -6769,6 +6766,13 @@ JitWasmCodeGen::JitWasmCodeGen(CPU* cpu) : JitSSE(cpu) {
 
     // Import linear memory.
     m_emitter.addMemoryImport("env", "memory");
+#ifndef BOXEDWINE_MULTI_THREADED
+    // Relocatable (persistence) modules keep their shape for the offline cache pipeline.
+    m_chainBlocks = !wasmJitPersistenceActive();
+    if (m_chainBlocks) {
+        m_emitter.addTableImport("env", "table");
+    }
+#endif
 
     // Most helpers take CPU*. Pure math imports instead receive cached f64
     // operands directly and return f64, without any architectural writeback.
@@ -13089,7 +13093,7 @@ void JitWasmCodeGen::JumpIfCondition(JitConditional cond, U32 address) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        emitFunctionReturn();
+        emitChainReturn();
         m_emitter.emitEnd();
         m_emitter.emitEnd();
         freeScratch(targetLocal);
@@ -13103,7 +13107,7 @@ void JitWasmCodeGen::JumpIfCondition(JitConditional cond, U32 address) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitI32Const((S32)(uintptr_t)targetOp);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        emitFunctionReturn();
+        emitChainReturn();
     } else {
         writeEip(address - cpu->seg[CS].address);
         blockExit();
@@ -13187,6 +13191,73 @@ void JitWasmCodeGen::emitFunctionReturn() {
     m_emitter.emitReturn();
 }
 
+void JitWasmCodeGen::emitChainReturn() {
+    materializeFpuCache();
+    syncDirtyRegsToHost();
+    emitChainToNextOp();
+    m_emitter.emitReturn();
+}
+
+// Tiny blocks (string loops, block stops) spent more time returning to
+// wasmStartJITOp and being called again than running. Make the same checks
+// the dispatcher loop makes and tail-call the next block from here; any
+// other case returns to the dispatcher. The budget check also bounds a chain
+// that never returns, and nextOp stays set for the dispatcher either way.
+void JitWasmCodeGen::emitChainToNextOp() {
+#ifndef BOXEDWINE_MULTI_THREADED
+    if (!m_chainBlocks) {
+        return;
+    }
+    auto nextOp = [this](U32 field, bool half = false) {
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
+        if (half) m_emitter.emitI32Load16U(field); else m_emitter.emitI32Load(field);
+    };
+    // nextOp && nextOp->pfn == startJITOp && !yield && blockInstructionCount < contextTimeRemaining
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
+    m_emitter.emitOp(WASM_I32_EQZ);
+    m_emitter.emitOp(WASM_I32_EQZ);
+    nextOp((U32)offsetof(DecodedOp, pfn));
+    m_emitter.emitI32Const((S32)(uintptr_t)(OpCallback)wasmStartJITOp);
+    m_emitter.emitOp(WASM_I32_EQ);
+    m_emitter.emitOp(WASM_I32_AND);
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load8U((U32)offsetof(CPU, yield));
+    m_emitter.emitOp(WASM_I32_EQZ);
+    m_emitter.emitOp(WASM_I32_AND);
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load((U32)offsetof(CPU, blockInstructionCount));
+    m_emitter.emitI32Const((S32)(uintptr_t)&contextTimeRemaining);
+    m_emitter.emitI32Load(0);
+    m_emitter.emitOp(WASM_I32_LT_S);
+    m_emitter.emitOp(WASM_I32_AND);
+    m_emitter.setNextBranchHint(WasmBranchHint::Likely);
+    m_emitter.emitIf();
+    nextOp((U32)offsetof(DecodedOp, pfnJitCode));
+    m_emitter.emitIf();
+    // What wasmStartJITOp's loop and boxedwine_wasm_call_block do per block.
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load((U32)offsetof(CPU, blockInstructionCount));
+    nextOp((U32)offsetof(DecodedOp, blockOpCount), true);
+    m_emitter.emitOp(WASM_I32_ADD);
+    m_emitter.emitI32Store((U32)offsetof(CPU, blockInstructionCount));
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Const(0);
+    m_emitter.emitI32Store((U32)offsetof(CPU, wasmJitActiveBlock));
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Const(WASM_JIT_BAILOUT_NONE);
+    m_emitter.emitI32Store((U32)offsetof(CPU, wasmJitBailout));
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Const(0); // relocBase: only relocatable (persistence) blocks use one, and they guard 0
+    nextOp((U32)offsetof(DecodedOp, pfnJitCode));
+    m_emitter.emitReturnCallIndirect(m_typeVoidI32I32, 0);
+    m_emitter.emitEnd();
+    m_emitter.emitEnd();
+#endif
+}
+
 void JitWasmCodeGen::emitBlockExitWithProfile(U32 profileHelperIdx) {
     materializeFpuCache();
     syncDirtyRegsToHost();
@@ -13197,6 +13268,7 @@ void JitWasmCodeGen::emitBlockExitWithProfile(U32 profileHelperIdx) {
 #endif
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitCall(m_helperGetNextOpIdx);
+    emitChainToNextOp();
     m_emitter.emitReturn();
 }
 void JitWasmCodeGen::blockExit() {
@@ -13244,7 +13316,7 @@ void JitWasmCodeGen::blockNext1(U32 eip, DecodedOp* op) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        emitFunctionReturn();
+        emitChainReturn();
         m_emitter.emitEnd();
         m_emitter.emitEnd();
         m_emitter.emitEnd();
@@ -13270,7 +13342,7 @@ void JitWasmCodeGen::blockNext1(U32 eip, DecodedOp* op) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        emitFunctionReturn();
+        emitChainReturn();
         m_emitter.emitEnd();
 
         freeScratch(targetLocal);
@@ -13312,7 +13384,7 @@ void JitWasmCodeGen::blockNext2(U32 eip, DecodedOp* op) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        emitFunctionReturn();
+        emitChainReturn();
         m_emitter.emitEnd();
         m_emitter.emitEnd();
         m_emitter.emitEnd();
@@ -13331,7 +13403,7 @@ void JitWasmCodeGen::blockNext2(U32 eip, DecodedOp* op) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        emitFunctionReturn();
+        emitChainReturn();
         m_emitter.emitEnd();
         freeScratch(targetLocal);
     }
@@ -13424,7 +13496,7 @@ void JitWasmCodeGen::jumpEip(RegPtr reg) {
     m_emitter.emitI32Store((U32)offsetof(CPU, tmpReg));
     emitProfileSampledCall(HELPER_PROFILE_EXIT_GENERIC);
 #endif
-    emitFunctionReturn();
+    emitChainReturn();
     m_emitter.emitEnd();
     m_emitter.emitEnd();
     m_emitter.emitEnd();

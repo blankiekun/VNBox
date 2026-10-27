@@ -1120,6 +1120,9 @@ protected:
     void emitBailoutCheck();
     void emitBranchBailoutCheck();
     void emitFunctionReturn();
+    // Return after cpu->nextOp is set; with m_chainBlocks, first tail-call the next block when the dispatcher would.
+    void emitChainReturn();
+    void emitChainToNextOp();
     void emitBlockExitWithProfile(U32 profileHelperIdx);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     void emitProfileSampledCall(U32 helperIdx, U32 detail = InstructionCount);
@@ -1164,6 +1167,7 @@ protected:
     U32 m_typeI32Void   = 0;  // () -> i32
     U32 m_typeI32I32    = 0;  // (i32) -> i32
     U32 m_typeVoidI32I32= 0;  // (i32, i32) -> ()
+    bool m_chainBlocks = false; // block exits tail-call the next compiled block (imports wasmTable)
 
     // Imported function indices
     U32 m_helperReadMemIdx  = 0;
