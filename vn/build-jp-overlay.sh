@@ -4,7 +4,8 @@
 # the name to pick code page 932), plus the root fs's Wine prefix registry with unneeded
 # services turned off (see below), and Wine 11.0's wineboot and explorer with vn/wine/*.patch
 # (build-wine-boot.sh, needs Docker): they skip shell32/wininet/rpcss work a game doesn't use,
-# and wineboot imports jp-fonts.reg (below) once per version of the file.
+# and wineboot imports jp-fonts.reg (below) once per version of the file; and ntdll.so and
+# wineserver built with ntsync support (build-wine-ntsync.sh).
 # Usage: vn/build-jp-overlay.sh <TinyCore15Wine11.0-web.zip> <out/jp.zip>
 set -euo pipefail
 root_zip=$(realpath "$1")
@@ -63,6 +64,17 @@ mkdir -p "$work/opt/wine/share/wine/vnbox-patches"
 cp "$here"/wine/*.patch "$work/opt/wine/share/wine/vnbox-patches/"
 printf 'wineboot.exe.so and explorer.exe.so in opt/wine/lib/wine/i386-unix are Wine 11.0\n(LGPL-2.1, https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz) with these\npatches, built by vn/build-wine-boot.sh in https://github.com/blankiekun/VNBox.\n' \
   > "$work/opt/wine/share/wine/vnbox-patches/README"
+
+# ntsync: the root fs's ntdll.so and wineserver rebuilt with linux/ntsync.h, so event, mutex and
+# semaphore waits skip wineserver once the kernel has /dev/ntsync (falls back to the server without).
+"$here/build-wine-ntsync.sh" "$work/ntsync"
+mv "$work/ntsync/ntdll.so" "$work/opt/wine/lib/wine/i386-unix/"
+mkdir -p "$work/opt/wine/bin"
+mv "$work/ntsync/wineserver" "$work/opt/wine/bin/"
+mv "$work/ntsync/patches" "$work/opt/wine/share/wine/vnbox-patches/rootfs"
+rm -r "$work/ntsync"
+printf '\nntdll.so (i386-unix) and wineserver (bin) are Wine 11.0 with the root fs patches in rootfs/\n(tools/buildWine/wine_builds.json), configured with Linux 6.14'"'"'s include/uapi/linux/ntsync.h,\nbuilt by vn/build-wine-ntsync.sh in https://github.com/blankiekun/VNBox.\n' \
+  >> "$work/opt/wine/share/wine/vnbox-patches/README"
 
 # The root fs's prefix with the same changes, so a new prefix boots fast from the first launch.
 # Existing prefixes keep their own system.reg (it wins over the zips) and get the import.

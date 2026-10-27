@@ -64,7 +64,7 @@ jobs:
 
           - \`vnbox-web-$GITHUB_REF_NAME.tar.gz\`: boxedwine.{html,js,wasm,css}, boxedwine-shell.js, fsfs.js, lazyfs.js, lazyfs-worker.js, frida-compat.js, vnbox-zips.sha256. GPL-2.0, source is this tag.
           - \`TinyCore15Wine11.0-web.zip\`: unmodified mirror of the Boxedwine root file system ($ROOT_FS_URL). It holds Tiny Core Linux, Wine 11.0 and other GPL/LGPL software; build scripts in [tools/buildWine](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_REF_NAME/tools/buildWine), sources from the projects (https://www.winehq.org, http://tinycorelinux.net) and https://boxedwine.org.
-          - \`jp.zip\`: Japanese overlay, IPA fonts (IPA Font License v1.0, included in the zip) a ja_JP.utf8 locale name, a trimmed Wine prefix registry and Wine 11.0's wineboot/explorer with VNBox's boot patches (faster boot; LGPL-2.1, patches in the zip under opt/wine/share/wine/vnbox-patches and in [vn/wine](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_REF_NAME/vn/wine)), built by vn/build-jp-overlay.sh.
+          - \`jp.zip\`: Japanese overlay, IPA fonts (IPA Font License v1.0, included in the zip) a ja_JP.utf8 locale name, a trimmed Wine prefix registry and Wine 11.0's wineboot/explorer with VNBox's boot patches (faster boot; LGPL-2.1, patches in the zip under opt/wine/share/wine/vnbox-patches and in [vn/wine](https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_REF_NAME/vn/wine)), and the root fs's ntdll.so/wineserver rebuilt with ntsync support (vn/build-wine-ntsync.sh; root fs patches under vnbox-patches/rootfs), built by vn/build-jp-overlay.sh.
           - \`SHA256SUMS\`
           NOTES
           gh release create "$GITHUB_REF_NAME" dist/* --title "VNBox $GITHUB_REF_NAME" --notes-file notes.md
