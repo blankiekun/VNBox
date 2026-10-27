@@ -1,0 +1,29 @@
+diff --git a/programs/explorer/desktop.c b/programs/explorer/desktop.c
+index ce70c5d..58b561e 100644
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -1293,7 +1293,9 @@ void manage_desktop( WCHAR *arg )
+         initialize_systray( using_root, enable_shell, show_systray, no_tray_items );
+         if (!using_root && enable_launchers) initialize_launchers( hwnd );
+ 
+-        if ((shell32 = LoadLibraryW( L"shell32.dll" )) &&
++        /* VNBox: a desktop without the shell (games) needs no Program Manager DDE server nor the
++         * ShellWindows object (which also starts rpcss); both delay the first window ~1.4 s. */
++        if (enable_shell && (shell32 = LoadLibraryW( L"shell32.dll" )) &&
+             (pShellDDEInit = (void *)GetProcAddress( shell32, (LPCSTR)188)))
+         {
+             pShellDDEInit( TRUE );
+@@ -1316,8 +1318,11 @@ void manage_desktop( WCHAR *arg )
+         }
+     }
+ 
+-    desktopshellbrowserwindow_init();
+-    shellwindows_init();
++    if (enable_shell)
++    {
++        desktopshellbrowserwindow_init();
++        shellwindows_init();
++    }
+ 
+     /* Ideally we would set the window of an IShellView here, but we never
+        actually create one, so the desktop window itself will have to do. */

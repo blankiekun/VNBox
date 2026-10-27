@@ -8,9 +8,9 @@ What changed:
 - Lazy game folders: games are read on demand from OPFS or a directory handle, so they are never copied into memory; saves go to an IndexedDB overlay.
 - Root fs zips are streamed once into OPFS and read in blocks.
 - A Frida-compatible layer (`frida-compat.js`) runs text hook scripts and hands each dialogue line to the page.
-- A Japanese overlay, `jp.zip`: IPA fonts, a `ja_JP.utf8` locale name and a Wine prefix registry without the services a VN never needs, so Wine boots faster (`vn/`).
+- A Japanese overlay, `jp.zip`: IPA fonts, a `ja_JP.utf8` locale name and a Wine prefix registry without the services a VN never needs and patched Wine 11.0 wineboot/explorer (`vn/wine/*.patch`, LGPL-2.1), so Wine boots faster (`vn/`).
 
-Build (Emscripten 5.0.7): `make -C project/emscripten jitJspi`; output in `project/emscripten/Build/JitJspi`. `vn/build-jp-overlay.sh <root fs zip> jp.zip` builds the overlay.
+Build (Emscripten 5.0.7): `make -C project/emscripten jitJspi`; output in `project/emscripten/Build/JitJspi`. `vn/build-jp-overlay.sh <root fs zip> jp.zip` builds the overlay (needs Docker for `vn/build-wine-boot.sh`).
 
 Releases: pushing a `v*` tag runs `.github/workflows/vn-release.yml`, which publishes the web build, an unmodified mirror of the root fs `TinyCore15Wine11.0-web.zip` it was tested with (from boxedwine.org; build scripts in `tools/buildWine`), `jp.zip` and `SHA256SUMS`.
 
