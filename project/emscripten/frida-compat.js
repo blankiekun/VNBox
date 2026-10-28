@@ -427,14 +427,22 @@
     // Joins a hook's pieces into lines, per key: a piece of one character is appended, a longer one
     // starts a new line of the same text (a repeat of the previous longer piece, a redraw, is
     // dropped). The text goes out after 400 ms without a piece, after 3 s, or at 2000 characters.
+    // Games that redraw the previous text as it fades out start a line with its end: that part
+    // (3+ characters) is dropped, unless nothing would be left.
     function makeJoiner(send) {
-        const open = new Map();
+        const open = new Map(), sent = new Map();
         function flush(key) {
             const b = open.get(key);
             if (!b) return;
             open.delete(key);
             clearTimeout(b.timer);
-            if (b.text) send(key, b.text);
+            const prev = sent.get(key) || '';
+            let text = b.text;
+            for (let k = Math.min(prev.length, text.length - 1, 500); k >= 3; k--) {
+                if (prev.endsWith(text.slice(0, k))) { text = text.slice(k).replace(/^\n/, ''); break; }
+            }
+            sent.set(key, b.text);
+            if (text) send(key, text);
         }
         return function push(key, piece, whole) {
             if (!piece) return;

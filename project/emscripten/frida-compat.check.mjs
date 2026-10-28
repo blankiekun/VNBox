@@ -81,3 +81,11 @@ assert.deepEqual(lines.slice(1), ['日本^n']);
 assert.equal(F.unload(id), true);
 assert.equal(F.version, 1);
 console.log('frida-compat H-code ok');
+// a line that starts with a redraw of the previous one's end (最果てのイマ fades the old text out) loses that part
+const joined = [], join = F.test.makeJoiner((key, text) => joined.push(text));
+for (const burst of ['？？「―――」', '「―――」？？遠くから。', '遠くから。「……」', '「……」']) {
+    for (const c of burst) join('k', c);
+    await new Promise((r) => setTimeout(r, 450));
+}
+assert.deepEqual(joined, ['？？「―――」', '？？遠くから。', '「……」', '「……」']);
+console.log('frida-compat joiner ok');
