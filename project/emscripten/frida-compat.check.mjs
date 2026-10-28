@@ -81,6 +81,9 @@ assert.deepEqual(lines.slice(1), ['日本^n']);
 assert.equal(F.unload(id), true);
 assert.equal(F.version, 1);
 console.log('frida-compat H-code ok');
+// search thread ids: module + offset, the same across runs; the absolute address only outside any module
+assert.equal(F.test.searchThreadId('GetGlyphOutlineA', 'Farthest2015.exe', 0x9cb10, '0x49cb10'), 'GetGlyphOutlineA@Farthest2015.exe+0x9cb10');
+assert.equal(F.test.searchThreadId('TextOutA', undefined, 0x7f001234, '0x7f001234'), 'TextOutA@0x7f001234');
 // a line that starts with a redraw of the previous one's end (最果てのイマ fades the old text out) loses that part
 const joined = [], join = F.test.makeJoiner((key, text) => joined.push(text));
 for (const burst of ['？？「―――」', '「―――」？？遠くから。', '遠くから。「……」', '「……」']) {

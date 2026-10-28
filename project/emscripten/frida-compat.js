@@ -27,7 +27,7 @@
 //   unload(id) / unloadAll() (also stops the search), keep(threadId) → id: keeps a search thread.
 //   search.start() / stop() / running: hooks gdi32 GetGlyphOutlineA/W, TextOutA/W, ExtTextOutA/W
 //     and user32 DrawText(Ex)A/W; one thread per export and caller, characters joined by thread
-//     (400 ms gap), thread id "<export>@<caller address>".
+//     (400 ms gap), thread id "<export>@<module>+0x<offset>" (caller return address; absolute only outside any module).
 //   scriptFor(threadId) → a script with no require() reproducing that thread (for frida= blob:).
 // H-codes: /H{A,B,W,S,Q,V}[F][N][codepage#][padding+]data_offset[*deref][:split[*deref]]@addr[:module[:export]]
 //   A/B: DBCS char (A lead byte high, B low), W: UTF-16 char, S/Q/V: cp932 / UTF-16 / UTF-8 string.
@@ -695,16 +695,25 @@
     // ---- auto search (H4 step a): every text export, one thread per export and caller ----------
     const SEARCH = { id: '\0search', kind: 'search' };
     const searchThreads = new Map(); // thread id → thread (with api, module, offset)
+    const searchIds = new Map(); // api@absolute return address → thread id, so a hit looks up its module once
+    // Thread id: module + offset (the same across runs and relocation); the absolute address only outside any module.
+    function searchThreadId(api, moduleName, offset, ret) {
+        return api + '@' + (moduleName ? moduleName + '+0x' + offset.toString(16) : ret);
+    }
     let searching = false;
     function runSearch() {
         const g = Object.assign({}, SEARCH.globalsBase, makeInterceptor(SEARCH));
+        searchIds.clear(); // a restarted game may load modules elsewhere
         const join = makeJoiner((id, text) => { if (searching && !handles.has(id)) emit(text, searchThreads.get(id)); });
         const n = hookTextApis(g, null, (api, ret, text) => {
-            const id = api + '@' + ret.toString();
-            if (!searchThreads.has(id)) {
+            const key = api + '@' + ret.toString();
+            let id = searchIds.get(key);
+            if (!id) {
                 const m = Process.findModuleByAddress(ret);
                 const offset = m ? ret.sub(m.base).toUInt32() : ret.toUInt32();
-                searchThreads.set(id, {
+                id = searchThreadId(api, m && m.name, offset, ret.toString());
+                searchIds.set(key, id);
+                if (!searchThreads.has(id)) searchThreads.set(id, {
                     handle: SEARCH.id, id, kind: 'search', address: ret.toString(), module: m ? m.name : undefined, api, offset,
                     label: api + ' ← ' + (m ? m.name + '+0x' + offset.toString(16) : ret.toString()),
                 });
@@ -771,7 +780,7 @@
         version: 1, NativePointer, ptr, NULL: ptr(0), Memory, Process, Module, hexdump,
         load, loadHcode, unload, unloadAll, search, keep, scriptFor,
     });
-    F.test = { parsePattern, readTerminated, toU32, scriptAllowed, parseHcode, makeJoiner, makeTrans, hookHcode };
+    F.test = { searchThreadId, parsePattern, readTerminated, toU32, scriptAllowed, parseHcode, makeJoiner, makeTrans, hookHcode };
 
     // ---- the boot script (frida= URL) ------------------------------------------------------------
     // require() shim: the script's relative requires are fetched up front, then evaluated
