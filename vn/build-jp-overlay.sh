@@ -7,7 +7,8 @@
 # and wineboot imports jp-fonts.reg (below) once per version of the file, and quartz hands
 # MPEG-1 movies to the browser page (/dev/vnbox-movie, vnbox-movie.js), and dsound mixes 16-bit
 # and float sound without a function call per sample; and ntdll.so and
-# wineserver built with ntsync support (build-wine-ntsync.sh).
+# wineserver built with ntsync support (build-wine-ntsync.sh); and the WebGL wined3d.dll with
+# vn/webgl/*.patch (build-webgl-wined3d.sh).
 # Usage: vn/build-jp-overlay.sh <TinyCore15Wine11.0-web.zip> <out/jp.zip>
 set -euo pipefail
 root_zip=$(realpath "$1")
@@ -77,6 +78,13 @@ mv "$work/ntsync/wineserver" "$work/opt/wine/bin/"
 mv "$work/ntsync/patches" "$work/opt/wine/share/wine/vnbox-patches/rootfs"
 rm -r "$work/ntsync"
 printf '\nntdll.so (i386-unix) and wineserver (bin) are Wine 11.0 with the root fs patches in rootfs/\n(tools/buildWine/wine_builds.json), configured with Linux 6.14'"'"'s include/uapi/linux/ntsync.h,\nbuilt by vn/build-wine-ntsync.sh in https://github.com/blankiekun/VNBox.\n' \
+  >> "$work/opt/wine/share/wine/vnbox-patches/README"
+
+# WebGL WineD3D: Direct3D 10/11 draws with no vertex shader bound no longer crash (Muramasa EN).
+"$here/build-webgl-wined3d.sh" "$work/home/username/.wine/drive_c/webgl"
+mkdir -p "$work/opt/wine/share/wine/vnbox-patches/webgl"
+cp "$here"/webgl/*.patch "$work/opt/wine/share/wine/vnbox-patches/webgl/"
+printf '\nhome/username/.wine/drive_c/webgl/wined3d.dll is Wine 11.0 with the WebGL series v47\n(tools/wineTests/webgl-test-divergences-v47.json) and the patches in webgl/, built by\nvn/build-webgl-wined3d.sh in https://github.com/blankiekun/VNBox.\n' \
   >> "$work/opt/wine/share/wine/vnbox-patches/README"
 
 # The root fs's prefix with the same changes, so a new prefix boots fast from the first launch.

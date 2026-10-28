@@ -1,0 +1,17 @@
+diff --git a/dlls/wined3d/glsl_shader.c b/dlls/wined3d/glsl_shader.c
+index 084219f..ce290e4 100644
+--- a/dlls/wined3d/glsl_shader.c
++++ b/dlls/wined3d/glsl_shader.c
+@@ -10884,10 +10884,10 @@ static void set_glsl_shader_program(const struct wined3d_context_gl *context_gl,
+         vs_id = ctx_data->glsl_program->vs.id;
+         vs_list = &ctx_data->glsl_program->vs.shader_entry;
+ 
+-        if (use_vs(state) || d3d_info->ffp_hlsl)
++        if (use_vs(state) || (d3d_info->ffp_hlsl && state->shader[WINED3D_SHADER_TYPE_VERTEX]))
+             vshader = state->shader[WINED3D_SHADER_TYPE_VERTEX];
+     }
+-    else if (use_vs(state) || d3d_info->ffp_hlsl)
++    else if (use_vs(state) || (d3d_info->ffp_hlsl && state->shader[WINED3D_SHADER_TYPE_VERTEX]))
+     {
+         struct vs_compile_args vs_compile_args;
+ 
