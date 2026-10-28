@@ -447,8 +447,10 @@ void mainloop() {
         }
     };
     static bool exited = false;
-    if (!exited && KSystem::getProcessCount() == 0) {
-        // every guest process is gone (an installer finished): tell a page embedding the player
+    // Running, not just listed: processes nobody waits on (the first one, Wine's services after
+    // wineserver quits) stay listed as zombies, so the list never empties.
+    if (!exited && KSystem::getRunningProcessCount() == 0) {
+        // every guest process has exited (an installer finished): tell a page embedding the player
         exited = true;
         klog("all processes have exited");
         EM_ASM({ try { if (parent !== window) parent.postMessage({ type: "vnbox-exit" }, location.origin); } catch (e) { } });
