@@ -1283,7 +1283,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testReadOnlyCreatePreservesZipFile, "Test read-only create preserves ZIP file contents", TEST_ENTRY_SERIAL},
     {testZipRandomAccess, "Test ZIP random access and handle lifetime", TEST_ENTRY_SERIAL},
     {testZipEntryTimes, "Test ZIP entry times are UTC", TEST_ENTRY_SERIAL},
-    {testDiscImageLayouts, "Test disc image layouts and CUE sheets beside BINs", TEST_ENTRY_SERIAL},
+    {testDiscImageLayouts, "Test disc image layouts, CUE sheets beside BINs and MDS files", TEST_ENTRY_SERIAL},
     {testIsoFilesAndDiscChanges, "Test ISO file types, seeks and disc changes", TEST_ENTRY_SERIAL},
     {testMalformedIsoDirectories, "Test malformed ISO directory rejection", TEST_ENTRY_SERIAL},
     {testStatxEmptyPathUsesOpenFile, "Test statx empty path uses open file identity", TEST_ENTRY_SERIAL},

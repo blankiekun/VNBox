@@ -726,7 +726,10 @@
         }
         // cdrom=e:game.iso mounts game.iso as drive e:, cdrom=game.iso uses DEFAULT_CDROM_DRIVE.
         // cdrom=e:disc1.iso;disc2.iso lists the discs of a multi-disc game, which are
-        // swapped in the one drive.
+        // swapped in the one drive. opfs:dir/game.mds reads the image from that folder of the
+        // origin private file system on demand (lazyfs.js; jspi builds), with the CUE's BINs or
+        // the MDS's MDF beside it, never whole in memory. A page embedding the player swaps discs
+        // with insertCDRomDisc(index) and ejectCDRomDisc() on the frame's window.
         function getCDRom(param) {
             var value =  getParameter(param);
             var drive = "";
@@ -981,8 +984,16 @@
                 return null;
             });
         }
+        // the path Boxedwine opens a disc at
+        function cdromFsPath(file) {
+            return file.startsWith("opfs:") ? LAZY_DISC_MOUNT + "/" + file.substring(5) : file;
+        }
         function loadCDRomDisc(index) {
             let disc = Config.cdromISOFiles[index];
+            if (disc.startsWith("opfs:")) {
+                cdromDiscFiles[index] = []; // read on demand, nothing to free
+                return mountLazyDisc(disc.substring(5, disc.lastIndexOf("/")));
+            }
             let sheet = /\.cue$/i.test(disc) ? fetchCDRomFile(disc).then(function() { return disc; }) : fetchCueSheetBesideBin(disc);
             return sheet.then(function(cue) {
                 if (!cue) {
@@ -1025,7 +1036,7 @@
                 Config.cdromISOFiles.forEach(function(file, index) {
                     let option = document.createElement("option");
                     option.value = "" + index;
-                    option.textContent = "Disc " + (index + 1) + ": " + file;
+                    option.textContent = "Disc " + (index + 1) + ": " + file.split("/").pop();
                     select.appendChild(option);
                 });
                 select.style.display = "";
@@ -1991,7 +2002,7 @@
             params.push(Config.rootZipFile);
             for (let i = 0; i < Config.cdromISOFiles.length; i++) {
 				params.push("-cdrom");
-				params.push(Config.cdromISOFiles[i]);
+				params.push(cdromFsPath(Config.cdromISOFiles[i]));
 				params.push(Config.cdromDrive);
 			}
             
