@@ -1069,6 +1069,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testMmxPmaxsw_0x3ee, "Test MMX Pmaxsw 3ee"},
     {testMmxPsadbw_0x3f6, "Test MMX Psadbw 3f6"},
     {testMmxMaskmovq_0x3f7, "Test MMX Maskmovq 3f7"},
+    {testMmxRegisterCacheSequences, "Test MMX register sequences in one block"},
     {testSelfModifying, "Test Self Modifying Code"},
     {testSelfModifyingMovsb, "Test Self Modifying Code using movsb"},
     {testSelfModifyingFront, "Test Self Modifying Code Same Block(Previous)"},

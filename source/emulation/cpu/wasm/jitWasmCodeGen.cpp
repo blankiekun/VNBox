@@ -6821,6 +6821,7 @@ JitWasmCodeGen::JitWasmCodeGen(CPU* cpu) : JitSSE(cpu) {
         { WASM_XMM_LOCAL_COUNT, WasmType::V128 }, // cached XMM registers (locals 68-75)
         { 8, WasmType::F64 },  // persistent x87 values (locals 76-83)
         { 19, WasmType::I32 }, // x87 metadata (84-100), flag result (101), loop carry (102)
+        { 8, WasmType::V128 }, // cached MMX registers (103-110)
     });
 
     m_gpLoaded.fill(false);
@@ -8992,11 +8993,24 @@ MMXRegPtr JitWasmCodeGen::loadMMXFromReg(RegPtr reg) {
     return tmp;
 }
 
+// MMX registers are cached write-through: stores update both the CPU and a local, so nothing ever needs a flush.
+// A load reuses the local while WasmEmitter::mmxCached says no call, x87 op or join may have changed the CPU copy.
+// Callers get a scratch copy, as ops may write dst before reading src (mm1, mm1).
 MMXRegPtr JitWasmCodeGen::loadCpuMMXReg(U8 index) {
     MMXRegPtr tmp = getTmpMMX();
+    if (index < 8 && (m_emitter.mmxCached & (1 << index))) {
+        m_emitter.emitLocalGet(WASM_MMX_LOCAL_BASE + index);
+        m_emitter.emitLocalSet(tmp->hardwareReg());
+        return tmp;
+    }
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI64Load((U32)(index * cpu->fpu.sizeofRegInRegsArray() + offsetof(CPU, fpu.regs[0].signif)));
     emitI64ToMmxLocal(tmp->hardwareReg());
+    if (index < 8) {
+        m_emitter.emitLocalGet(tmp->hardwareReg());
+        m_emitter.emitLocalSet(WASM_MMX_LOCAL_BASE + index);
+        m_emitter.mmxCached |= (U8)(1 << index);
+    }
     return tmp;
 }
 
@@ -9030,6 +9044,15 @@ MMXRegPtr JitWasmCodeGen::loadMMXFromMem64(U8 index, MemPtr address) {
 void JitWasmCodeGen::storeCpuMMXReg(MMXRegPtr reg, U32 index) {
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     emitMmxLocalToI64(reg->hardwareReg());
+    if (index < 8) {
+        // Ops can leave junk in the high lane; the cached copy keeps it zero like a fresh load.
+        m_emitter.emitLocalTee(WASM_I64_SCRATCH);
+        m_emitter.emitI64Store((U32)(index * cpu->fpu.sizeofRegInRegsArray() + offsetof(CPU, fpu.regs[0].signif)));
+        m_emitter.emitLocalGet(WASM_I64_SCRATCH);
+        emitI64ToMmxLocal(WASM_MMX_LOCAL_BASE + index);
+        m_emitter.mmxCached |= (U8)(1 << index);
+        return;
+    }
     m_emitter.emitI64Store((U32)(index * cpu->fpu.sizeofRegInRegsArray() + offsetof(CPU, fpu.regs[0].signif)));
 }
 
@@ -10434,7 +10457,7 @@ void JitWasmCodeGen::readMMU(RegPtr dest, RegPtr index, U32 offset) {
     storeMemHelperField((U32)offsetof(CPU, memHelperAddr), index);
     syncStateBeforeFaultingMemoryHelper();
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitCall(HELPER_READ_MEM32);
+    m_emitter.emitCall(HELPER_READ_MEM32, true);
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Load((U32)offsetof(CPU, memHelperValue));
     m_emitter.emitLocalSet(r->hardwareReg());
@@ -10787,7 +10810,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
         storeMemHelperField((U32)offsetof(CPU, memHelperAddr), addressReg);
         syncStateBeforeFaultingMemoryHelper();
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-        m_emitter.emitCall(readWriteHelperForWidth(w));
+        m_emitter.emitCall(readWriteHelperForWidth(w), true);
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitI32Load((U32)offsetof(CPU, memHelperValue));
         m_emitter.emitLocalSet(result->hardwareReg());
@@ -10833,7 +10856,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
             syncStateBeforeFaultingMemoryHelper();
             m_emitter.emitLocalGet(WASM_CPU_LOCAL);
             emitArmSmcBailout();
-            m_emitter.emitCall(writeCheckHelperForWidth(w));
+            m_emitter.emitCall(writeCheckHelperForWidth(w), true);
             emitBailoutCheck();
         }
         m_emitter.emitElse();
@@ -11096,7 +11119,7 @@ RegPtr JitWasmCodeGen::readMemoryValue(JitWidth w, RegPtr addressReg, RegPtr tmp
         storeMemHelperField((U32)offsetof(CPU, memHelperAddr), addressReg);
         syncStateBeforeFaultingMemoryHelper();
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-        m_emitter.emitCall(readHelperForWidth(w));
+        m_emitter.emitCall(readHelperForWidth(w), true);
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitI32Load((U32)offsetof(CPU, memHelperValue));
         if (signExtend) {
@@ -11213,7 +11236,7 @@ void JitWasmCodeGen::write(JitWidth w, RegPtr addressReg, RegPtr src,
         syncStateBeforeFaultingMemoryHelper();
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         emitArmSmcBailout();
-        m_emitter.emitCall(writeCheckHelperForWidth(w));
+        m_emitter.emitCall(writeCheckHelperForWidth(w), true);
         emitBailoutCheck();
     }
     m_emitter.emitElse();
@@ -12309,7 +12332,7 @@ void JitWasmCodeGen::fillFlags(U32 flags) {
     // Materialize lazy flags: call common_fillFlags(cpu).
     syncDirtyRegsToHost();
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitCall(HELPER_FILL_FLAGS);
+    m_emitter.emitCall(HELPER_FILL_FLAGS, true);
     m_gpLoaded.fill(false);
     m_xmmLoaded.fill(false);
     currentLazyFlags = FLAGS_NONE;
@@ -12319,7 +12342,7 @@ RegPtr JitWasmCodeGen::getZF() {
     // wasmHelper_computeZF(cpu) which stores ZF in cpu->tmpReg.
     syncDirtyRegsToHost();
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitCall(HELPER_COMPUTE_ZF);
+    m_emitter.emitCall(HELPER_COMPUTE_ZF, true);
     auto r = getTmpReg();
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Load((U32)offsetof(CPU, tmpReg));
@@ -12344,7 +12367,7 @@ RegPtr JitWasmCodeGen::getCF() {
         // The helper only reads lazy-flag fields and writes cpu->tmpReg; GP
         // locals do not need to be flushed or invalidated around this call.
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-        m_emitter.emitCall(HELPER_COMPUTE_CF);
+        m_emitter.emitCall(HELPER_COMPUTE_CF, true);
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitI32Load((U32)offsetof(CPU, tmpReg));
         m_emitter.emitLocalSet(r->hardwareReg());
@@ -12879,7 +12902,7 @@ RegPtr JitWasmCodeGen::getCondition(JitConditional cond, RegPtr res) {
     // The per-condition helper has signature (CPU*)->void and writes tmpReg.
     // Other incoming lazy states still need their original flag formula.
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitCall(HELPER_COND_BASE + (U32)cond);
+    m_emitter.emitCall(HELPER_COND_BASE + (U32)cond, true);
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Load((U32)offsetof(CPU, tmpReg));
     m_emitter.emitLocalSet(tmp->hardwareReg());
@@ -14469,6 +14492,7 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
     if (!canKeepFpuCache(op)) {
         flushFpuCache();
     }
+    if (op->isFpuOp()) m_emitter.mmxCached = 0; // x87 code writes fpu.regs directly
 
     if (!skippedOp && !m_directLoopOpen) {
         for (auto& loop : m_directLoops) {

@@ -236,7 +236,9 @@ static constexpr U32 WASM_FPU_VALID_BASE = WASM_FPU_TOP_LOCAL + 1;
 // Adjacent flag consumers may reuse this value across scratch-pool resets.
 static constexpr U32 WASM_FLAG_RESULT_LOCAL = WASM_FPU_VALID_BASE + 8;
 static constexpr U32 WASM_LOOP_CARRY_LOCAL = WASM_FLAG_RESULT_LOCAL + 1;
-static constexpr U32 WASM_LOCAL_COUNT = WASM_LOOP_CARRY_LOCAL + 1;
+// v128 copies of mm0-mm7 (low 64 bits, high lane zero), valid per WasmEmitter::mmxCached.
+static constexpr U32 WASM_MMX_LOCAL_BASE = WASM_LOOP_CARRY_LOCAL + 1;
+static constexpr U32 WASM_LOCAL_COUNT = WASM_MMX_LOCAL_BASE + 8;
 
 // ---------------------------------------------------------------------------
 // Mapping from emulated register index to WASM local index.
