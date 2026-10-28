@@ -7584,6 +7584,47 @@ void testDiscImageLayouts() {
             testFail("%s was not read through %s", binName.c_str(), cueName.c_str());
         }
     }
+
+    // Alcohol 120%: an MDS (lead-in entry, a data and an audio track) and the MDF it names as "*.mdf"
+    std::vector<U8> mds(400, 0);
+    auto put16 = [&mds](size_t at, U32 v) { mds[at] = (U8)v; mds[at + 1] = (U8)(v >> 8); };
+    auto put32 = [&mds](size_t at, U32 v) { for (int i = 0; i < 4; i++) mds[at + i] = (U8)(v >> (8 * i)); };
+    memcpy(mds.data(), "MEDIA DESCRIPTOR", 16);
+    mds[16] = 1; mds[17] = 3;
+    put16(20, 1);   // one session
+    put32(80, 88);  // its block
+    mds[88 + 10] = 3; // blocks: 0xA0 then tracks 1 and 2
+    put32(88 + 20, 112);
+    mds[112 + 4] = 0xA0;
+    const U32 trackBlocks[2][5] = { { 0xAA, 1, 0, 0, 352 }, { 0xA9, 2, 20, 20 * 2352, 360 } }; // mode, point, start, offset, extra
+    for (U32 i = 0; i < 2; i++) {
+        size_t t = 192 + i * 80;
+        mds[t] = (U8)trackBlocks[i][0];
+        mds[t + 2] = i ? 0x10 : 0x14;
+        mds[t + 4] = (U8)trackBlocks[i][1];
+        put32(t + 12, trackBlocks[i][4]);
+        put16(t + 16, 2352);
+        put32(t + 36, trackBlocks[i][2]);
+        put32(t + 40, trackBlocks[i][3]);
+        put32(t + 48, 1);
+        put32(t + 52, 368);
+        put32(trackBlocks[i][4] + 4, i ? 10 : 20); // extra block: pregap, length
+    }
+    put32(368, 384); // footer: name offset, not wide
+    memcpy(mds.data() + 384, "*.mdf", 6);
+    writeTestFile(dir / "alcohol.mds", mds.data(), mds.size());
+    writeTestFile(dir / "alcohol.mdf", bin.data(), bin.size());
+    for (const char* name : { "alcohol.mds", "alcohol.mdf" }) {
+        std::shared_ptr<DiscImage> disc = DiscImage::open(BString::copy((dir / name).string().c_str()));
+        U8 descriptor[6] = {};
+        U8 sector3 = 0;
+        if (!disc || disc->tracks.size() != 2 || disc->tracks[0].audio || !disc->tracks[1].audio || disc->tracks[1].start != 20 || disc->leadOut != 30) {
+            testFail("%s did not open as a data and an audio track", name);
+        } else if (disc->readData(16 * 2048, descriptor, 6) != 6 || memcmp(descriptor, "\001CD001", 6)
+                || disc->readData(3 * 2048, &sector3, 1) != 1 || sector3 != 3) {
+            testFail("%s does not read the MDF's user data", name);
+        }
+    }
     std::filesystem::remove_all(dir, error);
 }
 

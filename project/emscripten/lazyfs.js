@@ -295,6 +295,21 @@ function lazyMountOverlay(mountPoint) {
     return new Promise((resolve, reject) => IDBFS.syncfs(mount, true, err => err ? reject(err) : resolve()));
 }
 
+// A disc image's folder ("vnbox/discs/<id>": the image and its CUE/BINs or MDS/MDF) as lazy nodes
+// under LAZY_DISC_MOUNT, read-only and kept out of IndexedDB. Each folder is mounted once.
+var LAZY_DISC_MOUNT = "/lazydisc";
+var lazyDiscs = {};
+function mountLazyDisc(folder) {
+    var parts = folder.split("/").filter(Boolean), key = parts.join("/"), name = parts.pop();
+    if (!lazyDiscs[key]) {
+        lazyStats.mode = typeof boxedwineJspiReads !== "undefined" ? "jspi" : "sab";
+        var mountPoint = [LAZY_DISC_MOUNT].concat(parts).join("/");
+        FS.mkdirTree(mountPoint);
+        lazyDiscs[key] = (lazyStats.mode === "jspi" ? mountLazyAppJspi : mountLazyAppSab)(mountPoint, name, lazyOpfsDir(key));
+    }
+    return lazyDiscs[key];
+}
+
 var LAZY_APP_MOUNT_ROOT = "/lazyapp/";
 function mountLazyApp(mountPoint, name, dirHandle) {
     lazyStats.mode = typeof boxedwineJspiReads !== "undefined" ? "jspi" : "sab";

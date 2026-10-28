@@ -446,6 +446,13 @@ void mainloop() {
             break;
         }
     };
+    static bool exited = false;
+    if (!exited && KSystem::getProcessCount() == 0) {
+        // every guest process is gone (an installer finished): tell a page embedding the player
+        exited = true;
+        klog("all processes have exited");
+        EM_ASM({ try { if (parent !== window) parent.postMessage({ type: "vnbox-exit" }, location.origin); } catch (e) { } });
+    }
     updateMainLoopTiming(idle);
     if (vnboxStats.on) {
         if (idle) vnboxStats.ticksIdle++; else vnboxStats.ticksBusy++;

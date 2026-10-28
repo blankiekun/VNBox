@@ -45,8 +45,9 @@ class DiscImage {
 public:
     ~DiscImage();
 
-    // .cue files are read as CUE sheets. A .bin with a CUE sheet of the same name beside
-    // it is read through that sheet. Anything else is one data track: an ISO image, or a
+    // .cue files are read as CUE sheets, .mds files as Alcohol 120% descriptors of the .mdf
+    // beside them. A .bin with a CUE sheet (or an .mdf with an .mds) of the same name beside
+    // it is read through that. Anything else is one data track: an ISO image, or a
     // raw image of 2352 or 2336 byte sectors, as a BIN without its CUE sheet is.
     static std::shared_ptr<DiscImage> open(const BString& path);
 
@@ -83,6 +84,7 @@ private:
 
     bool openDataTrack(const BString& path);
     bool openCue(const BString& path);
+    bool openMds(const BString& path);
     const Extent* findExtent(U64 sector) const;
     U32 readFile(S32 file, U64 offset, U8* buffer, U32 len);
 };

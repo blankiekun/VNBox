@@ -32,14 +32,14 @@ DiscImage::~DiscImage() {
     }
 }
 
-// A BIN's CUE sheet usually has the same name. It says where any audio tracks are,
-// which the BIN itself does not.
-static BString cueBeside(const BString& path) {
-    if (!path.endsWith(".bin", true)) {
+// A BIN's CUE sheet (an MDF's MDS) usually has the same name. It says where any audio
+// tracks are, which the BIN itself does not.
+static BString sheetBeside(const BString& path, const char* image, const char* lower, const char* upper) {
+    if (!path.endsWith(image, true)) {
         return BString::empty;
     }
     BString base = path.substr(0, path.length() - 4);
-    for (const char* extension : { ".cue", ".CUE" }) {
+    for (const char* extension : { lower, upper }) {
         BString cue = base + extension;
         FILE* file = Platform::fopen(cue.c_str(), "rb");
         if (file) {
@@ -52,9 +52,15 @@ static BString cueBeside(const BString& path) {
 
 std::shared_ptr<DiscImage> DiscImage::open(const BString& path) {
     std::shared_ptr<DiscImage> image = std::make_shared<DiscImage>();
-    BString cue = path.endsWith(".cue", true) ? path : cueBeside(path);
+    BString mds = path.endsWith(".mds", true) ? path : sheetBeside(path, ".mdf", ".mds", ".MDS");
+    BString cue = path.endsWith(".cue", true) ? path : sheetBeside(path, ".bin", ".cue", ".CUE");
     bool opened;
-    if (cue.length()) {
+    if (mds.length()) {
+        if (mds != path) {
+            klog_fmt("DiscImage: reading %s through %s", path.c_str(), mds.c_str());
+        }
+        opened = image->openMds(mds);
+    } else if (cue.length()) {
         if (cue != path) {
             klog_fmt("DiscImage: reading %s through %s", path.c_str(), cue.c_str());
         }
@@ -481,6 +487,151 @@ bool DiscImage::openCue(const BString& path) {
     return true;
 }
 
+namespace {
+
+U16 readU16LE(const U8* p) {
+    return (U16)(p[0] | (p[1] << 8));
+}
+
+U64 readU64LE(const U8* p) {
+    return (U64)readU32LE(p) | ((U64)readU32LE(p + 4) << 32);
+}
+
+}
+
+// Alcohol 120% MDS v1 (as libmirage reads it): a header, session blocks, then per session
+// 80 byte track blocks (points 1-99 are tracks, 0xA0 and up lead-in entries), each with an
+// 8 byte extra block (pregap, length in sectors; for DVDs extra_offset is the length) and a
+// footer naming the MDF ("*.mdf" = the MDS's own name). The MDF holds the tracks' sectors
+// back to back from each track's start offset; pregaps are not stored.
+bool DiscImage::openMds(const BString& path) {
+    FILE* mds = Platform::fopen(path.c_str(), "rb");
+    if (!mds) {
+        klog_fmt("DiscImage: could not open %s", path.c_str());
+        return false;
+    }
+    std::vector<U8> d;
+    U8 buffer[4096];
+    size_t len;
+    while ((len = fread(buffer, 1, sizeof(buffer), mds)) > 0 && d.size() < (1 << 20)) {
+        d.insert(d.end(), buffer, buffer + len);
+    }
+    fclose(mds);
+    auto fits = [&d](U64 offset, U64 size) { return offset + size <= d.size(); };
+    if (!fits(0, 88) || memcmp(d.data(), "MEDIA DESCRIPTOR", 16)) {
+        klog_fmt("DiscImage: %s is not an MDS file", path.c_str());
+        return false;
+    }
+    if (d[16] != 1) {
+        klog_fmt("DiscImage: %s is MDS version %d.%d, only version 1 is supported", path.c_str(), d[16], d[17]);
+        return false;
+    }
+    bool dvd = readU16LE(&d[18]) >= 0x10;
+    U32 sessions = readU16LE(&d[20]);
+    U32 sessionOffset = readU32LE(&d[80]);
+    BString mdf;
+    for (U32 s = 0; s < sessions; s++) {
+        U64 so = sessionOffset + (U64)s * 24;
+        if (!fits(so, 24)) {
+            klog_fmt("DiscImage: %s is cut off", path.c_str());
+            return false;
+        }
+        U32 blocks = d[so + 10];
+        U32 trackOffset = readU32LE(&d[so + 20]);
+        for (U32 b = 0; b < blocks; b++) {
+            U64 to = trackOffset + (U64)b * 80;
+            if (!fits(to, 80)) {
+                klog_fmt("DiscImage: %s is cut off", path.c_str());
+                return false;
+            }
+            const U8* t = &d[to];
+            U32 point = t[4];
+            if (point < 1 || point > 99) {
+                continue;
+            }
+            U32 mode = t[0] & 0x0F;
+            U32 sectorSize = readU16LE(t + 16);
+            U32 extraOffset = readU32LE(t + 12);
+            U32 start = readU32LE(t + 36);
+            U64 fileOffset = readU64LE(t + 40);
+            U32 footerOffset = readU32LE(t + 52);
+            U32 length = 0;
+            if (dvd) {
+                length = extraOffset;
+            } else if (extraOffset && fits(extraOffset, 8)) {
+                length = readU32LE(&d[extraOffset + 4]);
+            }
+            if (files.empty()) {
+                if (!readU32LE(t + 48) || !footerOffset || !fits(footerOffset, 16)) {
+                    klog_fmt("DiscImage: %s names no image file", path.c_str());
+                    return false;
+                }
+                U32 nameOffset = readU32LE(&d[footerOffset]);
+                bool wide = readU32LE(&d[footerOffset + 4]) != 0;
+                std::string name;
+                for (U64 i = nameOffset; fits(i, wide ? 2 : 1); i += wide ? 2 : 1) {
+                    U32 c = wide ? readU16LE(&d[i]) : d[i];
+                    if (!c) {
+                        break;
+                    }
+                    name += c < 0x80 ? (char)c : '?'; // shortcut: non-ASCII MDF names are not found; rename the MDF to match the MDS
+                }
+                if (name.size() > 1 && name[0] == '*') { // "*.mdf": the MDS's own name
+                    mdf = path.substr(0, path.length() - 4) + BString::copy(name.c_str() + 1);
+                } else {
+                    std::string dir = path.c_str();
+                    size_t slash = dir.find_last_of("/\\");
+                    mdf = BString::copy(((slash == std::string::npos) ? "" : dir.substr(0, slash + 1)).c_str()) + BString::copy(name.c_str());
+                }
+                FILE* file = Platform::fopen(mdf.c_str(), "rb");
+                if (!file && mdf.endsWith(".mdf")) { // images copied from Windows may have either case
+                    mdf = mdf.substr(0, mdf.length() - 4) + B(".MDF");
+                    file = Platform::fopen(mdf.c_str(), "rb");
+                }
+                if (!file) {
+                    klog_fmt("DiscImage: could not open %s, which %s names", mdf.c_str(), path.c_str());
+                    return false;
+                }
+                files.push_back(file);
+            }
+            if (!length) { // to the end of the file
+                U64 size = getFileSize(files[0]);
+                length = size > fileOffset && sectorSize ? (U32)((size - fileOffset) / sectorSize) : 0;
+            }
+            DiscTrack track;
+            track.number = point;
+            track.control = t[2] & 0x0F;
+            track.start = start;
+            U32 dataOffset = 0;
+            if (mode == 9) { // audio
+                track.audio = true;
+                track.mode = 0;
+            } else {
+                track.control |= DISC_CONTROL_DATA;
+                track.mode = (mode >= 0xB) ? 2 : 1;
+                if (sectorSize >= DISC_RAW_SECTOR_SIZE) {
+                    dataOffset = track.mode == 2 ? 24 : 16; // after the sync pattern and header (and mode 2's subheader)
+                }
+            }
+            if (!sectorSize || (sectorSize != DISC_DATA_SECTOR_SIZE && sectorSize < DISC_RAW_SECTOR_SIZE)) {
+                klog_fmt("DiscImage: track %d in %s has %d byte sectors, which are not supported", point, path.c_str(), sectorSize);
+                return false;
+            }
+            // sectors over 2352 bytes carry 96 bytes of subchannel data after the main data
+            extents.push_back({ start, length, 0, fileOffset, sectorSize, dataOffset, track.audio, false });
+            tracks.push_back(track);
+            leadOut = std::max(leadOut, start + length);
+        }
+    }
+    std::sort(extents.begin(), extents.end(), [](const Extent& a, const Extent& b) { return a.start < b.start; });
+    if (tracks.empty()) {
+        klog_fmt("DiscImage: %s has no tracks", path.c_str());
+        return false;
+    }
+    klog_fmt("DiscImage: %s has %d track(s) and %d sectors", path.c_str(), (U32)tracks.size(), leadOut);
+    return true;
+}
+
 const DiscImage::Extent* DiscImage::findExtent(U64 sector) const {
     auto next = std::upper_bound(extents.begin(), extents.end(), sector, [](U64 s, const Extent& e) { return s < e.start; });
     if (next == extents.begin()) {
@@ -543,11 +694,11 @@ bool DiscImage::readRaw(U32 sector, U32 count, U8* buffer) {
     }
     for (U32 i = 0; i < count; i++, buffer += DISC_RAW_SECTOR_SIZE) {
         const Extent* extent = findExtent((U64)sector + i);
-        if (!extent || extent->file < 0 || extent->sectorSize != DISC_RAW_SECTOR_SIZE) {
+        if (!extent || extent->file < 0 || extent->sectorSize < DISC_RAW_SECTOR_SIZE) {
             memset(buffer, 0, DISC_RAW_SECTOR_SIZE);
             continue;
         }
-        U64 at = extent->fileOffset + ((U64)sector + i - extent->start) * DISC_RAW_SECTOR_SIZE;
+        U64 at = extent->fileOffset + ((U64)sector + i - extent->start) * extent->sectorSize;
         U32 read = readFile(extent->file, at, buffer, DISC_RAW_SECTOR_SIZE);
         memset(buffer + read, 0, DISC_RAW_SECTOR_SIZE - read);
         if (extent->bigEndian && extent->audio) {
