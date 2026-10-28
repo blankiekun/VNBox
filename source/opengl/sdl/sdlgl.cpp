@@ -1136,6 +1136,24 @@ void KOpenGLSdl::glSwapBuffers(KThread* thread, const std::shared_ptr<XDrawable>
         }
         if (thread && thread->cpu) {
             thread->cpu->yield = true;
+#ifndef BOXEDWINE_MULTI_THREADED
+            // fps= caps GL presents as XServer::draw caps software ones: the thread that swapped
+            // sleeps until its next deadline, like a vsync'd swap, instead of drawing frames the
+            // browser never shows (WebGL shows one frame per paint).
+            if (XServer::drawFps) {
+                static U64 nextSwapUs;
+                U64 now = KSystem::getMicroCounter();
+                U64 interval = 1000000 / XServer::drawFps;
+                if (now < nextSwapUs) {
+                    thread->sleep((U32)((nextSwapUs - now + 999) / 1000)); // -K_WAIT: unscheduled until the timer
+                    thread->condStartWaitTime = 0; // no syscall restarts this sleep
+                    nextSwapUs += interval;
+                } else {
+                    // a frame later than one interval starts over (no catch-up swaps)
+                    nextSwapUs = now - nextSwapUs < interval ? nextSwapUs + interval : now + interval;
+                }
+            }
+#endif
         }
 #endif
     }

@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <vector>
 #include "kdspaudio_math.h"
+#include <malloc.h>
+#include <unistd.h>
 
 #ifdef BOXEDWINE_MULTI_THREADED
 #include "knativethread.h"
@@ -317,6 +319,7 @@ static BString statsBusyThreads(const VnboxStats& s, double sec) {
 }
 
 // stats=1: how a tick waited (asked vs real), then every ~2 s one console line with the counters.
+extern int allocatedRamPages;
 static void statsTickStart() {
     double now = emscripten_get_now();
     if (statsLastTickEnd) {
@@ -346,7 +349,8 @@ static void statsTickStart() {
             " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f shown/s=%.1f skippedSame/s=%.1f busyDropped/s=%.1f"
             " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f | input/s=%.1f motion/s=%.0f"
             " | sys ms/s=%.0f user ms/s=%.0f | threads/s:%s | topSys: %s | jit instr=%.0f%% (interp %.0f%%) entries/s=%.0f blocksCompiled/s=%.0f"
-            " | wineserver ms/s=%.0f req/s=%.0f | wineReq %s | signals/s=%.1f faults/s=%.1f | audio underruns/s=%.1f queuedMin=%.0fms | zipMiss/s=%.1f zipMs/s=%.0f%s",
+            " | wineserver ms/s=%.0f req/s=%.0f | wineReq %s | signals/s=%.1f faults/s=%.1f | audio underruns/s=%.1f queuedMin=%.0fms | zipMiss/s=%.1f zipMs/s=%.0f"
+            " | mem guestRam=%uMB mallocUsed=%uMB heapTop=%uMB processes=%u%s",
             sec, statsLastMips, s.sliceMs / sec / 10.0, s.ticksBusy, s.ticksIdle,
             s.tickWaits, s.tickWaits ? s.tickLateMs / s.tickWaits : 0, s.tickLateMaxMs,
             s.msgWaits, s.msgWaits ? s.msgGapMs / s.msgWaits : 0, s.msgGapMaxMs,
@@ -357,7 +361,8 @@ static void statsTickStart() {
             s.sysMs / sec, (s.sliceMs - s.sysMs) / sec, statsBusyThreads(s, sec).c_str(), statsTopSyscalls(s).c_str(),
             guestInstr ? 100.0 * s.jitInstr / guestInstr : 0, guestInstr ? 100.0 - 100.0 * s.jitInstr / guestInstr : 0,
             s.jitEntries / sec, s.blocksCompiled / sec,
-            s.wineserverMs / sec, s.wineserverRequests / sec, statsWineRequests(s, sec).c_str(), s.signals / sec, s.faults / sec, s.audioUnderruns / sec, s.audioQueuedMinMs, s.zipMisses / sec, s.zipMs / sec, js);
+            s.wineserverMs / sec, s.wineserverRequests / sec, statsWineRequests(s, sec).c_str(), s.signals / sec, s.faults / sec, s.audioUnderruns / sec, s.audioQueuedMinMs, s.zipMisses / sec, s.zipMs / sec,
+            (U32)(allocatedRamPages / 256), (U32)(mallinfo().uordblks >> 20), (U32)((uintptr_t)sbrk(0) >> 20), KSystem::getProcessCount(), js);
         s = VnboxStats();
         s.on = true;
         statsLastLog = now;
