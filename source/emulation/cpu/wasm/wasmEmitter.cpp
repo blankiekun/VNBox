@@ -156,6 +156,8 @@ void WasmEmitter::beginFunction(const std::vector<std::pair<U32, WasmType>>& loc
     m_currentBody.clear();
     m_inFunction = true;
     m_ctrlDepth = 0;
+    mmxCached = 0;
+    m_mmxCtrl.clear();
     m_currentFunctionIndex = m_lastFunctionIndex;
     clearNextBranchHint();
     // Encode locals declaration
@@ -322,11 +324,13 @@ void WasmEmitter::emitV128Store(U32 offset, U32 align) {
     emitMemArg(m_currentBody, align, offset);
 }
 
-void WasmEmitter::emitCall(U32 funcIdx) {
+void WasmEmitter::emitCall(U32 funcIdx, bool keepsMmxCache) {
+    if (!keepsMmxCache) mmxCached = 0;
     m_currentBody.push_back(WASM_CALL);
     appendULEB128(m_currentBody, funcIdx);
 }
 void WasmEmitter::emitCallIndirect(U32 typeIdx, U32 tableIdx) {
+    mmxCached = 0;
     m_currentBody.push_back(WASM_CALL_INDIRECT);
     appendULEB128(m_currentBody, typeIdx);
     appendULEB128(m_currentBody, tableIdx);
@@ -415,20 +419,45 @@ void WasmEmitter::emitIf(WasmType blockType) {
     m_currentBody.push_back(WASM_IF);
     m_currentBody.push_back((U8)blockType);
     ++m_ctrlDepth;
+    m_mmxCtrl.push_back({ WASM_IF, mmxCached, 0xff, false });
 }
-void WasmEmitter::emitElse() { m_currentBody.push_back(WASM_ELSE); }
+void WasmEmitter::emitElse() {
+    m_currentBody.push_back(WASM_ELSE);
+    if (!m_mmxCtrl.empty()) {
+        MmxCtrl& c = m_mmxCtrl.back();
+        c.arms &= mmxCached;
+        c.hasElse = true;
+        mmxCached = c.entry;
+    }
+}
 void WasmEmitter::emitBlock(WasmType blockType) {
     m_currentBody.push_back(WASM_BLOCK);
     m_currentBody.push_back((U8)blockType);
     ++m_ctrlDepth;
+    m_mmxCtrl.push_back({ WASM_BLOCK, 0, 0xff, false });
 }
 void WasmEmitter::emitLoop(WasmType blockType) {
     m_currentBody.push_back(WASM_LOOP);
     m_currentBody.push_back((U8)blockType);
     ++m_ctrlDepth;
+    mmxCached = 0; // the backedge may arrive with any state
+    m_mmxCtrl.push_back({ WASM_LOOP, 0, 0xff, false });
+}
+void WasmEmitter::mmxBranchTo(U32 depth) {
+    // br to a loop goes to its header, which assumes nothing cached; deeper than the stack = function end.
+    if (depth < m_mmxCtrl.size()) {
+        MmxCtrl& c = m_mmxCtrl[m_mmxCtrl.size() - 1 - depth];
+        if (c.kind != WASM_LOOP) c.arms &= mmxCached;
+    }
 }
 void WasmEmitter::emitEnd() {
     m_currentBody.push_back(WASM_END);
+    if (!m_mmxCtrl.empty()) {
+        MmxCtrl c = m_mmxCtrl.back();
+        m_mmxCtrl.pop_back();
+        // An if without else also falls through from its entry state.
+        mmxCached &= c.arms & (c.kind == WASM_IF && !c.hasElse ? c.entry : 0xff);
+    }
     if (m_ctrlDepth > 0) {
         --m_ctrlDepth;
     }
@@ -436,10 +465,12 @@ void WasmEmitter::emitEnd() {
     // depth already 0; the underflow guard above covers that case.
 }
 void WasmEmitter::emitBr(U32 depth)  {
+    mmxBranchTo(depth);
     m_currentBody.push_back(WASM_BR);
     appendULEB128(m_currentBody, depth);
 }
 void WasmEmitter::emitBrIf(U32 depth) {
+    mmxBranchTo(depth);
     recordBranchHintIfNeeded();
     m_currentBody.push_back(WASM_BR_IF);
     appendULEB128(m_currentBody, depth);

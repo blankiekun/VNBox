@@ -30,5 +30,6 @@ void testMmxPminsw_0x3ea();
 void testMmxPmaxsw_0x3ee();
 void testMmxPsadbw_0x3f6();
 void testMmxMaskmovq_0x3f7();
+void testMmxRegisterCacheSequences();
 
 #endif

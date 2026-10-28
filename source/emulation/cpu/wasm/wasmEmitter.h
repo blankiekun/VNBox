@@ -441,7 +441,8 @@ public:
     void emitV128Const(const U8 bytes[16]);
     void emitV128Load(U32 offset, U32 align = 4);
     void emitV128Store(U32 offset, U32 align = 4);
-    void emitCall(U32 funcIdx);
+    // keepsMmxCache: the helper never writes cpu->fpu.regs (memory and flag helpers).
+    void emitCall(U32 funcIdx, bool keepsMmxCache = false);
     void emitCallIndirect(U32 typeIdx, U32 tableIdx = 0);
     void emitReturnCallIndirect(U32 typeIdx, U32 tableIdx = 0);
 
@@ -463,6 +464,10 @@ public:
     // each emitEnd as -1 (emitElse does not change depth — `else` stays
     // inside the same `if` frame).
     U32 currentCtrlDepth() const { return m_ctrlDepth; }
+
+    // MMX registers (bit i = mm i) whose cached v128 local equals cpu->fpu.regs[i] on every path that
+    // reaches the current position. Calls, loop headers and joins narrow it; see JitWasmCodeGen::loadCpuMMXReg.
+    U8 mmxCached = 0;
     void emitDrop();
     void emitReturn();
     void emitUnreachable();
@@ -503,6 +508,14 @@ private:
     std::vector<U8>  m_currentBody;      // being built by begin/endFunction
     bool             m_inFunction = false;
     U32              m_ctrlDepth = 0;    // open structural blocks (if/block/loop)
+    struct MmxCtrl {
+        U8 kind;      // WASM_IF, WASM_BLOCK or WASM_LOOP
+        U8 entry;     // mmxCached when the if opened
+        U8 arms;      // AND of the finished then-arm (else seen) and every br to this label
+        bool hasElse;
+    };
+    std::vector<MmxCtrl> m_mmxCtrl;
+    void mmxBranchTo(U32 depth);
 
     struct BranchHintEntry {
         U32 funcIndex;

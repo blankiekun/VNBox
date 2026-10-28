@@ -13,6 +13,9 @@
 
 #include "testMMX.h"
 #include "testCPU.h"
+#ifdef BOXEDWINE_WASM_JIT
+#include "../../emulation/cpu/wasm/wasmEmitter.h"
+#endif
 
 #define cpu (testContext().cpu)
 #define memory (testContext().memory)
@@ -613,6 +616,132 @@ void testMmxPsadbw_0x3f6() {
 
 void testMmxMaskmovq_0x3f7() {
     runMaskmovqCase(0x1122334455667788ULL, 0x807fff00808001f0ULL, 0x1199339955669988ULL, "mmx maskmovq");
+}
+
+// Several MMX ops in one compiled block: the WASM JIT keeps mm registers in locals between them
+// (write-through), so check reuse, same-register operands, x87 writes, a forward join and a loop.
+void testMmxRegisterCacheSequences() {
+    const U64 A = MMX_DEFAULT, B = MMX_SRC;
+    U64 x = 0;
+    for (int i = 0; i < 4; ++i) {
+        U32 w = (U16)(A >> (16 * i));
+        x |= (U64)(U16)(w * w) << (16 * i);
+    }
+    U64 sum = 0;
+    for (int i = 0; i < 8; ++i) {
+        U32 b = (U32)((x >> (8 * i)) & 0xff) + (U32)((B >> (8 * i)) & 0xff);
+        sum |= (U64)(b > 0xff ? 0xff : b) << (8 * i);
+    }
+    U64 shifted = 0;
+    for (int i = 0; i < 4; ++i) {
+        shifted |= (U64)((U16)(sum >> (16 * i)) >> 3) << (16 * i);
+    }
+    U64 expected = ~shifted;
+
+    initMmx();
+    emitMovqMmxFromMmx(1, 0);
+    emitMmxRegReg(0xd5, 1, 1); // pmullw mm1,mm1
+    emitMovqMmxFromMem(2, MEM_SRC);
+    emitMmxRegReg(0xdc, 1, 2); // paddusb mm1,mm2
+    emitMmxImm(0x71, 2, 1, 3); // psrlw mm1,3
+    emitMmxRegReg(0x74, 3, 3); // pcmpeqb mm3,mm3
+    emitMmxRegReg(0xef, 1, 3); // pxor mm1,mm3
+    emitMovqMemFromMmx(1, MEM_DST);
+    emitMovdRegFromMmx(R_AX, 1);
+    runTestCPU();
+    if (cpu->fpu.getMMX(0)->q != A || cpu->fpu.getMMX(1)->q != expected || cpu->fpu.getMMX(2)->q != B ||
+            cpu->fpu.getMMX(3)->q != ~0ULL || cpu->fpu.getMMX(4)->q != A ||
+            memory->readq(TEST_HEAP_ADDRESS + MEM_DST) != expected || cpu->reg[R_AX].u32 != (U32)expected) {
+        failed("mmx cached sequence");
+    }
+
+    // fxrstor (an x87-state op) rewrites mm7 behind its cached copy.
+    initMmx();
+    const U32 area = MEM_BASE + 0x200;
+    for (U32 i = 0; i < 512; i += 8) {
+        memory->writeq(TEST_HEAP_ADDRESS + area + i, 0);
+    }
+    memory->writew(TEST_HEAP_ADDRESS + area, 0x37f); // fcw; fsw (top) stays 0
+    memory->writed(TEST_HEAP_ADDRESS + area + 24, 0x1f80); // mxcsr
+    for (U32 i = 0; i < 8; ++i) {
+        memory->writeq(TEST_HEAP_ADDRESS + area + 32 + 16 * i, B);
+    }
+    emitMovqMmxFromMmx(2, 7);
+    pushCode8(0x0f); pushCode8(0xae); emitDirectAddressModRM(1, area); // fxrstor [area]
+    emitMovqMmxFromMmx(1, 7);
+    runTestCPU();
+    if (cpu->fpu.getMMX(7)->q != B || cpu->fpu.getMMX(1)->q != B) {
+        failed("mmx cache after fxrstor: mm2 %llx mm7 %llx mm1 %llx", (unsigned long long)cpu->fpu.getMMX(2)->q,
+            (unsigned long long)cpu->fpu.getMMX(7)->q, (unsigned long long)cpu->fpu.getMMX(1)->q);
+    }
+
+    // mm3 is cached before the branch and written on one path only; mm6 is loaded on one path only.
+    for (U32 eax : {0u, 1u}) {
+        initMmx();
+        cpu->reg[R_AX].u32 = eax;
+        emitMovqMmxFromMmx(5, 3);
+        pushCode8(0x85); pushCode8(0xc0); // test eax,eax
+        pushCode8(0x74); pushCode8(14); // jz join
+        emitMovqMmxFromMem(3, MEM_SRC); // 8 bytes
+        emitMovqMmxFromMmx(7, 6); // 3 bytes
+        emitMmxRegReg(0xfc, 6, 3); // paddb mm6,mm3, 3 bytes
+        emitMovqMmxFromMmx(4, 3); // join
+        emitMovqMmxFromMmx(1, 6);
+        runTestCPU();
+        U64 mm3 = eax ? B : A, mm6 = eax ? paddBytes(A, B) : A;
+        if (cpu->fpu.getMMX(4)->q != mm3 || cpu->fpu.getMMX(3)->q != mm3 || cpu->fpu.getMMX(1)->q != mm6 ||
+                cpu->fpu.getMMX(5)->q != A) {
+            failed("mmx cache across a forward branch (eax %u)", eax);
+        }
+    }
+
+    // A backward loop: the header can't assume what the previous iteration cached.
+    initMmx();
+    cpu->reg[R_CX].u32 = 3;
+    emitMovqMmxFromMem(2, MEM_SRC);
+    emitMmxRegReg(0xfc, 1, 2); // L: paddb mm1,mm2
+    pushCode8(0x49); // dec ecx
+    pushCode8(0x75); pushCode8(0xfa); // jnz L
+    runTestCPU();
+    if (cpu->fpu.getMMX(1)->q != paddBytes(paddBytes(paddBytes(A, B), B), B) || cpu->reg[R_CX].u32 != 0) {
+        failed("mmx cache in a loop");
+    }
+
+#ifdef BOXEDWINE_WASM_JIT
+    // Which cached MMX locals stay valid across the emitter's control flow.
+    WasmEmitter e;
+    e.beginFunction({});
+    e.mmxCached = 0x0f;
+    e.emitIf();
+    e.mmxCached |= 0x10; // loaded on the then-path only
+    e.emitCall(0, true);
+    e.emitElse();
+    if (e.mmxCached != 0x0f) failed("mmx cache: else starts from the if's entry");
+    e.mmxCached |= 0x30;
+    e.emitEnd();
+    if (e.mmxCached != 0x1f) failed("mmx cache: if/else join keeps both arms' registers");
+    e.emitIf();
+    e.mmxCached |= 0x40;
+    e.emitEnd();
+    if (e.mmxCached != 0x1f) failed("mmx cache: if without else joins its entry");
+    e.emitBlock();
+    e.emitIf();
+    e.mmxCached = 0x01; // e.g. after a call in this arm
+    e.emitBrIf(1);
+    e.mmxCached = 0x1f;
+    e.emitEnd();
+    e.emitEnd();
+    if (e.mmxCached != 0x01) failed("mmx cache: br to a block narrows its end");
+    e.mmxCached = 0x0f;
+    e.emitLoop();
+    if (e.mmxCached != 0) failed("mmx cache: loop header starts empty");
+    e.mmxCached = 0x03;
+    e.emitBrIf(0);
+    e.emitEnd();
+    if (e.mmxCached != 0x03) failed("mmx cache: loop end falls through");
+    e.emitCall(0);
+    if (e.mmxCached != 0) failed("mmx cache: other calls clear it");
+#endif
 }
 
 #endif
