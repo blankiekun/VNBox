@@ -5,7 +5,7 @@
 //
 // URL: frida=<script url> loads that script (and its require()d libs) into the game process,
 // the one whose first loaded module is the exe named by p=. Lines the script sends go to
-// window.boxedwineText(line) when defined, and to the console.
+// window.boxedwineText(line, thread) when defined (see "Runtime hooks"), and to the console.
 // Only same-origin blob: URLs and same-origin files under the folder above frida-compat.js load (XSS guard).
 //
 // Covered: Interceptor.attach (onEnter), Breakpoint.add/remove, this.context.<x86 regs>,
@@ -14,6 +14,25 @@
 // module lookups, Module.findExportByName, hexdump, trans.send/replace (port of dc00's
 // libLoader.js, MIT). Not covered: memory writes, Memory.alloc, onLeave, Instruction,
 // NativeFunction, Stalker.
+//
+// Runtime hooks (contract version 1, boxedwineFrida.version): the game process is attached even
+// without frida=, so hooks can be added and removed while the game runs. Lines go to
+// window.boxedwineText(line, thread), thread = { id, label, kind: 'script' | 'hcode' | 'search',
+// address, module }; the frida= script's thread id is "script".
+//   load(source, name?) → id: runs a script now (no require()); throws on its error.
+//   loadHcode(code) → id: one Textractor hook code. An H-code's first caller context is thread <id>,
+//     later ones <id>#2, #3, … (context = caller module+offset unless N, plus the split value).
+//   unload(id) / unloadAll() (also stops the search), keep(threadId) → id: keeps a search thread.
+//   search.start() / stop() / running: hooks gdi32 GetGlyphOutlineA/W, TextOutA/W, ExtTextOutA/W
+//     and user32 DrawText(Ex)A/W; one thread per export and caller, characters joined by thread
+//     (400 ms gap), thread id "<export>@<caller address>".
+//   scriptFor(threadId) → a script with no require() reproducing that thread (for frida= blob:).
+// H-codes: /H{A,B,W,S,Q,V}[F][N][codepage#][padding+]data_offset[*deref][:split[*deref]]@addr[:module[:export]]
+//   A/B: DBCS char (A lead byte high, B low), W: UTF-16 char, S/Q/V: cp932 / UTF-16 / UTF-8 string.
+//   Offsets: hex, >= 0 [esp + offset] at the hooked instruction (4 = first argument), -4 eax, -8 ecx,
+//   -C edx, -10 ebx, -14 esp, -18 ebp, -1C esi, -20 edi. Codepages 932 and 65001. @addr is absolute,
+//   or relative to the module (empty: the exe) or to the module's export.
+//   Refused with a message: /R read codes, types H/M/U (hex dump, UTF-32), null_length n<, other codepages.
 (function () {
     'use strict';
     const ANSI = 'shift_jis'; // shortcut: the guest's ANSI code page is cp932 (LC_ALL ja_JP); read it from the locale when other locales matter
@@ -252,28 +271,34 @@
         get: (_, k) => (typeof k === 'string' && /^\d+$/.test(k) ? ptr(u32(F.api.reg(4) + 4 + 4 * k)) : undefined),
     });
 
-    const listeners = new Map(); // hook id → { address, onEnter }
-    function addHook(target, callbacks) {
-        const onEnter = typeof callbacks === 'function' ? callbacks : callbacks && callbacks.onEnter;
-        if (callbacks && callbacks.onLeave) console.warn('[frida] onLeave is not supported; only onEnter runs');
-        const address = toU32(target);
-        const id = F.api.hookAdd(F.pid, address);
-        listeners.set(id, { address, onEnter });
-        return { detach() { F.api.hookRemove(id); listeners.delete(id); } };
+    const listeners = new Map(); // hook id → { address, onEnter, handle }
+    function removeListeners(test) {
+        for (const [id, l] of listeners) if (test(l)) { F.api.hookRemove(id); listeners.delete(id); }
     }
-    function removeHooksAt(target) {
-        const address = toU32(target);
-        for (const [id, l] of listeners) if (l.address === address) { F.api.hookRemove(id); listeners.delete(id); }
+    // Interceptor/Breakpoint for one handle: its hooks are detached together with it.
+    function makeInterceptor(handle) {
+        function addHook(target, callbacks) {
+            const onEnter = typeof callbacks === 'function' ? callbacks : callbacks && callbacks.onEnter;
+            if (callbacks && callbacks.onLeave) console.warn('[frida] onLeave is not supported; only onEnter runs');
+            const address = toU32(target);
+            const id = F.api.hookAdd(F.pid, address);
+            listeners.set(id, { address, onEnter, handle });
+            return { detach() { removeListeners((l) => l === listeners.get(id)); } };
+        }
+        const Interceptor = {
+            attach: addHook,
+            detachAll() { removeListeners((l) => l.handle === handle); },
+            flush() {},
+        };
+        const Breakpoint = {
+            add: addHook,
+            remove(target) {
+                if (target && typeof target.detach === 'function') target.detach();
+                else { const a = toU32(target); removeListeners((l) => l.handle === handle && l.address === a); }
+            },
+        };
+        return { Interceptor, Breakpoint };
     }
-    const Interceptor = {
-        attach: addHook,
-        detachAll() { for (const id of listeners.keys()) F.api.hookRemove(id); listeners.clear(); },
-        flush() {},
-    };
-    const Breakpoint = {
-        add: addHook,
-        remove(target) { if (target && typeof target.detach === 'function') target.detach(); else removeHooksAt(target); },
-    };
 
     function hit(id, pid, tid) {
         const l = listeners.get(id);
@@ -294,82 +319,94 @@
         if (typeof vnboxReport === 'function') vnboxReport('frida', message); else console.error('[frida] ' + message);
     }
 
-    // ---- trans (dc00 libLoader.js, MIT: joins a hook's fragments into lines) ----------------------
-    function emit(text) {
+    // ---- lines ------------------------------------------------------------------------------------
+    // Every line goes to window.boxedwineText(line, thread), thread = { id, label, kind, address, module }
+    // (the runtime hook contract, version 1). Script lines keep the old `[frida] "…"` console form.
+    function emit(text, thread) {
         if (text === null || text === undefined || text === '') return;
-        F.lines.push(text);
-        console.log('[frida] ' + JSON.stringify(text));
-        if (typeof globalThis.boxedwineText === 'function') globalThis.boxedwineText(text);
+        if (!handles.has(thread.handle)) return; // unloaded while a join timer ran
+        const t = { id: thread.id, label: thread.label, kind: thread.kind, address: thread.address, module: thread.module };
+        if (t.kind === 'script') {
+            F.lines.push(text);
+            console.log('[frida] ' + JSON.stringify(text));
+        } else {
+            console.log('[frida ' + t.id + '] ' + JSON.stringify(text));
+        }
+        if (typeof globalThis.boxedwineText === 'function') globalThis.boxedwineText(text, t);
     }
-    const trans = {
-        _copy(s) { emit(s); },
-        _send(s) { if (s !== null) this._copy(s); },
-        replace(fn, override) {
-            if (override === true) {
-                this._copy = (s) => emit(fn(s));
-            } else {
-                const prev = this._copy;
-                this._copy = function (s) { prev.call(this, fn(s)); };
-            }
-        },
-        // delay: 0 sends each call; N ms debounces to the last call; "N" sends the first call's
-        // text and appends the last one's; "N+" / "N-" collect calls (appended / prepended, a
-        // repeat of the previous one dropped) and join them with "\n", or with the separator
-        // between "N+…+" when given.
-        send(fn, delay = 0) {
-            if (!(fn instanceof Function)) return this._send(fn);
-            const self = this;
-            const direct = function () { self._send(fn.apply(this, arguments)); };
-            if (delay === 0) return direct;
-            let timer = null;
-            if (typeof delay === 'string') {
-                const ms = parseInt(delay), last = delay[delay.length - 1], plus = last === '+';
-                if (plus || last === '-') {
-                    const m = delay.match(plus ? /(^\d+\+)(.*)(\+$)/s : /(^\d+-)(.*)(-$)/s);
-                    const sep = m !== null ? m[2] : '\n', dedupe = sep === '\n';
-                    let lines = [], previous;
+
+    // ---- trans (dc00 libLoader.js, MIT: joins a hook's fragments into lines) ----------------------
+    function makeTrans(send) {
+        return {
+            _copy(s) { send(s); },
+            _send(s) { if (s !== null) this._copy(s); },
+            replace(fn, override) {
+                if (override === true) {
+                    this._copy = (s) => send(fn(s));
+                } else {
+                    const prev = this._copy;
+                    this._copy = function (s) { prev.call(this, fn(s)); };
+                }
+            },
+            // delay: 0 sends each call; N ms debounces to the last call; "N" sends the first call's
+            // text and appends the last one's; "N+" / "N-" collect calls (appended / prepended, a
+            // repeat of the previous one dropped) and join them with "\n", or with the separator
+            // between "N+…+" when given.
+            send(fn, delay = 0) {
+                if (!(fn instanceof Function)) return this._send(fn);
+                const self = this;
+                const direct = function () { self._send(fn.apply(this, arguments)); };
+                if (delay === 0) return direct;
+                let timer = null;
+                if (typeof delay === 'string') {
+                    const ms = parseInt(delay), last = delay[delay.length - 1], plus = last === '+';
+                    if (plus || last === '-') {
+                        const m = delay.match(plus ? /(^\d+\+)(.*)(\+$)/s : /(^\d+-)(.*)(-$)/s);
+                        const sep = m !== null ? m[2] : '\n', dedupe = sep === '\n';
+                        let lines = [], previous;
+                        return function () {
+                            const s = fn.apply(this, arguments);
+                            if (!dedupe) lines[plus ? 'push' : 'unshift'](s);
+                            else if (s !== null && s !== previous) { previous = s; lines[plus ? 'push' : 'unshift'](s); }
+                            clearTimeout(timer);
+                            timer = setTimeout(() => { self._send(lines.join(sep)); lines = []; previous = null; }, ms);
+                        };
+                    }
+                    let first, calls = 0;
                     return function () {
-                        const s = fn.apply(this, arguments);
-                        if (!dedupe) lines[plus ? 'push' : 'unshift'](s);
-                        else if (s !== null && s !== previous) { previous = s; lines[plus ? 'push' : 'unshift'](s); }
+                        const a = arguments, that = this;
+                        calls++;
+                        if (timer === null) first = fn.apply(that, a);
                         clearTimeout(timer);
-                        timer = setTimeout(() => { self._send(lines.join(sep)); lines = []; previous = null; }, ms);
+                        timer = setTimeout(() => {
+                            timer = null;
+                            if (calls > 1) {
+                                calls = 0;
+                                const s = fn.apply(that, a);
+                                if (first !== null) { if (s !== null) first = first + '\n' + s; self._send(first); } else self._send(s);
+                            } else {
+                                calls = 0;
+                                self._send(first);
+                            }
+                        }, ms);
                     };
                 }
-                let first, calls = 0;
+                if (delay > 0) {
+                    return function () {
+                        const a = arguments, that = this;
+                        clearTimeout(timer);
+                        timer = setTimeout(() => direct.apply(that, a), delay);
+                    };
+                }
+                const quiet = -delay; // negative: the first call of a burst only
                 return function () {
-                    const a = arguments, that = this;
-                    calls++;
-                    if (timer === null) first = fn.apply(that, a);
+                    if (timer === null) direct.apply(this, arguments);
                     clearTimeout(timer);
-                    timer = setTimeout(() => {
-                        timer = null;
-                        if (calls > 1) {
-                            calls = 0;
-                            const s = fn.apply(that, a);
-                            if (first !== null) { if (s !== null) first = first + '\n' + s; self._send(first); } else self._send(s);
-                        } else {
-                            calls = 0;
-                            self._send(first);
-                        }
-                    }, ms);
+                    timer = setTimeout(() => { timer = null; }, quiet);
                 };
-            }
-            if (delay > 0) {
-                return function () {
-                    const a = arguments, that = this;
-                    clearTimeout(timer);
-                    timer = setTimeout(() => direct.apply(that, a), delay);
-                };
-            }
-            const quiet = -delay; // negative: the first call of a burst only
-            return function () {
-                if (timer === null) direct.apply(this, arguments);
-                clearTimeout(timer);
-                timer = setTimeout(() => { timer = null; }, quiet);
-            };
-        },
-    };
+            },
+        };
+    }
 
     function hexdump(target, options = {}) {
         const len = options.length || 256;
@@ -383,12 +420,348 @@
         return rows.join('\n');
     }
 
-    // Scripts get these as parameters: a global Module would clash with Emscripten's.
-    const fridaGlobals = { NativePointer, ptr, NULL: ptr(0), Memory, Process, Module, Interceptor, Breakpoint, trans, hexdump };
-    Object.assign(F, fridaGlobals);
-    F.test = { parsePattern, readTerminated, toU32, scriptAllowed }; // for frida-compat.check.mjs
+    // ---- text hooks shared by H-codes, the search and the scripts scriptFor() writes -------------
+    // These three functions are copied by source into generated scripts (Function.prototype.toString),
+    // so they use only their parameters and browser globals (TextDecoder, setTimeout).
 
-    // ---- loading the script ---------------------------------------------------------------------
+    // Joins a hook's pieces into lines, per key: a piece of one character is appended, a longer one
+    // starts a new line of the same text (a repeat of the previous longer piece, a redraw, is
+    // dropped). The text goes out after 400 ms without a piece, after 3 s, or at 2000 characters.
+    function makeJoiner(send) {
+        const open = new Map();
+        function flush(key) {
+            const b = open.get(key);
+            if (!b) return;
+            open.delete(key);
+            clearTimeout(b.timer);
+            if (b.text) send(key, b.text);
+        }
+        return function push(key, piece, whole) {
+            if (!piece) return;
+            if (whole) { flush(key); send(key, piece); return; }
+            const now = Date.now();
+            let b = open.get(key);
+            if (b && now - b.started > 3000) { flush(key); b = null; }
+            if (!b) open.set(key, b = { text: '', last: null, started: now, timer: 0 });
+            const single = [...piece].length === 1;
+            if (single || piece !== b.last) {
+                b.text += b.text && !single ? '\n' + piece : piece;
+                if (!single) b.last = piece;
+            }
+            clearTimeout(b.timer);
+            b.timer = setTimeout(() => flush(key), 400);
+            if (b.text.length > 2000) flush(key);
+        };
+    }
+
+    // Hooks Wine's GDI/USER text exports in the game process. g: { Interceptor, Process, Module, ptr }.
+    // only: null for all, or { api, module, offset } for one export called from one place.
+    // push(api, returnAddress, text) for every call that draws text.
+    function hookTextApis(g, only, push) {
+        const A = new TextDecoder('shift_jis');
+        const dbcs = (c) => A.decode(new Uint8Array(c > 0xff ? [c >> 8, c & 0xff] : [c]));
+        const str = (p, n, wide) => {
+            n = Math.min(n, 4096);
+            if (n === 0 || p.isNull()) return null;
+            return wide ? p.readUtf16String(n < 0 ? 4096 : n) : p.readAnsiString(n < 0 ? 4096 : n);
+        };
+        const ETO_GLYPH_INDEX = 0x10, DT_CALCRECT = 0x400;
+        const apis = {
+            GetGlyphOutlineA: ['gdi32.dll', (a) => dbcs(a[1].toUInt32() & 0xffff)],
+            GetGlyphOutlineW: ['gdi32.dll', (a) => String.fromCharCode(a[1].toUInt32() & 0xffff)],
+            TextOutA: ['gdi32.dll', (a) => str(a[3], a[4].toInt32(), false)],
+            TextOutW: ['gdi32.dll', (a) => str(a[3], a[4].toInt32(), true)],
+            ExtTextOutA: ['gdi32.dll', (a) => (a[3].toUInt32() & ETO_GLYPH_INDEX ? null : str(a[5], a[6].toInt32(), false))],
+            ExtTextOutW: ['gdi32.dll', (a) => (a[3].toUInt32() & ETO_GLYPH_INDEX ? null : str(a[5], a[6].toInt32(), true))],
+            DrawTextA: ['user32.dll', (a) => (a[4].toUInt32() & DT_CALCRECT ? null : str(a[1], a[2].toInt32(), false))],
+            DrawTextW: ['user32.dll', (a) => (a[4].toUInt32() & DT_CALCRECT ? null : str(a[1], a[2].toInt32(), true))],
+            DrawTextExA: ['user32.dll', (a) => (a[4].toUInt32() & DT_CALCRECT ? null : str(a[1], a[2].toInt32(), false))],
+            DrawTextExW: ['user32.dll', (a) => (a[4].toUInt32() & DT_CALCRECT ? null : str(a[1], a[2].toInt32(), true))],
+        };
+        let caller = null;
+        if (only) {
+            const m = only.module ? g.Process.findModuleByName(only.module) : null;
+            caller = m ? m.base.add(only.offset) : g.ptr(only.address);
+        }
+        let hooked = 0;
+        for (const name of Object.keys(apis)) {
+            if (only && only.api !== name) continue;
+            const [module, read] = apis[name];
+            const at = g.Module.findExportByName(module, name);
+            if (!at) continue;
+            g.Interceptor.attach(at, function (args) {
+                const ret = this.returnAddress;
+                if (caller && !ret.equals(caller)) return;
+                let text;
+                try { text = read(args); } catch (e) { return; } // a bad pointer: the game's own error
+                if (text) push(name, ret, text);
+            });
+            hooked++;
+        }
+        return hooked;
+    }
+
+    // Hooks one parsed H-code (parseHcode). push(context, text, whole): context is '' with N,
+    // else the caller "module+0xoffset", plus ":0x<split>" with a split. only: hook that context alone.
+    function hookHcode(hp, g, push, only) {
+        const regs = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi'];
+        let at = g.ptr(hp.address);
+        if (hp.module !== null) {
+            const m = hp.module === '' ? g.Process.enumerateModules()[0] : g.Process.findModuleByName(hp.module);
+            if (!m) throw new Error('H-code: module not loaded: ' + hp.module);
+            if (hp.func !== null) {
+                const f = m.findExportByName(hp.func);
+                if (!f) throw new Error('H-code: ' + m.name + ' has no export ' + hp.func);
+                at = f.add(hp.address);
+            } else {
+                at = m.base.add(hp.address);
+            }
+        }
+        const dec = new TextDecoder(hp.encoding);
+        const value = (ctx, off) => (off < 0 ? ctx[regs[-off / 4 - 1]] : ctx.esp.add(off).readPointer());
+        const places = new Map();
+        const place = (ret) => {
+            let s = places.get(ret.toUInt32());
+            if (s === undefined) {
+                const m = g.Process.findModuleByAddress(ret);
+                s = m ? m.name + '+0x' + ret.sub(m.base).toUInt32().toString(16) : ret.toString();
+                places.set(ret.toUInt32(), s);
+            }
+            return s;
+        };
+        g.Interceptor.attach(at, function () {
+            let key = hp.noContext ? '' : place(this.returnAddress);
+            if (hp.split !== null) {
+                let s = value(this.context, hp.split);
+                if (hp.splitDeref !== null) s = s.add(hp.splitDeref).readPointer();
+                key += ':' + s.toString();
+            }
+            if (only !== undefined && only !== null && key !== only) return;
+            let v = value(this.context, hp.offset);
+            if (hp.deref !== null) v = v.add(hp.deref).readPointer();
+            let text;
+            if (hp.string) {
+                const p = v.add(hp.padding);
+                text = hp.encoding === 'utf-16le' ? p.readUtf16String() : hp.encoding === 'utf-8' ? p.readUtf8String() : p.readShiftJisString();
+            } else {
+                const c = v.toUInt32() & 0xffff;
+                text = hp.encoding === 'utf-16le' ? String.fromCharCode(c)
+                    : dec.decode(new Uint8Array(c > 0xff ? (hp.type === 'A' ? [c >> 8, c & 0xff] : [c & 0xff, c >> 8]) : [c]));
+            }
+            push(key, text, hp.full);
+        });
+        return at;
+    }
+
+    // Textractor's /H hook code, the subset hookHcode runs (README "H-codes" at the top).
+    function parseHcode(code) {
+        const src = String(code).trim();
+        const fail = (why) => { throw new Error('H-code ' + JSON.stringify(src) + ': ' + why); };
+        let s = src.replace(/^\//, ''), m;
+        if (s[0] === 'R') fail('read codes (/R) are not supported, only hook codes (/H)');
+        if (s[0] !== 'H') fail('expected /H at the start');
+        const type = s[1] || '';
+        if (!type || !'ABWSQV'.includes(type)) fail('type ' + JSON.stringify(type) + ' is not supported (A, B, W, S, Q, V)');
+        s = s.slice(2);
+        const hp = {
+            type, string: 'SQV'.includes(type), full: false, noContext: false, encoding: 'shift_jis', padding: 0,
+            offset: 0, deref: null, split: null, splitDeref: null, address: 0, module: null, func: null,
+        };
+        if (hp.string && s[0] === 'F') { hp.full = true; s = s.slice(1); }
+        if (/^\d+</.test(s)) fail('null_length (n<) is not supported');
+        if (s[0] === 'N') { hp.noContext = true; s = s.slice(1); }
+        let codepage = 932;
+        if ((m = s.match(/^(\d+)#/))) { codepage = +m[1]; s = s.slice(m[0].length); }
+        if ((m = s.match(/^([0-9a-f]+)\+/i))) { hp.padding = parseInt(m[1], 16); s = s.slice(m[0].length); }
+        const hex = (what) => {
+            const h = s.match(/^-?[0-9a-f]+/i);
+            if (!h) fail('expected ' + what + ' (hex) at ' + JSON.stringify(s));
+            s = s.slice(h[0].length);
+            return parseInt(h[0], 16);
+        };
+        const offset = (what) => {
+            const v = hex(what);
+            if (v < 0 && (v < -0x20 || v % 4)) fail(what + ' ' + v.toString(16) + ': registers are -4 (eax) to -20 (edi) in steps of 4');
+            return v;
+        };
+        hp.offset = offset('data offset');
+        if (s[0] === '*') { s = s.slice(1); hp.deref = hex('deref offset'); }
+        if (s[0] === ':') {
+            s = s.slice(1);
+            hp.split = offset('split offset');
+            if (s[0] === '*') { s = s.slice(1); hp.splitDeref = hex('split deref offset'); }
+        }
+        if (!(m = s.match(/^@([0-9a-f]+)(?::([^:]*))?(?::(.+))?$/i))) fail('expected @address[:module[:function]] at ' + JSON.stringify(s));
+        hp.address = parseInt(m[1], 16);
+        if (m[2] !== undefined) hp.module = m[2];
+        if (m[3] !== undefined) hp.func = m[3];
+        if (type === 'W' || type === 'Q') hp.encoding = 'utf-16le';
+        else if (type === 'V' || codepage === 65001) hp.encoding = 'utf-8';
+        else if (codepage !== 932) fail('codepage ' + codepage + ' is not supported (932, 65001)');
+        return hp;
+    }
+
+    // ---- handles: the boot script, runtime scripts, H-codes, kept search threads ------------------
+    // A handle's id is also its thread id (H-code contexts after the first: "<id>#2", "#3", …).
+    // Each runs in its own scope (Interceptor, Breakpoint, trans) when the game process is attached,
+    // again after the game restarts, and is detached as a whole by unload().
+    const handles = new Map();
+    let nextHandle = 1;
+    function addHandle(h) {
+        h.thread = Object.assign({ handle: h.id, id: h.id }, h.thread);
+        handles.set(h.id, h);
+        if (attachedPid) runHandle(h);
+        return h;
+    }
+    const GLOBAL_NAMES = ['NativePointer', 'ptr', 'NULL', 'Memory', 'Process', 'Module', 'Interceptor', 'Breakpoint', 'trans', 'hexdump'];
+    function runHandle(h) {
+        const { Interceptor, Breakpoint } = makeInterceptor(h);
+        const trans = makeTrans((s) => emit(s, h.thread));
+        h.globals = { NativePointer, ptr, NULL: ptr(0), Memory, Process, Module, Interceptor, Breakpoint, trans, hexdump };
+        h.run(h.globals);
+    }
+    function dropHandle(id) {
+        handles.delete(id);
+        removeListeners((l) => l.handle.id === id);
+    }
+    function runtimeScript(id, label, source, name) {
+        const names = GLOBAL_NAMES;
+        const fn = new Function('require', 'module', 'exports', ...names, source + '\n//# sourceURL=' + (name || id)); // throws on a syntax error
+        const require = (n) => { throw new Error('require(' + JSON.stringify(n) + ') is not available in scripts loaded at run time'); };
+        return {
+            id, kind: 'script', source, thread: { label, kind: 'script' },
+            run(g) { const module = { exports: {}, parent: null, id }; fn(require, module, module.exports, ...names.map((n) => g[n])); },
+        };
+    }
+    // Adds the handle; when the game is attached its script runs now and an error unloads it and throws.
+    function start(h) {
+        try {
+            addHandle(h);
+        } catch (e) {
+            dropHandle(h.id);
+            throw new Error((e && e.message) || String(e));
+        }
+        return h.id;
+    }
+    function load(source, name) {
+        if (typeof source !== 'string') throw new Error('load: source must be a string');
+        const id = 'script:' + nextHandle++;
+        return start(runtimeScript(id, name ? String(name) : 'Hook script', source, name));
+    }
+    function loadHcode(code) {
+        const hp = parseHcode(code);
+        const id = 'hcode:' + nextHandle++;
+        const contexts = new Map(); // context → thread
+        const h = {
+            id, kind: 'hcode', hp, code: String(code).trim(), contexts, thread: { label: String(code).trim(), kind: 'hcode' },
+            run(g) {
+                const join = makeJoiner((key, text) => emit(text, contexts.get(key)));
+                hookHcode(hp, g, (key, text, whole) => {
+                    if (!contexts.has(key)) {
+                        const n = contexts.size;
+                        contexts.set(key, n === 0 ? h.thread : {
+                            handle: id, id: id + '#' + (n + 1), kind: 'hcode', label: h.code + (key ? ' ' + key : ''), module: key.split('+')[0] || undefined,
+                        });
+                        if (n === 0 && key) h.thread.label = h.code + ' ' + key;
+                    }
+                    join(key, text, whole);
+                });
+            },
+        };
+        return start(h);
+    }
+    function unload(id) {
+        const h = handles.get(String(id).split('#')[0]);
+        if (!h) return false;
+        dropHandle(h.id);
+        return true;
+    }
+    function unloadAll() {
+        search.stop();
+        for (const id of [...handles.keys()]) if (id !== SEARCH.id) dropHandle(id);
+    }
+
+    // ---- auto search (H4 step a): every text export, one thread per export and caller ----------
+    const SEARCH = { id: '\0search', kind: 'search' };
+    const searchThreads = new Map(); // thread id → thread (with api, module, offset)
+    let searching = false;
+    function runSearch() {
+        const g = Object.assign({}, SEARCH.globalsBase, makeInterceptor(SEARCH));
+        const join = makeJoiner((id, text) => { if (searching && !handles.has(id)) emit(text, searchThreads.get(id)); });
+        const n = hookTextApis(g, null, (api, ret, text) => {
+            const id = api + '@' + ret.toString();
+            if (!searchThreads.has(id)) {
+                const m = Process.findModuleByAddress(ret);
+                const offset = m ? ret.sub(m.base).toUInt32() : ret.toUInt32();
+                searchThreads.set(id, {
+                    handle: SEARCH.id, id, kind: 'search', address: ret.toString(), module: m ? m.name : undefined, api, offset,
+                    label: api + ' ← ' + (m ? m.name + '+0x' + offset.toString(16) : ret.toString()),
+                });
+            }
+            join(id, text);
+        });
+        console.log('[frida] search: ' + n + ' text exports hooked');
+    }
+    handles.set(SEARCH.id, SEARCH); // emit() checks handles; search lines are gated by `searching`
+    SEARCH.globalsBase = { ptr, Process, Module };
+    SEARCH.run = runSearch;
+    const search = {
+        start() {
+            if (searching) return;
+            searching = true;
+            if (attachedPid) runSearch();
+        },
+        stop() {
+            searching = false;
+            removeListeners((l) => l.handle === SEARCH);
+        },
+        get running() { return searching; },
+    };
+    function keep(threadId) {
+        const t = searchThreads.get(threadId);
+        if (!t) throw new Error('keep: no search thread ' + threadId);
+        if (handles.has(t.id)) return t.id;
+        const only = { api: t.api, module: t.module || null, offset: t.offset, address: t.address };
+        return start({
+            id: t.id, kind: 'search', only, thread: Object.assign({}, t, { handle: t.id }),
+            run(g) {
+                const h = this, join = makeJoiner((key, text) => emit(text, h.thread));
+                hookTextApis(g, only, (api, ret, text) => join('', text));
+            },
+        });
+    }
+
+    // A script reproducing one thread, for the book's `hook` field (loaded with frida= at the next boot).
+    function scriptFor(threadId) {
+        threadId = String(threadId);
+        const base = threadId.split('#')[0];
+        const h = handles.get(base);
+        const head = (what) => '// ' + what + '\n// Written by VNBox frida-compat.js scriptFor(): runs as a frida= script on its own (no libraries).\n' +
+            'const g = { Interceptor, Process, Module, ptr };\nconst makeJoiner = ' + makeJoiner + ';\n';
+        if (h && h.kind === 'script') return h.source;
+        if (h && h.kind === 'hcode') {
+            let context = null;
+            for (const [key, t] of h.contexts) if (t.id === threadId) context = key;
+            return head('H-code ' + JSON.stringify(h.code) + (context ? ', context ' + JSON.stringify(context) : '')) +
+                'const hookHcode = ' + hookHcode + ';\nconst push = makeJoiner((key, text) => trans.send(text));\n' +
+                'hookHcode(' + JSON.stringify(h.hp) + ', g, push, ' + JSON.stringify(context) + ');\n';
+        }
+        const t = (h && h.kind === 'search' && h.thread) || searchThreads.get(threadId);
+        if (t && t.api) {
+            const only = { api: t.api, module: t.module || null, offset: t.offset, address: t.address };
+            return head(t.label) + 'const hookTextApis = ' + hookTextApis + ';\nconst push = makeJoiner((key, text) => trans.send(text));\n' +
+                'hookTextApis(g, ' + JSON.stringify(only) + ', (api, ret, text) => push(\'\', text));\n';
+        }
+        throw new Error('scriptFor: no thread ' + threadId);
+    }
+
+    Object.assign(F, {
+        version: 1, NativePointer, ptr, NULL: ptr(0), Memory, Process, Module, hexdump,
+        load, loadHcode, unload, unloadAll, search, keep, scriptFor,
+    });
+    F.test = { parsePattern, readTerminated, toU32, scriptAllowed, parseHcode, makeJoiner, makeTrans, hookHcode };
+
+    // ---- the boot script (frida= URL) ------------------------------------------------------------
     // require() shim: the script's relative requires are fetched up front, then evaluated
     // synchronously as CommonJS modules when the script runs.
     const sources = new Map(), cache = new Map();
@@ -419,7 +792,7 @@
         const deps = [...text.matchAll(/require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)/g)].map((m) => new URL(m[1], url).href);
         await Promise.all(deps.map(fetchTree));
     }
-    function evaluate(url, parent = null) {
+    function evaluate(url, globals, parent = null) {
         if (cache.has(url)) return cache.get(url).exports;
         const module = { exports: {}, parent, id: url }; // libs check module.parent to refuse running alone
         cache.set(url, module);
@@ -427,21 +800,31 @@
             if (!/^\.{1,2}\//.test(name)) throw new Error('frida: require of a non-relative module is not supported: ' + name);
             const dep = new URL(name, url).href;
             if (!sources.has(dep)) throw new Error('frida: module not preloaded: ' + dep);
-            return evaluate(dep, module);
+            return evaluate(dep, globals, module);
         };
-        const names = Object.keys(fridaGlobals);
-        new Function('require', 'module', 'exports', ...names, sources.get(url) + '\n//# sourceURL=' + url)(require, module, module.exports, ...names.map((n) => fridaGlobals[n]));
+        const names = Object.keys(globals);
+        new Function('require', 'module', 'exports', ...names, sources.get(url) + '\n//# sourceURL=' + url)(require, module, module.exports, ...names.map((n) => globals[n]));
         return module.exports;
     }
 
     const params = typeof location === 'undefined' ? null : new URLSearchParams(location.search);
     const scriptUrl = params && params.get('frida') ? new URL(params.get('frida'), location.href).href : null;
     const exe = lower(params && (params.get('p') || '').split(/[\\/]/).pop());
-    // attachedPid: the process the script runs in; a new process of the exe (the game restarted)
-    // gets it again. candidate: the process being prepared, otherPids: processes of other exes.
-    let loaded = false, attachedPid = 0, candidate = 0, phase = 0, seenAt = 0;
-    const otherPids = new Set(), copy0 = trans._copy;
-    if (scriptUrl) fetchTree(scriptUrl).then(() => { loaded = true; }, (e) => report('loading ' + scriptUrl + ': ' + (e && e.message || e)));
+    // attachedPid: the game process (the exe's), attached with or without a boot script so hooks can be
+    // loaded at run time; a new process of the exe (the game restarted) gets every handle again.
+    // candidate: the process being prepared, otherPids: processes of other exes.
+    let loaded = !scriptUrl, attachedPid = 0, candidate = 0, phase = 0, seenAt = 0;
+    const otherPids = new Set();
+    if (scriptUrl) {
+        fetchTree(scriptUrl).then(() => {
+            loaded = true;
+            handles.set('script', {
+                id: 'script', kind: 'script', thread: { handle: 'script', id: 'script', label: 'Hook script', kind: 'script' },
+                get source() { return sources.get(scriptUrl); },
+                run(g) { cache.clear(); evaluate(scriptUrl, g); },
+            });
+        }, (e) => report('loading ' + scriptUrl + ': ' + (e && e.message || e)));
+    }
 
     // From C every 1024 syscalls, on the guest thread of process pid. 0: nothing, 2: load the
     // ranges asked for with prefetch and poll again, 1: load them and attach.
@@ -481,11 +864,9 @@
     }
 
     function attach(pid, tid, teb) {
-        if (attachedPid) { // a new process of the exe: drop the old one's hooks and run the script afresh
+        if (attachedPid) { // a new process of the exe: drop the old one's hooks and run every handle afresh
             console.log('[frida] re-attach: pid ' + attachedPid + ' -> ' + pid);
-            Interceptor.detachAll();
-            cache.clear();
-            trans._copy = copy0;
+            removeListeners(() => true);
         }
         attachedPid = pid;
         candidate = 0;
@@ -497,10 +878,13 @@
             return r.length === 1 && r[0].address.equals(main.base);
         }) && scanSync(main.base, 0x40, '4d 5a 4d').length === 0;
         console.log('[frida] attach pid ' + pid + ' ' + main.name + ' @ ' + main.base + ' size 0x' + main.size.toString(16) + ', scan self-check ' + (ok ? 'ok' : 'FAILED'));
-        try {
-            evaluate(scriptUrl);
-        } catch (e) {
-            report('script failed: ' + (e && e.stack || e));
+        for (const h of handles.values()) {
+            if (h === SEARCH) { if (searching) runSearch(); continue; }
+            try {
+                runHandle(h);
+            } catch (e) {
+                report((h.id === 'script' ? 'script' : h.id) + ' failed: ' + (e && e.stack || e));
+            }
         }
     }
 })();

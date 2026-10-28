@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 new Function(fs.readFileSync(new URL('./frida-compat.js', import.meta.url), 'utf8'))();
 const F = globalThis.boxedwineFrida;
-const { ptr, trans } = F;
+const { ptr } = F;
+const lines = [];
+const trans = F.test.makeTrans((s) => lines.push(s));
 const mem = new Uint8Array(0x3000), heap = new Uint8Array(1 << 20);
 let top = 16;
 F.api = {
@@ -30,7 +32,7 @@ assert.deepEqual([...bytes, ...masks], [0xe8, 0, 0x40, 0xff, 0, 0xf0 & 0xfe]);
 const handler = trans.send((s) => s, '200+');
 handler('a'); handler('a'); handler('b');
 await new Promise((r) => setTimeout(r, 300));
-assert.deepEqual(F.lines, ['a\nb']);
+assert.deepEqual(lines, ['a\nb']);
 console.log('frida-compat self-check ok');
 // script URL guard: same-origin blob: or under the page's parent folder, nothing else
 const page = 'https://ex.org/vn/vnbox/boxedwine.html?frida=x';
@@ -47,3 +49,35 @@ assert.ok(!F.test.scriptAllowed('https://ex.org/calibre/x.js', embed, self));
 assert.ok(!F.test.scriptAllowed('https://ex.org/vnx.js', embed, self));
 assert.ok(!F.test.scriptAllowed('https://evil.org/vn/a.js', embed, self));
 console.log('frida-compat embed guard ok');
+// H-codes: the Textractor subset, and the script scriptFor() writes for one, run against fake Frida globals
+const H = F.test.parseHcode;
+assert.deepEqual(H('/HS8@6E300:PJADVJP.bin'), { type: 'S', string: true, full: false, noContext: false, encoding: 'shift_jis', padding: 0,
+    offset: 8, deref: null, split: null, splitDeref: null, address: 0x6e300, module: 'PJADVJP.bin', func: null });
+assert.deepEqual([H('/HW-4*14@1137D0:')].map((h) => [h.offset, h.deref, h.module, h.encoding]), [[-4, 0x14, '', 'utf-16le']]);
+const q = H('HQFN-1C:-8*4@10:kernel32.dll:lstrlenW');
+assert.deepEqual([q.full, q.noContext, q.offset, q.split, q.splitDeref, q.module, q.func], [true, true, -0x1c, -8, 4, 'kernel32.dll', 'lstrlenW']);
+assert.deepEqual([H('/HB65001#10+4@1').padding, H('/HB65001#10+4@1').encoding, H('/HA4@401000').module], [0x10, 'utf-8', null]);
+for (const [bad, why] of [['/RS@1', /read codes/], ['/HM4@1', /type "M"/], ['/HS4@', /@address/], ['/HS-3@1', /registers/],
+    ['/HS936#4@1', /codepage 936/], ['/HS4<8@1', /null_length/], ['4@1', /expected \/H/], ['/HSx@1', /data offset/]])
+    assert.throws(() => H(bad), why, bad);
+assert.throws(() => F.loadHcode('/HM4@1'), /type "M"/);
+const id = F.loadHcode('/HS4@2000:'); // not attached: kept until the game process is
+assert.equal(id, 'hcode:1');
+const script = F.scriptFor(id);
+assert.ok(!/require\(/.test(script), 'no require()');
+let hooked = null;
+const fake = {
+    Interceptor: { attach: (at, fn) => { hooked = { at, fn }; } }, ptr,
+    Process: { enumerateModules: () => [{ name: 'game.exe', base: ptr(0x1000) }], findModuleByAddress: () => null },
+    Module: {}, trans,
+};
+new Function(...Object.keys(fake), script)(...Object.values(fake));
+assert.equal(hooked.at.toString(), '0x3000');
+mem.set([0x00, 0x01, 0, 0], 0x504); // [esp + 4] = 0x100, the Shift-JIS string above
+hooked.fn.call({ context: { esp: ptr(0x500) }, returnAddress: ptr(0x1234) });
+hooked.fn.call({ context: { esp: ptr(0x500) }, returnAddress: ptr(0x1234) }); // a redraw: dropped
+await new Promise((r) => setTimeout(r, 500));
+assert.deepEqual(lines.slice(1), ['日本^n']);
+assert.equal(F.unload(id), true);
+assert.equal(F.version, 1);
+console.log('frida-compat H-code ok');
