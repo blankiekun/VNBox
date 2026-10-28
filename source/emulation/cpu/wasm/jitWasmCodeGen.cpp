@@ -14204,6 +14204,7 @@ void JitWasmCodeGen::findDirectLoopCandidates() {
             continue;
         }
         bool cacheable = supportsFpuLoopCache();
+        bool touchesX87 = false;
         S32 stackChange = 0;
         for (const auto& entry : blockInstructions) {
             if (entry.eip < loop.targetEip) continue;
@@ -14212,6 +14213,7 @@ void JitWasmCodeGen::findDirectLoopCandidates() {
             loop.opCount++;
             loop.keepsRegisters &= accumulateLoopRegisters(cur, loop.registers);
             loop.touchesFpu |= cur->isFpuOp() || cur->isMmxOp();
+            touchesX87 |= cur->isFpuOp();
             cacheable &= canKeepFpuCache(cur);
             if (canCacheFpuOp(cur)) stackChange += cachedFpuStackChange(cur);
             loop.dynamicFpuValidity |= cur->inst == FILD_QWORD_INTEGER ||
@@ -14238,9 +14240,11 @@ void JitWasmCodeGen::findDirectLoopCandidates() {
         }
         loop.dynamicFpuValidity |= (stackChange & 7) != 0;
         // Forward edges can use nested Wasm blocks within this loop. Keep
-        // x87/MMX loops on their existing path: joining their cached stack
+        // x87 loops on their existing path: joining their cached stack
         // mappings requires more than invalidating the GP/XMM local caches.
-        if (!loop.touchesFpu) {
+        // MMX ops end any x87 cache region first, and WasmEmitter::mmxCached
+        // merges the MMX locals at each join.
+        if (!touchesX87) {
             for (const auto& branch : forwardBranches) {
                 if (branch.sourceEip >= loop.targetEip && branch.targetEip <= loop.sourceEip) {
                     loop.forwardTargets.push_back({branch.targetEip, 0});
@@ -14291,10 +14295,10 @@ void JitWasmCodeGen::prepareForwardRegisterRegion() {
 
 void JitWasmCodeGen::findForwardTargets() {
     m_forwardTargets.clear();
-    // General joins initially support integer/SSE blocks only. Cached x87
-    // stack mappings need separate reconciliation on every incoming path.
+    // General joins support integer/SSE/MMX blocks. Cached x87 stack
+    // mappings need separate reconciliation on every incoming path.
     for (const auto& entry : blockInstructions) {
-        if (entry.op->isFpuOp() || entry.op->isMmxOp()) return;
+        if (entry.op->isFpuOp()) return;
     }
     for (const auto& branch : forwardBranches) {
         bool insideLoop = false;

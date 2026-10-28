@@ -707,6 +707,26 @@ void testMmxRegisterCacheSequences() {
         failed("mmx cache in a loop");
     }
 
+    // A loop whose body skips the MMX work for some elements: a join inside the loop.
+    initMmx();
+    const U32 vals[4] = {0x11223344, 0, 0x01020304, 0};
+    for (U32 i = 0; i < 4; ++i) memory->writed(TEST_HEAP_ADDRESS + MEM_SRC + 4 * i, vals[i]);
+    cpu->reg[R_CX].u32 = 4;
+    cpu->reg[R_SI].u32 = MEM_SRC;
+    pushCode8(0x0f); pushCode8(0x6e); pushCode8(0x16); // L: movd mm2,[esi]
+    pushCode8(0x0f); pushCode8(0x7e); pushCode8(0xd0); // movd eax,mm2
+    pushCode8(0x85); pushCode8(0xc0); // test eax,eax
+    pushCode8(0x74); pushCode8(0x03); // jz skip
+    emitMmxRegReg(0xfc, 1, 2); // paddb mm1,mm2
+    pushCode8(0x83); pushCode8(0xc6); pushCode8(0x04); // skip: add esi,4
+    pushCode8(0x49); // dec ecx
+    pushCode8(0x75); pushCode8(0xed); // jnz L
+    runTestCPU();
+    if (cpu->fpu.getMMX(1)->q != paddBytes(paddBytes(A, vals[0]), vals[2]) || cpu->fpu.getMMX(2)->q != 0 ||
+            cpu->reg[R_CX].u32 != 0) {
+        failed("mmx cache in a loop with a skip");
+    }
+
 #ifdef BOXEDWINE_WASM_JIT
     // Which cached MMX locals stay valid across the emitter's control flow.
     WasmEmitter e;
