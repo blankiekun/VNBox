@@ -64,7 +64,8 @@
         // (vn/wine/wineboot-import-jp-fonts.patch), so the preset runs nothing: "cmd /c reg import"
         // before every game cost about 2 s.
         REGISTRY_PRESETS.jpfonts = [];
-        // wine-override=[name,...] adds these to WINEDLLOVERRIDES
+        // wine-override=[name,...] adds these to WINEDLLOVERRIDES; an item dll=n, dll=b or dll=
+        // (native, builtin, disabled) is added as written
         let WINE_OVERRIDE_PRESETS = {
             nomono: "mscoree,mshtml=" // skip the Wine Mono and Gecko installs
         };
@@ -180,7 +181,9 @@
             Config.Program = getExecutable(); //MANUAL:"CHOMP.EXE";
             Config.ProgramArgs = getProgramArgs();
             Config.registryCommands = getRegistryCommands();
-            Config.dllOverrides = getPresets("wine-override", WINE_OVERRIDE_PRESETS).join(";");
+            Config.dllOverrides = getPresets("wine-override", WINE_OVERRIDE_PRESETS, /^[a-z0-9_.\-]+=[nb]?$/).join(";");
+            Config.wineEnv = getWineEnv();
+            Config.virtualDesktop = getVirtualDesktop();
             Config.WorkingDir = getWorkingDir();
             Config.PlayScript = getPlayScript();
             Config.runLinux = getRunLinux();
@@ -579,8 +582,9 @@
             }
             return result;
         }
-        // param=[name,...] -> the values of the named presets, in order
-        function getPresets(param, presets) {
+        // param=[name,...] -> the values of the named presets, in order; items matching `raw`
+        // are taken as written
+        function getPresets(param, presets, raw) {
             var list = getParameter(param);
             if (!allowParameterOverride() || list === "") {
                 return [];
@@ -593,6 +597,11 @@
             list.split(/[,;]/).forEach(function(item) {
                 let name = item.trim().toLowerCase();
                 if (name.length == 0) {
+                    return;
+                }
+                if (raw && raw.test(name)) {
+                    console.log("setting " + param + " to: " + name);
+                    values.push(name);
                     return;
                 }
                 if (!Object.prototype.hasOwnProperty.call(presets, name)) {
@@ -611,7 +620,71 @@
                     commands.push(splitCommandLine(command));
                 });
             });
+            return commands.concat(getRegistryValues());
+        }
+        // reg=<encoded lines of KEY<tab>NAME<tab>TYPE<tab>VALUE> sets these values with reg add,
+        // after the registry= presets. Only under HKCU\Software or HKLM\Software, REG_SZ or
+        // REG_DWORD, and nothing cmd would read as an operator or a variable: the commands run in
+        // a cmd /c chain. An empty NAME sets the key's default value. Values stay in the prefix.
+        function getRegistryValues() {
+            let list = getParameter("reg");
+            if (!allowParameterOverride() || list === "") {
+                return [];
+            }
+            let commands = [];
+            decodeUrlValue(list).split("\n").slice(0, 64).forEach(function(line) {
+                let fields = line.replace(/\r$/, "").split("\t");
+                if (line.trim().length == 0) {
+                    return;
+                }
+                let key = fields[0], name = fields[1], type = (fields[2] || "").toUpperCase(), value = fields[3];
+                let ok = fields.length == 4
+                    && /^(HKCU|HKLM|HKEY_CURRENT_USER|HKEY_LOCAL_MACHINE)\\Software(\\[^\\]+)*$/i.test(key)
+                    && fields.every(function(field) { return field.length <= 260 && !/["&|<>^%\x00-\x1f]/.test(field); })
+                    && (type == "REG_SZ" || (type == "REG_DWORD" && /^(0x[0-9a-f]{1,8}|[0-9]{1,10})$/i.test(value)));
+                if (!ok) {
+                    console.log("skipping registry value: " + line);
+                    return;
+                }
+                console.log("setting registry value: " + key + " " + name + " " + type + " " + value);
+                commands.push(["reg", "add", key].concat(name.length > 0 ? ["/v", name] : ["/ve"], ["/t", type, "/d", value, "/f"]));
+            });
             return commands;
+        }
+        // wine-env=<encoded lines of NAME=value> passes each to Wine as an environment variable.
+        // WINEDLLOVERRIDES goes through wine-override (or env), so it stays a single entry.
+        function getWineEnv() {
+            let list = getParameter("wine-env");
+            if (!allowParameterOverride() || list === "") {
+                return [];
+            }
+            let values = [];
+            decodeUrlValue(list).split("\n").slice(0, 32).forEach(function(line) {
+                line = line.replace(/\r$/, "");
+                let name = line.substring(0, line.indexOf("="));
+                if (line.trim().length == 0) {
+                    return;
+                }
+                if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name) || name.toUpperCase() == "WINEDLLOVERRIDES"
+                    || line.length > 1024 || /[\x00-\x1f]/.test(line)) {
+                    console.log("skipping wine-env entry: " + line);
+                    return;
+                }
+                console.log("setting wine-env " + line);
+                values.push(line);
+            });
+            return values;
+        }
+        // desktop=WIDTHxHEIGHT runs the program in a Wine virtual desktop of that size
+        // (explorer /desktop=vnbox,WxH), for games that change the screen mode. Not kept in the
+        // Wine prefix, unlike the registry setting winecfg writes.
+        function getVirtualDesktop() {
+            let size = getParameter("desktop");
+            if (!allowParameterOverride() || !/^[0-9]{3,4}x[0-9]{3,4}$/.test(size)) {
+                return "";
+            }
+            console.log("setting virtual desktop to: " + size);
+            return size;
         }
         function getWorkingDir() {
             var workingDir = getParameter("w");
@@ -1991,6 +2064,10 @@
                 params.push("-env");
                 params.push("WINEDLLOVERRIDES=" + dllOverrides);
             }
+            Config.wineEnv.forEach(function(value) {
+                params.push("-env");
+                params.push(value);
+            });
 
 			if (!Config.loadDesktop) {
             	if(Config.WorkingDir.length > 0){
@@ -2030,6 +2107,10 @@
                     }
                 }
                 if(Config.Program.length > 0 && !Config.loadDesktop){
+                    if (Config.virtualDesktop.length > 0) {
+                        params.push("explorer");
+                        params.push("/desktop=vnbox," + Config.virtualDesktop);
+                    }
                     if (Config.Program.endsWith('.bat')) {
                         params.push("cmd");
                         params.push("/c");

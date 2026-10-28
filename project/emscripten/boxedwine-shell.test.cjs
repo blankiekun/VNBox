@@ -24,6 +24,8 @@ function launcher(url) {
             },
         },
         console: { log() {}, error() {}, warn() {} },
+        URLSearchParams,
+        location: { search: new URL(url).search },
         IDBFS: {},
         FS: {
             mkdirTree(directory) { directories.push(directory); },
@@ -118,6 +120,8 @@ function dialogShell(tree, url = 'http://localhost/') {
             body: { appendChild() {}, removeChild() {} },
         },
         console: { log() {}, error() {}, warn() {} },
+        URLSearchParams,
+        location: { search: new URL(url).search },
         TextEncoder, TextDecoder, Blob, Response, CompressionStream, DecompressionStream,
         IDBFS: {},
         FS: {
@@ -599,13 +603,13 @@ test('memory and regression launches do not mount persistent storage', () => {
 });
 
 const gdiCommands = [
-    'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'DirectDrawRenderer', '/t', 'REG_SZ', '/d', 'gdi', '/f', '&&',
-    'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'renderer', '/t', 'REG_SZ', '/d', 'gdi', '/f', '&&',
+    'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'DirectDrawRenderer', '/t', 'REG_SZ', '/d', 'gdi', '/f', '&',
+    'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'renderer', '/t', 'REG_SZ', '/d', 'gdi', '/f', '&',
 ];
 
 test('registry presets launch the same command as hand-written reg add args', () => {
     const preset = launcher('http://localhost/?app=PERF_W95.EXE.zip&p=PERF_W95.EXE&bpp=8&resolution=640x480&registry=[gdi]');
-    const manual = launcher('http://localhost/?app=PERF_W95.EXE.zip&p=cmd&bpp=8&resolution=640x480&args=/c%20reg%20add%20%22HKCU%5CSoftware%5CWine%5CDirect3D%22%20/v%20DirectDrawRenderer%20/t%20REG_SZ%20/d%20gdi%20/f%20%26%26%20reg%20add%20%22HKCU%5CSoftware%5CWine%5CDirect3D%22%20/v%20renderer%20/t%20REG_SZ%20/d%20gdi%20/f%20%26%26%20%22PERF_W95.EXE%22');
+    const manual = launcher('http://localhost/?app=PERF_W95.EXE.zip&p=cmd&bpp=8&resolution=640x480&args=/c%20reg%20add%20%22HKCU%5CSoftware%5CWine%5CDirect3D%22%20/v%20DirectDrawRenderer%20/t%20REG_SZ%20/d%20gdi%20/f%20%26%20reg%20add%20%22HKCU%5CSoftware%5CWine%5CDirect3D%22%20/v%20renderer%20/t%20REG_SZ%20/d%20gdi%20/f%20%26%20%22PERF_W95.EXE%22');
     assert.deepEqual(preset.params, manual.params);
 });
 
@@ -617,7 +621,7 @@ test('registry presets stack in order and skip unknown names', () => {
     const expected = [
         'cmd', '/c',
         ...gdiCommands,
-        'reg', 'add', 'HKCU\\Software\\Wine', '/v', 'Version', '/t', 'REG_SZ', '/d', 'win98', '/f', '&&',
+        'reg', 'add', 'HKCU\\Software\\Wine', '/v', 'Version', '/t', 'REG_SZ', '/d', 'win98', '/f', '&',
         'GAME.EXE', '-x',
     ];
     assert.deepEqual(wine('http://localhost/?app=game&p=GAME.EXE&args=-x&registry=[gdi,win98]'), expected);
@@ -630,7 +634,7 @@ test('registry version presets set the Windows version Wine reports', () => {
     for (const version of ['win95', 'win98', 'winme', 'win2k', 'winxp', 'win7', 'win10']) {
         const { params } = launcher('http://localhost/?app=game&p=GAME.EXE&registry=' + version);
         assert.deepEqual(params.slice(params.indexOf('/bin/wine') + 1), [
-            'cmd', '/c', 'reg', 'add', 'HKCU\\Software\\Wine', '/v', 'Version', '/t', 'REG_SZ', '/d', version, '/f', '&&', 'GAME.EXE',
+            'cmd', '/c', 'reg', 'add', 'HKCU\\Software\\Wine', '/v', 'Version', '/t', 'REG_SZ', '/d', version, '/f', '&', 'GAME.EXE',
         ]);
     }
     const { params } = launcher('http://localhost/?app=game&p=GAME.EXE&registry=cdrom');
@@ -644,27 +648,27 @@ test('registry renderer and mouse warp presets match the native UI settings', ()
     };
     assert.deepEqual(wine('registry=gl'), [
         'cmd', '/c',
-        'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'DirectDrawRenderer', '/t', 'REG_SZ', '/d', 'opengl', '/f', '&&',
-        'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'renderer', '/t', 'REG_SZ', '/d', 'gl', '/f', '&&',
+        'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'DirectDrawRenderer', '/t', 'REG_SZ', '/d', 'opengl', '/f', '&',
+        'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'renderer', '/t', 'REG_SZ', '/d', 'gl', '/f', '&',
         'GAME.EXE',
     ]);
     for (const mode of ['enable', 'disable', 'force']) {
         assert.deepEqual(wine('registry=mousewarp-' + mode), [
-            'cmd', '/c', 'reg', 'add', 'HKCU\\Software\\Wine\\DirectInput', '/v', 'MouseWarpOverride', '/t', 'REG_SZ', '/d', mode, '/f', '&&',
+            'cmd', '/c', 'reg', 'add', 'HKCU\\Software\\Wine\\DirectInput', '/v', 'MouseWarpOverride', '/t', 'REG_SZ', '/d', mode, '/f', '&',
             'GAME.EXE',
         ]);
     }
     assert.deepEqual(wine('registry=[MouseWarp-Disable;gdi]'), [
-        'cmd', '/c', 'reg', 'add', 'HKCU\\Software\\Wine\\DirectInput', '/v', 'MouseWarpOverride', '/t', 'REG_SZ', '/d', 'disable', '/f', '&&',
+        'cmd', '/c', 'reg', 'add', 'HKCU\\Software\\Wine\\DirectInput', '/v', 'MouseWarpOverride', '/t', 'REG_SZ', '/d', 'disable', '/f', '&',
         ...gdiCommands, 'GAME.EXE',
     ]);
 });
 
 test('registry presets run before a hand-written cmd /c chain', () => {
-    const { params } = launcher('http://localhost/?app=game&p=cmd&args=/c%20reg%20add%20X%20%26%26%20GAME.EXE&registry=[gdi]');
+    const { params } = launcher('http://localhost/?app=game&p=cmd&args=/c%20reg%20add%20X%20%26%20GAME.EXE&registry=[gdi]');
     assert.deepEqual(params.slice(params.indexOf('/bin/wine') + 1), [
         'cmd', '/c', ...gdiCommands,
-        'cmd', '/c', 'reg', 'add', 'X', '&&', 'GAME.EXE',
+        'cmd', '/c', 'reg', 'add', 'X', '&', 'GAME.EXE',
     ]);
 });
 
@@ -678,7 +682,7 @@ test('preset params only run allow-listed values', () => {
         assert.deepEqual(tail('registry=' + name + '&wine-override=' + name), plain);
     }
     // operators, quotes and newlines stay inside an unknown name instead of reaching cmd
-    for (const hostile of ['gdi%20%26%26%20calc', 'gdi%22%20%26%20calc', 'gdi%0Acalc', 'gdi%7Ccalc', '%22gdi%22']) {
+    for (const hostile of ['gdi%20%26%20calc', 'gdi%22%20%26%20calc', 'gdi%0Acalc', 'gdi%7Ccalc', '%22gdi%22']) {
         assert.deepEqual(tail('registry=' + hostile + '&wine-override=' + hostile), plain);
     }
 });
@@ -707,6 +711,50 @@ test('wine-override presets pass a single WINEDLLOVERRIDES', () => {
         ['WINEDEBUG=-all', 'WINEDLLOVERRIDES=mscoree,mshtml=']);
 });
 
+test('wine-override takes dll=n, dll=b and dll= as written, wine-env several variables', () => {
+    const env = (query) => {
+        const { params } = launcher('http://localhost/?app=game&p=GAME.EXE&' + query);
+        return params.filter((_, i) => params[i - 1] === '-env');
+    };
+    assert.deepEqual(env('wine-override=[nomono,quartz%3D,D3D9=n,ddraw=b,evil=x,a%26b=n]'),
+        ['WINEDLLOVERRIDES=mscoree,mshtml=;quartz=;d3d9=n;ddraw=b']);
+    assert.deepEqual(env('env=%22LC_ALL:ja_JP.UTF-8%22&wine-env=' + encodeURIComponent('WINEDEBUG=-all\nA_B=x y=z\n\nWINEDLLOVERRIDES=d=n\n1X=a\nC=a\u0007b')),
+        ['LC_ALL=ja_JP.UTF-8', 'WINEDEBUG=-all', 'A_B=x y=z']);
+});
+
+test('reg= sets listed values under Software only, with nothing cmd would read', () => {
+    const wine = (lines) => {
+        const { params } = launcher('http://localhost/?app=game&p=GAME.EXE&registry=win98&reg=' + encodeURIComponent(lines.join('\n')));
+        return params.slice(params.indexOf('/bin/wine') + 1);
+    };
+    assert.deepEqual(wine([
+        'HKCU\\Software\\Wine\\Direct3D\tVideoMemorySize\tREG_SZ\t512',
+        'HKLM\\Software\\Some Maker\\Game\t\treg_dword\t0x10',
+        'HKCU\\Software\\X\tbad\tREG_DWORD\tten',
+        'HKCU\\System\\X\tv\tREG_SZ\t1',
+        'HKCU\\Software\\X\tv\tREG_BINARY\t00',
+        'HKCU\\Software\\X\tv\tREG_SZ\t1 & calc',
+        'HKCU\\Software\\X\tv\tREG_SZ\t%PATH%',
+        'HKCU\\Software\\X\tv"\tREG_SZ\t1',
+        'HKCU\\Software\\X\tv\tREG_SZ',
+    ]), [
+        'cmd', '/c',
+        'reg', 'add', 'HKCU\\Software\\Wine', '/v', 'Version', '/t', 'REG_SZ', '/d', 'win98', '/f', '&',
+        'reg', 'add', 'HKCU\\Software\\Wine\\Direct3D', '/v', 'VideoMemorySize', '/t', 'REG_SZ', '/d', '512', '/f', '&',
+        'reg', 'add', 'HKLM\\Software\\Some Maker\\Game', '/ve', '/t', 'REG_DWORD', '/d', '0x10', '/f', '&',
+        'GAME.EXE',
+    ]);
+});
+
+test('desktop= runs the program in a Wine virtual desktop', () => {
+    const wine = (query) => {
+        const { params } = launcher('http://localhost/?app=game&p=GAME.EXE&' + query);
+        return params.slice(params.indexOf('/bin/wine') + 1);
+    };
+    assert.deepEqual(wine('desktop=1024x768'), ['explorer', '/desktop=vnbox,1024x768', 'GAME.EXE']);
+    assert.deepEqual(wine('desktop=1024x768,x'), ['GAME.EXE']);
+});
+
 test('desktop launches without archives retain the existing storage', () => {
     const desktop = launcher('http://localhost/?root=TinyCore15Wine11.0');
     assert.equal(desktop.root, '/root');
@@ -722,6 +770,8 @@ async function loadDisc(url, served) {
         window: { location: { href: url }, addEventListener() {} },
         document: { addEventListener() {}, getElementById() { return { style: {}, value: '', addEventListener() {}, getContext() {}, contains() { return false; } }; } },
         console: { log() {}, error() {}, warn() {} },
+        URLSearchParams,
+        location: { search: new URL(url).search },
         TextDecoder,
         FS: {
             stat(file) { if (!files.has(file)) { throw new Error('ENOENT'); } return {}; },
