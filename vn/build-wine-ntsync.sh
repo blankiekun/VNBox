@@ -20,10 +20,16 @@ hdr_sha=006437ee52a3e04f921df77081eb5c21c44c71f598b10ac534c6ef9e78296262
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-curl -sSfL -o "$work/wine.tar.xz" "$url"
-echo "$sha  $work/wine.tar.xz" | sha256sum -c --quiet
+# One download for both wine builds: dl.winehq.org answers a second fetch within a minute with 429.
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/vnbox/wine-11.0.tar.xz
+if ! echo "$sha  $cache" | sha256sum -c --quiet 2>/dev/null; then
+  mkdir -p "$(dirname "$cache")"
+  curl -sSfL --retry 5 -o "$cache" "$url"
+  echo "$sha  $cache" | sha256sum -c --quiet
+fi
+cp "$cache" "$work/wine.tar.xz"
 if [ "${NTSYNC:-1}" != 0 ]; then
-  curl -sSfL -o "$work/ntsync.h" "$hdr_url"
+  curl -sSfL --retry 5 -o "$work/ntsync.h" "$hdr_url"
   echo "$hdr_sha  $work/ntsync.h" | sha256sum -c --quiet
 fi
 mkdir -p "$work/patches"
