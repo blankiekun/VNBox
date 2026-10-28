@@ -391,8 +391,18 @@ static std::vector<HostHook> hostHooks;
 static std::vector<HostHook> hostHookChanges; // added or removed, code at eip not yet invalidated
 static std::vector<std::pair<U32, U32>> hostHookPrefetch; // [address, size) to load before attach
 static U32 nextHostHookId = 1;
+#ifdef BOXEDWINE_MULTI_THREADED
+// Guest threads run in pthreads and the layer's JS on the page's main thread (calls proxied
+// there, the guest thread waits): hooksMutex guards the lists above, never held across a
+// proxied call; hitMutex lets one hooked thread at a time into JS.
+static std::mutex hooksMutex, hitMutex;
+#define HOST_HOOKS_LOCK std::lock_guard<std::mutex> hostHooksLock(hooksMutex)
+#else
+#define HOST_HOOKS_LOCK
+#endif
 
 static bool findHostHook(U32 pid, U32 eip, U32* id) {
+    HOST_HOOKS_LOCK;
     for (const HostHook& h : hostHooks) {
         if (h.eip == eip && h.pid == pid) {
             if (id) *id = h.id;
@@ -418,7 +428,11 @@ static const U8* hostHookPage(KMemory* memory, U32 page) {
     return mmu.canReadRam ? ramPageGet((RamPage)mmu.ramIndex) : nullptr;
 }
 
+#ifdef BOXEDWINE_MULTI_THREADED
+static CPU* hookCpu; // the CPU that hit the hook, while JS runs (read on the main thread)
+#else
 static thread_local CPU* hookCpu; // the CPU that hit the hook, while JS runs
+#endif
 
 // Copies the readable prefix of guest [addr, addr + len) into buf, returns its length.
 extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_read(U32 pid, U32 addr, U8* buf, U32 len) {
@@ -482,6 +496,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void bw_set_reg(U32 i, U32 value) {
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_hook_add(U32 pid, U32 eip) {
+    HOST_HOOKS_LOCK;
     HostHook h = { nextHostHookId++, pid, eip };
     hostHooks.push_back(h);
     hostHookChanges.push_back(h);
@@ -489,6 +504,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_hook_add(U32 pid, U32 eip) {
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void bw_hook_remove(U32 id) {
+    HOST_HOOKS_LOCK;
     for (auto it = hostHooks.begin(); it != hostHooks.end(); ++it) {
         if (it->id == id) {
             hostHookChanges.push_back(*it);
@@ -500,10 +516,27 @@ extern "C" EMSCRIPTEN_KEEPALIVE void bw_hook_remove(U32 id) {
 
 // Asks for the file pages in [addr, addr + size) to be loaded before the next poll or attach.
 extern "C" EMSCRIPTEN_KEEPALIVE void bw_prefetch(U32 addr, U32 size) {
+    HOST_HOOKS_LOCK;
     hostHookPrefetch.push_back({ addr, size });
 }
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED)
+// The page's window.boxedwineFrida lives on the main thread: same calls, proxied there.
+static int boxedwine_frida_poll(U32 pid, U32 tid, U32 teb) {
+    return MAIN_THREAD_EM_ASM_INT({
+        var f = globalThis.boxedwineFrida;
+        if (!f) return 0;
+        if (!f.api) f.api = {read: _bw_read, scan: _bw_scan, reg: _bw_reg, setReg: _bw_set_reg, hookAdd: _bw_hook_add, hookRemove: _bw_hook_remove, prefetch: _bw_prefetch, malloc: _malloc, free: _free, heap: function() { return HEAPU8; }};
+        return f.poll($0, $1, $2);
+    }, pid, tid, teb);
+}
+static void boxedwine_frida_attach(U32 pid, U32 tid, U32 teb) {
+    MAIN_THREAD_EM_ASM({ globalThis.boxedwineFrida.attach($0, $1, $2); }, pid, tid, teb);
+}
+static void boxedwine_frida_hit(U32 id, U32 pid, U32 tid) {
+    MAIN_THREAD_EM_ASM({ globalThis.boxedwineFrida.hit($0, $1, $2); }, id, pid, tid);
+}
+#elif defined(__EMSCRIPTEN__)
 // window.boxedwineFrida (frida-compat.js) gets the exports on its first poll.
 // 0: nothing to do, 1: load the prefetch ranges then attach, 2: load them then poll again.
 EM_JS(int, boxedwine_frida_poll, (U32 pid, U32 tid, U32 teb), {
@@ -525,6 +558,8 @@ EM_JS(void, boxedwine_frida_hit, (U32 id, U32 pid, U32 tid), {
 void hostHookSyscall(KThread* thread) {
 #ifdef __EMSCRIPTEN__
     U32 pid = thread->process->id;
+    {
+    HOST_HOOKS_LOCK;
     for (size_t i = 0; i < hostHookChanges.size();) {
         if (hostHookChanges[i].pid == pid) {
             thread->memory->removeCode(thread, hostHookChanges[i].eip, 1, false);
@@ -533,12 +568,18 @@ void hostHookSyscall(KThread* thread) {
             i++;
         }
     }
+    }
     static U32 count;
     if (++count % 1024) return;
     U32 teb = thread->cpu->seg[FS].address;
     for (int round = 0; round < 4; round++) {
         int r = boxedwine_frida_poll(pid, thread->id, teb);
-        for (auto& range : hostHookPrefetch) {
+        std::vector<std::pair<U32, U32>> prefetch;
+        {
+            HOST_HOOKS_LOCK;
+            prefetch.swap(hostHookPrefetch);
+        }
+        for (auto& range : prefetch) {
             U32 first = range.first >> K_PAGE_SHIFT;
             U32 last = (U32)(std::min((U64)range.first + range.second, (U64)0x100000000ull) - 1) >> K_PAGE_SHIFT;
             for (U32 page = first; range.second && page <= last && page < K_NUMBER_OF_PAGES; page++) {
@@ -548,7 +589,6 @@ void hostHookSyscall(KThread* thread) {
                 }
             }
         }
-        hostHookPrefetch.clear();
         if (r == 1) {
             boxedwine_frida_attach(pid, thread->id, teb);
             hostHookSyscall(thread); // invalidate what the script hooked
@@ -562,6 +602,9 @@ static void OPCALL hostHookOp(CPU* cpu, DecodedOp* op) {
     U32 id;
     if (findHostHook(cpu->thread->process->id, cpu->seg[CS].address + cpu->eip.u32, &id)) {
 #ifdef __EMSCRIPTEN__
+#ifdef BOXEDWINE_MULTI_THREADED
+        std::lock_guard<std::mutex> hitLock(hitMutex);
+#endif
         hookCpu = cpu;
         boxedwine_frida_hit(id, cpu->thread->process->id, cpu->thread->id);
         hookCpu = nullptr;

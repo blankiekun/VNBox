@@ -21,6 +21,8 @@
 var LAZY_BLOCK = 1 << 16;
 var LAZY_READAHEAD = 4 * LAZY_BLOCK; // read past the requested range when reads are sequential
 var LAZY_RUN_MAX = 1 << 22; // longest single read (and the sab buffer)
+// lazyfs-worker.js sits next to this script, which a player page may load from another folder.
+var LAZY_WORKER_URL = new URL("lazyfs-worker.js", (typeof document !== "undefined" && document.currentScript && document.currentScript.src) || location.href).href;
 var LAZY_EAGER_MAX = 1 << 20;
 var LAZY_CACHE_BLOCKS = 64; // 4 MiB
 // win: the stats=1 window (jspi reads), set and taken by the [stats] line every ~2 s; null when stats are off.
@@ -339,7 +341,7 @@ async function mountLazyAppJspi(mountPoint, name, dirHandle) {
 function mountLazyAppSab(mountPoint, name, dirHandle) {
     var ctl = new Int32Array(new SharedArrayBuffer(32)); // [state 0 idle/1 asked/2 answered, file, offLo, offHi, len, result]
     var data = new Uint8Array(new SharedArrayBuffer(LAZY_RUN_MAX));
-    var worker = new Worker("lazyfs-worker.js");
+    var worker = new Worker(LAZY_WORKER_URL);
 
     function readRun(file, start, length) {
         var t = performance.now();
