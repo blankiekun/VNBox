@@ -15,8 +15,14 @@ sha=c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-curl -sSfL -o "$work/wine.tar.xz" "$url"
-echo "$sha  $work/wine.tar.xz" | sha256sum -c --quiet
+# One download for both wine builds: dl.winehq.org answers a second fetch within a minute with 429.
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/vnbox/wine-11.0.tar.xz
+if ! echo "$sha  $cache" | sha256sum -c --quiet 2>/dev/null; then
+  mkdir -p "$(dirname "$cache")"
+  curl -sSfL --retry 5 -o "$cache" "$url"
+  echo "$sha  $cache" | sha256sum -c --quiet
+fi
+cp "$cache" "$work/wine.tar.xz"
 cp "$here"/wine/*.patch "$work/"
 mkdir -p "$out"
 docker run --rm -v "$work:/w" -v "$out:/out" -e HOST_UID="$(id -u)" ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c bash -euo pipefail -c '
