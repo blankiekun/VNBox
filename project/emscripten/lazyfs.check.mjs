@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 globalThis.window = globalThis;
 const L = new Function(fs.readFileSync(new URL('./lazyfs.js', import.meta.url), 'utf8') +
-    '\nreturn { lazyCopy, lazyCache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX };')();
+    '\nreturn { lazyCopy, lazyCache, lazyFiles, lazyReadvAsync, lazyStats, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX };')();
 const B = L.LAZY_BLOCK, size = 10 * (1 << 20) + 123;
 const file = Uint8Array.from({ length: size }, (_, i) => (i * 7) & 255);
 const reads = [];
@@ -37,4 +37,16 @@ const pre = { lazySize: 10, lazyBytes: file.slice(0, 10) }; // read whole at mou
 const o = new Uint8Array(4);
 assert.equal(L.lazyCopy(pre, o, 0, 4, 8, null), 2);
 assert.deepEqual(o.subarray(0, 2), file.slice(8, 10));
+// jspi readv: a promise (a suspension) only on a miss, the count itself on cached blocks
+globalThis.HEAPU8 = new Uint8Array(1 << 16); globalThis.HEAPU32 = new Uint32Array(HEAPU8.buffer);
+L.lazyFiles[2] = new Blob([file.slice(0, 4 * B)]);
+const stream = { node: { lazyFile: 2, lazySize: 4 * B }, position: 0 };
+HEAPU32.set([1024, 100, 2048, 50]); // two iovecs
+const p = L.lazyReadvAsync(stream, 0, 2);
+assert.ok(p instanceof Promise);
+assert.equal(await p, 150);
+assert.equal(L.lazyReadvAsync(stream, 0, 2), 150);
+assert.equal(stream.position, 300);
+assert.deepEqual(HEAPU8.subarray(2048, 2098), file.slice(250, 300));
+assert.equal(L.lazyStats.suspends, 1);
 console.log('lazyfs self-check ok');
