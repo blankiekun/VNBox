@@ -15,11 +15,13 @@
 // libLoader.js, MIT). Not covered: memory writes, Memory.alloc, onLeave, Instruction,
 // NativeFunction, Stalker.
 //
-// Runtime hooks (contract version 1, boxedwineFrida.version): the game process is attached even
-// without frida=, so hooks can be added and removed while the game runs. Lines go to
+// Runtime hooks (contract version 1, boxedwineFrida.version): without frida=, the game process is
+// attached on the first load/loadHcode/search.start (about 2 s later), so hooks can be added and
+// removed while the game runs and a boot with no hooks does no extra work. Lines go to
 // window.boxedwineText(line, thread), thread = { id, label, kind: 'script' | 'hcode' | 'search',
 // address, module }; the frida= script's thread id is "script".
-//   load(source, name?) → id: runs a script now (no require()); throws on its error.
+//   load(source, name?) → id: runs a script now (no require()); throws on its error (before the first
+//     attach only a syntax error throws; the script runs at attach and a run-time error is reported).
 //   loadHcode(code) → id: one Textractor hook code. An H-code's first caller context is thread <id>,
 //     later ones <id>#2, #3, … (context = caller module+offset unless N, plus the split value).
 //   unload(id) / unloadAll() (also stops the search), keep(threadId) → id: keeps a search thread.
@@ -616,6 +618,7 @@
     const handles = new Map();
     let nextHandle = 1;
     function addHandle(h) {
+        loaded = loaded || !scriptUrl; // no frida=: start attaching now (lazy, see the header)
         h.thread = Object.assign({ handle: h.id, id: h.id }, h.thread);
         handles.set(h.id, h);
         if (attachedPid) runHandle(h);
@@ -717,6 +720,7 @@
         start() {
             if (searching) return;
             searching = true;
+            loaded = loaded || !scriptUrl;
             if (attachedPid) runSearch();
         },
         stop() {
@@ -818,10 +822,10 @@
     const params = typeof location === 'undefined' ? null : new URLSearchParams(location.search);
     const scriptUrl = params && params.get('frida') ? new URL(params.get('frida'), location.href).href : null;
     const exe = lower(params && (params.get('p') || '').split(/[\\/]/).pop());
-    // attachedPid: the game process (the exe's), attached with or without a boot script so hooks can be
-    // loaded at run time; a new process of the exe (the game restarted) gets every handle again.
+    // attachedPid: the game process (the exe's), attached once the boot script is fetched or, without one,
+    // once a hook is first loaded at run time; a new process of the exe (the game restarted) gets every handle again.
     // candidate: the process being prepared, otherPids: processes of other exes.
-    let loaded = !scriptUrl, attachedPid = 0, candidate = 0, phase = 0, seenAt = 0;
+    let loaded = false, attachedPid = 0, candidate = 0, phase = 0, seenAt = 0;
     const otherPids = new Set();
     if (scriptUrl) {
         fetchTree(scriptUrl).then(() => {
