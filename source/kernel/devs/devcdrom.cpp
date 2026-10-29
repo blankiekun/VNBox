@@ -460,12 +460,24 @@ std::shared_ptr<FsIso> getCdromForPath(const BString& path) {
 #ifdef __EMSCRIPTEN__
 extern "C" {
 
+#ifdef BOXEDWINE_JSPI
+static S32 queuedInsert = -1;
+#endif
+
 // Called by the browser page, which fetches each disc image only when it is inserted.
 // In multi-threaded builds this runs on the browser thread while guest threads use the
 // drive, so all changes go through gDrive.mutex and the FsNode locks.
+// JSPI builds return -1: inserting reads the image, and a lazy (opfs:) image read suspends,
+// which only boxedwine_tick may do, so the next tick inserts and calls boxedwineCDRomInserted(ok).
 EMSCRIPTEN_KEEPALIVE
 int boxedwineCDRomInsert(int index) {
-    return (index >= 0 && cdromInsert((U32)index)) ? 1 : 0;
+    if (index < 0) return 0;
+#ifdef BOXEDWINE_JSPI
+    queuedInsert = index;
+    return -1;
+#else
+    return cdromInsert((U32)index) ? 1 : 0;
+#endif
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -473,5 +485,19 @@ void boxedwineCDRomEject() {
     cdromEject();
 }
 
+}
+
+void cdromRunQueuedInsert() {
+#ifdef BOXEDWINE_JSPI
+    if (queuedInsert < 0) return;
+    S32 index = queuedInsert;
+    queuedInsert = -1;
+    int ok = cdromInsert((U32)index) ? 1 : 0;
+    EM_ASM({
+        if (typeof boxedwineCDRomInserted === "function") {
+            boxedwineCDRomInserted($0);
+        }
+    }, ok);
+#endif
 }
 #endif

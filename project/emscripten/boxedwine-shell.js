@@ -1067,14 +1067,23 @@
             cdromReady = true;
             updateCDRomControls();
         }
+        var cdromInsertDone = null;
+        // Called by boxedwine_tick after the insert it was queued for (JSPI builds)
+        function boxedwineCDRomInserted(inserted) {
+            let done = cdromInsertDone;
+            cdromInsertDone = null;
+            if (done) {
+                done(inserted);
+            }
+        }
         function insertCDRomDisc(index) {
             if (index < 0 || cdromLoading >= 0 || index >= Config.cdromISOFiles.length || typeof Module.ccall !== "function") {
                 updateCDRomControls(); // undo a list change that was not acted on
                 return;
             }
             let disc = Config.cdromISOFiles[index];
-            let finish = function() {
-                if (Module.ccall("boxedwineCDRomInsert", "number", ["number"], [index])) {
+            let finish = function(inserted) {
+                if (inserted) {
                     cdromCurrent = index;
                     // free the memory of the discs that are not in the drive
                     let keep = cdromDiscFiles[index] || [disc];
@@ -1101,7 +1110,14 @@
             cdromLoading = index;
             updateCDRomControls();
             console.log("Loading disc " + (index + 1) + ": " + disc);
-            loadCDRomDisc(index).then(finish).catch(function(error) {
+            loadCDRomDisc(index).then(function() {
+                let inserted = Module.ccall("boxedwineCDRomInsert", "number", ["number"], [index]);
+                if (inserted < 0) {
+                    cdromInsertDone = finish; // JSPI builds: the next boxedwine_tick inserts it
+                } else {
+                    finish(inserted);
+                }
+            }).catch(function(error) {
                 console.log("Unable to load disc " + (index + 1) + ": " + disc + " error: " + error);
                 cdromLoading = -1;
                 updateCDRomControls();

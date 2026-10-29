@@ -40,6 +40,7 @@ struct CdromState {
 CdromState cdromGetState(); // synchronized snapshot, including guest ejects
 void cdromEject();
 void cdromNextDisc(); // inserts the disc after the last one inserted, wrapping around
+void cdromRunQueuedInsert(); // JSPI builds: the page's insert, run by boxedwine_tick
 // the mounted ISO if path is on it, so statfs can report it as iso9660
 std::shared_ptr<FsIso> getCdromForPath(const BString& path);
 
