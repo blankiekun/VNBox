@@ -1,0 +1,73 @@
+diff --git a/dlls/wined3d/glsl_shader.c b/dlls/wined3d/glsl_shader.c
+index 084219f..42b8361 100644
+--- a/dlls/wined3d/glsl_shader.c
++++ b/dlls/wined3d/glsl_shader.c
+@@ -3939,8 +3939,9 @@ static void PRINTF_ATTR(9, 10) shader_glsl_gen_sample_code(const struct wined3d_
+     shader_glsl_swizzle_to_str(swizzle, FALSE, ins->dst[0].write_mask, dst_swizzle);
+ 
+     /* If ARB_texture_swizzle is supported we don't need to do anything here.
+-     * We actually rely on it for vertex shaders and SM4+. */
+-    if (version->type == WINED3D_SHADER_TYPE_PIXEL && version->major < 4)
++     * We actually rely on it for vertex shaders, and for SM4+ unless
++     * find_ps_compile_args() set fixups (WebGL has no texture swizzles). */
++    if (version->type == WINED3D_SHADER_TYPE_PIXEL && sampler_bind_idx < WINED3D_MAX_FRAGMENT_SAMPLERS)
+     {
+         const struct shader_glsl_ctx_priv *priv = ins->ctx->backend_data;
+         fixup = priv->cur_ps_args->color_fixup[sampler_bind_idx];
+@@ -7308,7 +7309,7 @@ static void shader_glsl_setup_sm4_shader_output(struct shader_glsl_priv *priv,
+         shader_glsl_write_mask_to_str(output->mask, reg_mask);
+ 
+         shader_addline(buffer,
+-                rasterizer_setup ? "%s.reg%u%s = outputs[%u]%s;\n" : "%s.reg[%u]%s = outputs[%u]%s;\n",
++                rasterizer_setup ? "%s%u%s = outputs[%u]%s;\n" : "%s[%u]%s = outputs[%u]%s;\n",
+                 output_variable_name, output->register_idx, reg_mask, output->register_idx, reg_mask);
+     }
+ }
+@@ -7402,7 +7403,9 @@ static void shader_glsl_setup_sm3_rasterizer_input(struct shader_glsl_priv *priv
+         shader_glsl_setup_vs3_output(priv, gl_info, map, input_signature, reg_maps_in,
+                 output_signature, reg_maps_out);
+     else
+-        shader_glsl_setup_sm4_shader_output(priv, input_count, output_signature, reg_maps_out, "shader_out", TRUE);
++        /* Without interface blocks (WebGL ES) the outputs are the ps_link[] array. */
++        shader_glsl_setup_sm4_shader_output(priv, input_count, output_signature, reg_maps_out,
++                shader_glsl_shader_output_name(gl_info), shader_glsl_use_interface_blocks(gl_info));
+ }
+ 
+ /* Context activation is done by the caller. */
+@@ -7840,7 +7843,7 @@ static void shader_glsl_generate_sm4_output_setup(struct shader_glsl_priv *priv,
+                 NULL, input_count, &shader->output_signature, &shader->reg_maps, FALSE);
+     else
+         shader_glsl_setup_sm4_shader_output(priv, input_count, &shader->output_signature,
+-                &shader->reg_maps, "shader_out", rasterizer_setup);
++                &shader->reg_maps, "shader_out.reg", rasterizer_setup);
+ 
+     if (rasterizer_setup)
+         shader_glsl_generate_partial_stream_output(buffer, shader, FALSE);
+@@ -8401,7 +8404,7 @@ static GLuint shader_glsl_generate_fragment_shader(const struct wined3d_context_
+     /* Pack 3.0 inputs */
+     if (reg_maps->shader_version.major >= 3)
+         shader_glsl_input_pack(shader, buffer, &shader->input_signature, reg_maps, args, gl_info,
+-                reg_maps->shader_version.major >= 4);
++                reg_maps->shader_version.major >= 4 && shader_glsl_use_interface_blocks(gl_info));
+ 
+     /* Base Shader Body */
+     if (FAILED(shader_generate_code(shader, buffer, reg_maps, &priv_ctx, NULL, NULL)))
+@@ -8569,7 +8572,8 @@ static GLuint shader_glsl_generate_vertex_shader(const struct wined3d_context_gl
+             declare_out_varying(gl_info, buffer, FALSE, "vec4 ffp_varying_texcoord[%u];\n", WINED3D_MAX_FFP_TEXTURES);
+             declare_out_varying(gl_info, buffer, FALSE, "float ffp_varying_fogcoord;\n");
+         }
+-        else if (shader_glsl_use_webgl_glsl_es(gl_info) && args->next_shader_input_count)
++        /* SM4 declares its outputs in shader_glsl_generate_sm4_output_setup(). */
++        else if (shader_glsl_use_webgl_glsl_es(gl_info) && version->major < 4 && args->next_shader_input_count)
+         {
+             shader_glsl_declare_shader_outputs(gl_info, buffer,
+                     args->next_shader_input_count, FALSE, args->interpolation_mode);
+@@ -8713,7 +8717,7 @@ static GLuint shader_glsl_generate_hull_shader(const struct wined3d_context_gl *
+         shader_addline(buffer, "void setup_hs_output(in vec4 outputs[%u])\n{\n",
+                 shader->limits->packed_output);
+         shader_glsl_setup_sm4_shader_output(priv, shader->limits->packed_output, &shader->output_signature,
+-                &shader->reg_maps, "shader_out[gl_InvocationID]", FALSE);
++                &shader->reg_maps, "shader_out[gl_InvocationID].reg", FALSE);
+         shader_addline(buffer, "}\n");
+     }
+ 
