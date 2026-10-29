@@ -602,7 +602,9 @@ bool doMainLoop() {
     return false;
 }
 #ifdef BOXEDWINE_JSPI
+void cdromRunQueuedInsert();
 extern "C" EMSCRIPTEN_KEEPALIVE int boxedwine_tick() {
+    cdromRunQueuedInsert();
     mainloop();
     return jspiTickDelay;
 }
