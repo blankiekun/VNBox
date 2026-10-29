@@ -30,7 +30,7 @@ struct VnboxStats {
 extern VnboxStats vnboxStats;
 
 // prof=1 in the page URL (emscripten): where guest JIT time goes. One compiled block entry in VNBOX_PROF_EVERY is timed
-// until the next entry and charged, scaled up, to that block (key: process id << 32 | block eip); the main loop prints
+// until the next entry (minus one clock read and any syscalls) and charged, scaled up, to that block (key: process id << 32 | block eip); the main loop prints
 // the top entries. Blocks don't tail-call each other while it is on, so every entry is seen.
 struct VnboxProfEntry {
     double ms = 0;

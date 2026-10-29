@@ -4088,6 +4088,17 @@ static void disableWasmJitBlockAfterSlotMiss(DecodedOp* op) {
 // The OpCallback installed as process->startJITOp for WASM-compiled blocks.
 // DecodedOp::pfnJitCode stores the wasmTable index (cast to void*).
 // ---------------------------------------------------------------------------
+#ifndef BOXEDWINE_MULTI_THREADED
+extern U64 sysCallTime;
+// prof=1: charges one sampled block entry, scaled by VNBOX_PROF_EVERY. A clock read (~0.15 us) costs about ten short
+// blocks and syscalls are not JIT time (stats=1 shows them), so both come off; small blocks can come out negative.
+static void vnboxProfCharge(unsigned long long key, double start, double clockCost, U64 sysStart, U32 instr) {
+    double ms = emscripten_get_now() - start - clockCost - (sysCallTime - sysStart) / 1000.0;
+    VnboxProfEntry& e = vnboxProfBlocks[key];
+    e.ms += ms * VNBOX_PROF_EVERY; e.instr += instr * VNBOX_PROF_EVERY; e.entries += VNBOX_PROF_EVERY;
+}
+#endif
+
 void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
 #ifdef BOXEDWINE_MULTI_THREADED
     U32 chainedBlocks = 0;
@@ -4195,7 +4206,8 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     U64 statsPadStart = vnboxStats.sysPadInstr; // syscalls made from compiled blocks add their time as instructions
     WASM_JIT_PROFILE_ONLY(bool loopProfileSample = wasmJitProfileLoopSample();)
     const bool eipProf = vnboxProfOn; // prof=1: time per block, see VnboxProfEntry
-    double eipProfT = 0;
+    double eipProfT = 0, eipProfCost = 0;
+    U64 eipProfSys = 0;
     unsigned long long eipProfKey = 0;
     U32 eipProfInstr = 0;
     while (op && op->pfnJitCode && chainedBlocks < WASM_JIT_CHAIN_BLOCK_LIMIT && !cpu->yield) {
@@ -4203,15 +4215,17 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
             // Times one block entry in VNBOX_PROF_EVERY (until the next entry) and scales it: timing every
             // entry slowed guests about 15x.
             if (eipProfKey) {
-                VnboxProfEntry& e = vnboxProfBlocks[eipProfKey];
-                e.ms += (emscripten_get_now() - eipProfT) * VNBOX_PROF_EVERY; e.instr += eipProfInstr * VNBOX_PROF_EVERY; e.entries += VNBOX_PROF_EVERY;
+                vnboxProfCharge(eipProfKey, eipProfT, eipProfCost, eipProfSys, eipProfInstr);
                 eipProfKey = 0;
             }
             vnboxProfTick = vnboxProfTick * 1103515245u + 12345u; // pseudo-random pick: a fixed stride aliases with loops
             if ((vnboxProfTick >> 16) % VNBOX_PROF_EVERY == 0) {
-                eipProfT = emscripten_get_now();
                 eipProfKey = ((unsigned long long)cpu->thread->process->id << 32) | cpu->getEipAddress();
                 eipProfInstr = op->blockOpCount;
+                eipProfSys = sysCallTime;
+                double t0 = emscripten_get_now();
+                eipProfT = emscripten_get_now();
+                eipProfCost = eipProfT - t0; // one clock read, measured here: the span below includes one too
             }
         }
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
@@ -4265,8 +4279,7 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     }
 #if !defined(BOXEDWINE_MULTI_THREADED)
     if (eipProf && eipProfKey) {
-        VnboxProfEntry& e = vnboxProfBlocks[eipProfKey];
-        e.ms += (emscripten_get_now() - eipProfT) * VNBOX_PROF_EVERY; e.instr += eipProfInstr * VNBOX_PROF_EVERY; e.entries += VNBOX_PROF_EVERY;
+        vnboxProfCharge(eipProfKey, eipProfT, eipProfCost, eipProfSys, eipProfInstr);
     }
     if (vnboxStats.on) {
         vnboxStats.jitEntries++;
