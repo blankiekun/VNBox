@@ -623,6 +623,9 @@ static const char* addedExt[] = {
     // WebGL supplies sample lists; our wrapper also supplies their length.
     // Wine's WGL dispatch requires this extension before exposing the query.
     "GL_ARB_internalformat_query",
+    // WebGL2 has uniform blocks; the reported GL 3.0 does not imply them, so
+    // Wine's WGL would hide glUniformBlockBinding and D3D10+ constant buffers.
+    "GL_ARB_uniform_buffer_object",
 #endif
     "WGL_ARB_create_context_Invalid"
 };
