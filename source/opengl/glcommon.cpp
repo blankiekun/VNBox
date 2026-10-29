@@ -2468,9 +2468,12 @@ static void callOpenGLCallback(CPU* cpu, U32 index) {
     if (vnboxStats.on) {
         double start = emscripten_get_now();
         int99Callback[index](cpu);
-        vnboxStats.glMs += emscripten_get_now() - start;
+        double ms = emscripten_get_now() - start;
+        vnboxStats.glMs += ms;
         vnboxStats.glCalls++;
         if (index == GetError) vnboxStats.glGetErrors++;
+        else if (index == GetBufferSubData || index == GetBufferSubDataARB) { vnboxStats.glReadbacks++; vnboxStats.glReadbackMs += ms; vnboxStats.glReadbackKB += ARG3 / 1024.0; }
+        else if (index == ReadPixels || index == GetTexImage) { vnboxStats.glReadPixels++; vnboxStats.glReadPixelsMs += ms; }
         return;
     }
 #endif

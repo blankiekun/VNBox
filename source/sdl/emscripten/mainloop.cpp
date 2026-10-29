@@ -348,7 +348,7 @@ static void statsTickStart() {
         statsJsPart(js, sizeof(js), sec);
         klog_fmt("[stats] %.1fs mips=%u guestBusy=%.0f%% ticks busy=%u idle=%u | timeoutWaits=%u late avg=%.1f max=%.1fms | msg/rAF waits=%u gap avg=%.1f max=%.1fms"
             " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f shown/s=%.1f skippedSame/s=%.1f busyDropped/s=%.1f"
-            " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f | input/s=%.1f motion/s=%.0f"
+            " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f readbacks/s=%.1f readbackMs/s=%.0f readbackKB/s=%.0f readPixels/s=%.1f readPixelsMs/s=%.0f | input/s=%.1f motion/s=%.0f"
             " | sys ms/s=%.0f user ms/s=%.0f | threads/s:%s | topSys: %s | jit instr=%.0f%% (interp %.0f%%) entries/s=%.0f blocksCompiled/s=%.0f"
             " | wineserver ms/s=%.0f req/s=%.0f | wineReq %s | signals/s=%.1f faults/s=%.1f | audio underruns/s=%.1f queuedMin=%.0fms | zipMiss/s=%.1f zipMs/s=%.0f%s",
             sec, statsLastMips, s.sliceMs / sec / 10.0, s.ticksBusy, s.ticksIdle,
@@ -357,7 +357,7 @@ static void statsTickStart() {
             s.timers, s.timers ? s.timerLateMs / s.timers : 0, s.timerLateMaxMs,
             s.presentsGl / sec, s.presentsGl ? s.presentGlMs / s.presentsGl : 0, s.draws / sec, s.draws ? s.drawMs / s.draws : 0,
             (s.presentsSw + s.presentsGl) / sec, s.skippedSame / sec, s.busyDropped / sec,
-            s.glCalls / sec, s.glGetErrors / sec, s.glMs / sec, s.inputs / sec, s.motions / sec,
+            s.glCalls / sec, s.glGetErrors / sec, s.glMs / sec, s.glReadbacks / sec, s.glReadbackMs / sec, s.glReadbackKB / sec, s.glReadPixels / sec, s.glReadPixelsMs / sec, s.inputs / sec, s.motions / sec,
             s.sysMs / sec, (s.sliceMs - s.sysMs) / sec, statsBusyThreads(s, sec).c_str(), statsTopSyscalls(s).c_str(),
             guestInstr ? 100.0 * s.jitInstr / guestInstr : 0, guestInstr ? 100.0 - 100.0 * s.jitInstr / guestInstr : 0,
             s.jitEntries / sec, s.blocksCompiled / sec,
