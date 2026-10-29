@@ -24,7 +24,7 @@ var LAZY_RUN_MAX = 1 << 22; // longest single read (and the sab buffer)
 var LAZY_EAGER_MAX = 1 << 20;
 var LAZY_CACHE_BLOCKS = 64; // 4 MiB
 // win: the stats=1 window (jspi reads), set and taken by the [stats] line every ~2 s; null when stats are off.
-var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, suspends: 0, waitMs: 0, files: 0, mode: "", overlay: 0, copied: 0, win: null };
+var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, waitMs: 0, files: 0, mode: "", overlay: 0, copied: 0, win: null };
 window.__lazyStats = lazyStats;
 var lazyCache = new Map(); // "file:block" → Uint8Array, insertion order = LRU order
 var lazyFiles = []; // jspi mode: File objects by index
@@ -118,30 +118,22 @@ function lazyReadRunAsync(file, start, length) {
 }
 
 // fd_read/fd_pread for lazy nodes in jspi mode (lazyfs-jspi-lib.js): reads every iovec, then
-// stores the count. Returns the count when every block was cached, else a promise of it, which
-// suspends the wasm caller.
-function lazyReadvAsync(stream, iov, iovcnt, offset) {
-    var total = 0, pos = offset === undefined ? stream.position : offset, t = performance.now(), i = 0;
-    var step = () => {
-        for (; i < iovcnt; i++) {
-            var len = HEAPU32[(iov + i * 8 + 4) >> 2];
-            var n = lazyCopy(stream.node, HEAPU8, HEAPU32[(iov + i * 8) >> 2], len, pos + total, lazyReadRunAsync);
-            if (n instanceof Promise) {
-                lazyStats.suspends++;
-                return n.then(n => { total += n; i = n < len ? iovcnt : i + 1; return step(); });
-            }
-            total += n;
-            if (n < len) break;
-        }
-        if (offset === undefined) stream.position += total;
-        var w = lazyStats.win;
-        if (w) { // the whole read, suspension included: the guest slice waits all of it
-            var ms = performance.now() - t, name = stream.node.name;
-            w.reads++; w.bytes += total; w.ms += ms; w.files[name] = (w.files[name] || 0) + ms;
-        }
-        return total;
-    };
-    return step();
+// stores the count. Returns a promise, which suspends the wasm caller.
+async function lazyReadvAsync(stream, iov, iovcnt, offset) {
+    var total = 0, pos = offset === undefined ? stream.position : offset, t = performance.now();
+    for (var i = 0; i < iovcnt; i++) {
+        var ptr = HEAPU32[(iov + i * 8) >> 2], len = HEAPU32[(iov + i * 8 + 4) >> 2];
+        var n = await lazyCopy(stream.node, HEAPU8, ptr, len, pos + total, lazyReadRunAsync);
+        total += n;
+        if (n < len) break;
+    }
+    if (offset === undefined) stream.position += total;
+    var w = lazyStats.win;
+    if (w) { // the whole suspension, cache hits included: the guest slice waits all of it
+        var ms = performance.now() - t, name = stream.node.name;
+        w.reads++; w.bytes += total; w.ms += ms; w.files[name] = (w.files[name] || 0) + ms;
+    }
+    return total;
 }
 
 // Turns a lazy node into a plain MEMFS file holding bytes: the game's own copy, which IDBFS persists.
