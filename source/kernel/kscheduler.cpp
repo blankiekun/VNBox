@@ -27,6 +27,9 @@
 #endif
 
 VnboxStats vnboxStats;
+bool vnboxProfOn = false;
+unsigned vnboxProfTick = 0;
+std::unordered_map<unsigned long long, VnboxProfEntry> vnboxProfBlocks;
 
 #ifdef BOXEDWINE_MULTI_THREADED
 static KList<KTimerCallback*> timers;

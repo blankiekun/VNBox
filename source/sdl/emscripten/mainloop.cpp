@@ -26,6 +26,10 @@
 #include "../../x11/x11.h"
 #include "vnboxwinereq.h"
 #include <algorithm>
+#include <map>
+#include <tuple>
+#include <string>
+#include <string.h>
 #include <vector>
 #include "kdspaudio_math.h"
 
@@ -364,10 +368,80 @@ static void statsTickStart() {
     }
 }
 
+// prof=1: every ~5 s print the guest JIT time by module+offset (this window), then the cumulative top blocks as JSON.
+struct ProfAgg { double ms = 0; unsigned long long instr = 0, entries = 0; };
+static void profReport(double now) {
+    static double last = 0;
+    static std::map<std::tuple<std::string, std::string, unsigned>, ProfAgg> cum;
+    if (!last) { last = now; return; }
+    if (now - last < 5000) return;
+    double sec = (now - last) / 1000.0;
+    last = now;
+    std::map<std::tuple<std::string, std::string, unsigned>, ProfAgg> win;
+    std::map<std::string, double> byModule;
+    double total = 0;
+    for (auto& e : vnboxProfBlocks) {
+        unsigned pid = (unsigned)(e.first >> 32), eip = (unsigned)e.first;
+        KProcessPtr p = KSystem::getProcess(pid);
+        std::string pname = p ? std::string(p->name.c_str()) : "gone";
+        std::string mod = "?";
+        unsigned off = eip;
+        if (p) {
+            BString path = p->getModuleName(eip);
+            const char* c = path.c_str();
+            const char* slash = strrchr(c, '/');
+            mod = slash ? slash + 1 : c;
+            off = p->getModuleEip(eip);
+        }
+        auto key = std::make_tuple(pname, mod, off & ~0xFu);
+        for (auto* m : {&win, &cum}) {
+            ProfAgg& a = (*m)[key];
+            a.ms += e.second.ms; a.instr += e.second.instr; a.entries += e.second.entries;
+        }
+        byModule[pname + ":" + mod] += e.second.ms;
+        total += e.second.ms;
+    }
+    vnboxProfBlocks.clear();
+    auto top = [](std::map<std::tuple<std::string, std::string, unsigned>, ProfAgg>& m, size_t n) {
+        std::vector<std::pair<double, std::tuple<std::string, std::string, unsigned>>> v;
+        for (auto& e : m) v.push_back({e.second.ms, e.first});
+        std::sort(v.rbegin(), v.rend());
+        if (v.size() > n) v.resize(n);
+        return v;
+    };
+    klog_fmt("[prof] %.1fs jit ms/s=%.0f by module:", sec, total / sec);
+    std::vector<std::pair<double, std::string>> mods;
+    for (auto& e : byModule) mods.push_back({e.second, e.first});
+    std::sort(mods.rbegin(), mods.rend());
+    for (size_t i = 0; i < mods.size() && i < 8; i++) klog_fmt("[prof]   %5.1f%% %s", total ? 100 * mods[i].first / total : 0, mods[i].second.c_str());
+    for (auto& t : top(win, 20)) {
+        auto& a = win[t.second];
+        klog_fmt("[prof]   %5.1f%% %s:%s+0x%x ms=%.0f instr=%llu entries=%llu", total ? 100 * t.first / total : 0, std::get<0>(t.second).c_str(),
+            std::get<1>(t.second).c_str(), std::get<2>(t.second), a.ms, a.instr, a.entries);
+    }
+    // klog cuts lines at ~400 bytes: 4 items per line, join the [prof-cum] lines' items into one array
+    std::string json;
+    int n = 0;
+    for (auto& t : top(cum, 400)) {
+        auto& a = cum[t.second];
+        char item[256];
+        snprintf(item, sizeof(item), "%s[\"%s\",\"%s\",%u,%.1f,%llu,%llu]", json.empty() ? "" : ",", std::get<0>(t.second).c_str(),
+            std::get<1>(t.second).c_str(), std::get<2>(t.second), a.ms, a.instr, a.entries);
+        json += item;
+        if (++n % 4 == 0) { klog_fmt("[prof-cum] %s", json.c_str()); json.clear(); }
+    }
+    if (!json.empty()) klog_fmt("[prof-cum] %s", json.c_str());
+}
+
 void mainloop() {
     static bool statsChecked = false;
     if (!statsChecked) {
         statsChecked = true;
+        vnboxProfOn = EM_ASM_INT({
+            var q = location.search;
+            try { if (parent !== window) q += "&" + parent.location.search.slice(1); } catch (e) {}
+            return /[?&]prof=1(&|$)/.test(q) ? 1 : 0;
+        }) != 0;
         // on this page's URL or, for a player embedded in an iframe, the embedding page's
         vnboxStats.on = EM_ASM_INT({
             var q = location.search;
@@ -381,6 +455,9 @@ void mainloop() {
     }
     if (vnboxStats.on) {
         statsTickStart();
+    }
+    if (vnboxProfOn) {
+        profReport(emscripten_get_now());
     }
     U64 startTime = KSystem::getMicroCounter();
     checkBrowserSocketEvents();
