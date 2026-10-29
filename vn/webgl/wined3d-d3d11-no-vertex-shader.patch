@@ -1,17 +1,23 @@
-diff --git a/dlls/wined3d/glsl_shader.c b/dlls/wined3d/glsl_shader.c
-index 084219f..ce290e4 100644
---- a/dlls/wined3d/glsl_shader.c
-+++ b/dlls/wined3d/glsl_shader.c
-@@ -10884,10 +10884,10 @@ static void set_glsl_shader_program(const struct wined3d_context_gl *context_gl,
-         vs_id = ctx_data->glsl_program->vs.id;
-         vs_list = &ctx_data->glsl_program->vs.shader_entry;
+diff --git a/dlls/wined3d/context_gl.c b/dlls/wined3d/context_gl.c
+index 0b0515f..8174d21 100644
+--- a/dlls/wined3d/context_gl.c
++++ b/dlls/wined3d/context_gl.c
+@@ -5106,6 +5106,18 @@ void draw_primitive(struct wined3d_device *device, const struct wined3d_state *s
+     if (!parameters->indirect && !parameters->u.direct.index_count)
+         return;
  
--        if (use_vs(state) || d3d_info->ffp_hlsl)
-+        if (use_vs(state) || (d3d_info->ffp_hlsl && state->shader[WINED3D_SHADER_TYPE_VERTEX]))
-             vshader = state->shader[WINED3D_SHADER_TYPE_VERTEX];
-     }
--    else if (use_vs(state) || d3d_info->ffp_hlsl)
-+    else if (use_vs(state) || (d3d_info->ffp_hlsl && state->shader[WINED3D_SHADER_TYPE_VERTEX]))
-     {
-         struct vs_compile_args vs_compile_args;
- 
++    /* With HLSL FFP, d3d8/d3d9/ddraw always bind a vertex shader (the stateblock binds an FFP one),
++     * so none bound is a d3d10/d3d11 draw without one, which draws nothing on Windows. The shader
++     * and FFP paths below all assume a vertex shader or a vertex declaration. */
++    if (device->adapter->d3d_info.ffp_hlsl && !state->shader[WINED3D_SHADER_TYPE_VERTEX])
++    {
++        static unsigned int skipped;
++
++        if (!(skipped++ % 1000))
++            ERR("No vertex shader bound, skipping draw (%u so far).\n", skipped);
++        return;
++    }
++
+     if (!parameters->indirect)
+         TRACE("base_vertex_idx %d, start_idx %u, index_count %u, start_instance %u, instance_count %u.\n",
+                 parameters->u.direct.base_vertex_idx, parameters->u.direct.start_idx,
