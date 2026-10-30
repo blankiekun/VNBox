@@ -174,10 +174,12 @@ U32 kselect(KThread* thread, U32 nfds, U32 readfds, U32 writefds, U32 errorfds, 
     else {
         // timeval, 2nd part is microseconds
         // timespec, 2nd part is nanoseconds
+        // sub-ms parts round up: truncated to 0, Wine's Sleep loop would spin on select
+        U32 unit = timeoutIsTimeVal ? 1000 : 1000000;
         if (time64) {
-            timeout = (U32)(memory->readq(timeout) * 1000 + memory->readd(timeout + 8) / (timeoutIsTimeVal?1000:1000000));
+            timeout = (U32)(memory->readq(timeout) * 1000 + (memory->readd(timeout + 8) + unit - 1) / unit);
         } else {
-            timeout = memory->readd(timeout) * 1000 + memory->readd(timeout + 4) / (timeoutIsTimeVal ? 1000 : 1000000);
+            timeout = memory->readd(timeout) * 1000 + (memory->readd(timeout + 4) + unit - 1) / unit;
         }
         if (timeout < NUMBER_OF_MILLIES_TO_SPIN_FOR_WAIT && nfds == 0) {
             return KThread::currentThread()->sleep(timeout);

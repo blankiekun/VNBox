@@ -114,17 +114,19 @@ void Platform::writeCodeToMemory(void* address, U32 len, WriteCodeCallback callb
 #endif
 }
 
-//#ifdef __EMSCRIPTEN__
-#ifdef __THIS_HANGS__
-// error TypeError: asm.js type error: missing definition of function _testSetjmp
+#ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+// performance.now(): monotonic and sub-ms. gettimeofday is Date.now() through a WASI
+// import: 1 ms steps that follow wall-clock changes (CLOCK_REALTIME keeps using it).
+static double CounterStart;
 void Platform::startMicroCounter()
-{    
+{
+    CounterStart = emscripten_get_now();
 }
 
 unsigned long long int Platform::getMicroCounter()
 {
-    return (unsigned long long int)(emscripten_get_now()*1000000.0);
+    return (unsigned long long int)((emscripten_get_now() - CounterStart) * 1000.0);
 }
 #else
 long long int CounterStart;

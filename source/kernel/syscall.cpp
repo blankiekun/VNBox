@@ -2726,6 +2726,7 @@ void ksyscall(CPU* cpu, U32 eipCount) {
     hostHookSyscall(cpu->thread);
     U32 result = -K_ENOSYS;
     U64 startTime = KSystem::getMicroCounter();
+    U64 endTime = 0;
 #ifdef BOXEDWINE_MULTI_THREADED 
     U32 syscallNo = EAX;
 #endif
@@ -2748,12 +2749,12 @@ void ksyscall(CPU* cpu, U32 eipCount) {
         kdebug("no syscall for %d", EAX);
     } else {
 #ifndef BOXEDWINE_MULTI_THREADED
-        U64 startTime = KSystem::getMicroCounter();
         U32 statsNo = EAX, statsArg2 = ECX, statsLen = EDX;
 #endif
         result = syscallFunc[EAX](cpu, eipCount);
 #ifndef BOXEDWINE_MULTI_THREADED
-        U64 diff = KSystem::getMicroCounter()-startTime;
+        endTime = KSystem::getMicroCounter(); // one clock pair per syscall: kernelTime below reuses it
+        U64 diff = endTime-startTime;
         sysCallTime+=diff;  
         cpu->blockInstructionCount+=(U32)(contextTime*diff/10000);
         if (vnboxStats.on && statsNo < 440) { // EAX is guest-chosen; the arrays cover the known syscalls
@@ -2783,6 +2784,6 @@ void ksyscall(CPU* cpu, U32 eipCount) {
         EAX = result;
         cpu->eip.u32+=eipCount;
     }
-    cpu->thread->kernelTime += KSystem::getMicroCounter() - startTime;
+    cpu->thread->kernelTime += (endTime ? endTime : KSystem::getMicroCounter()) - startTime;
 }
 
