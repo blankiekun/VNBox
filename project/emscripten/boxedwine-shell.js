@@ -3512,13 +3512,13 @@ async function createZip(items) {
 var vnboxMovieBase = document.currentScript ? new URL(".", document.currentScript.src).href : "";
 var vnboxMovieLoad = null, vnboxMovieQueue = [];
 
-// The movie file as a Blob, from its Emscripten FS node (the lazy game folder's File in jspi mode).
+// The movie file as a Blob, from its Emscripten FS node (a lazy game folder's File, in either mode).
 function vnboxMovieBlob(path) {
     var node;
     try { node = FS.lookupPath(path).node; } catch (e) { return null; }
     if (node.lazyFile === undefined || node.lazyCopied) return node.contents ? new Blob([node.contents.subarray(0, node.usedBytes)]) : null;
     if (node.lazyBytes) return new Blob([node.lazyBytes]);
-    return typeof lazyFiles !== "undefined" && lazyFiles[node.lazyFile] || null; // sab mode: the worker has the File
+    return node.lazyBlob || typeof lazyFiles !== "undefined" && lazyFiles[node.lazyFile] || null; // lazyBlob: sab mode, the worker's File
 }
 
 function boxedwineMovie(id, cmd, arg) {

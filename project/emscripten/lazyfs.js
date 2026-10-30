@@ -223,6 +223,7 @@ function lazyAddFile(parent, fileName, index, size, readSync, bytes) {
     node.node_ops = Object.assign({}, node.node_ops, {
         setattr: (n, attr) => { if (attr.size !== undefined) lazyCopyUp(n, attr.size === 0); return setattr(n, attr); },
     });
+    return node;
 }
 
 // jspi mode: fetches url into the origin private file system once (lazyfs-cache/), then adds
@@ -273,7 +274,7 @@ function lazyBuildTree(root, entries, readSync) {
             bytes = new Uint8Array(entry.size);
             readSync({ lazyFile: entry.file, lazySize: entry.size }, bytes, 0, entry.size, 0);
         }
-        lazyAddFile(parent, fileName, entry.file, entry.size, readSync, bytes);
+        lazyAddFile(parent, fileName, entry.file, entry.size, readSync, bytes).lazyBlob = entry.blob || null;
     });
     console.log("Lazy game folder " + root + " (" + lazyStats.mode + "): " + lazyStats.files + " files listed, " + lazyStats.overlay + " from the saved overlay");
 }

@@ -16,7 +16,7 @@ onmessage = async e => {
                     await walk(h, path + "/");
                 } else {
                     var f = await h.getFile();
-                    entries.push({ path: path, file: handles.length, size: f.size });
+                    entries.push({ path: path, file: handles.length, size: f.size, blob: f }); // blob: the page hands movies to its decoder
                     handles.push(h); files.push(f);
                 }
             }
