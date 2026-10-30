@@ -785,6 +785,7 @@ void testX11CapsLockKeys() {
 
 // Bug: a bigger 8 or 16 bit window composited its old, smaller converted copy at the new pitch until the guest drew.
 void testX11ResizeMarksDirty() {
+void testX11HiddenWindowInvalidation() {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
     x11_init();
     testNewInstruction(0);
@@ -962,6 +963,30 @@ void testX11MotionCoalesced() {
         testFail("X11 motion coalescing lost the newest position or reordered a press");
     data->unlockEvents();
     server->closeDisplay(thread, data);
+}
+
+    visual->bits_per_rgb = 8;
+    auto window = server->createNewWindow(0, nullptr, 2, 2, 8, 0, 0, InputOutput, 0, visual);
+    auto gc = server->createGC(window);
+    gc->values.foreground = 42;
+    window->fillRectangle(nullptr, gc, 0, 0, 2, 2);
+
+    // A presentation consumes the display request but skips unmapped windows.
+    // Their backing pixels remain dirty until they can actually be drawn.
+    server->isDisplayDirty = false;
+    window->draw();
+    if (!window->isDirty) testFail("Hidden window lost its pending pixels");
+    window->mapWindow();
+    if (!server->isDisplayDirty) testFail("Mapping an already-dirty window did not request a redraw");
+
+    window->unmapWindow();
+    server->isDisplayDirty = false;
+    window->draw();
+    gc->values.foreground = 73;
+    window->fillRectangle(nullptr, gc, 0, 0, 2, 2);
+    if (!server->isDisplayDirty) testFail("Updating an already-dirty window did not request a redraw");
+    server->removeGC(gc->id);
+    server->destroyWindow(window->id);
 }
 
 void testX11PaletteInvalidation() {
