@@ -329,7 +329,7 @@ copy-assets: $(ASSET_OUTPUTS) $(MOVIE_DECODER)
 
 $(MOVIE_DECODER): vnbox-movie-decoder.c $(PROJDIR)/lib/pl_mpeg/pl_mpeg.h
 	@$(MKDIR_P) $(dir $@)
-	@$(CC) -O3 $< -o $@.tmp.js -sMODULARIZE -sEXPORT_NAME=VnboxMovieDecoder -sSINGLE_FILE -sENVIRONMENT=web \
+	@$(CC) -O3 -msimd128 $< -o $@.tmp.js -sMODULARIZE -sEXPORT_NAME=VnboxMovieDecoder -sSINGLE_FILE -sENVIRONMENT=web \
 		-sALLOW_MEMORY_GROWTH -sFILESYSTEM=0 -sEXPORTED_FUNCTIONS=_malloc,_free -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPF32
 	@{ echo "/*!"; cat $(PROJDIR)/lib/pl_mpeg/LICENSE; echo "*/"; cat $@.tmp.js; } > $@ && rm $@.tmp.js
 
