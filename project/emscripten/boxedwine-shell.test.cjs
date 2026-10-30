@@ -7,6 +7,8 @@ const zlib = require('node:zlib');
 const crypto = require('node:crypto');
 
 const source = readFileSync(path.join(__dirname, 'boxedwine-shell.js'), 'utf8');
+// shell.html loads lazyfs.js (vnboxParam) before the shell
+const lazyfs = readFileSync(path.join(__dirname, 'lazyfs.js'), 'utf8');
 
 function launcher(url) {
     const elements = new Map();
@@ -33,6 +35,7 @@ function launcher(url) {
             syncfs(populate, callback) { assert.equal(populate, true); callback(null); },
         },
     });
+    vm.runInContext(lazyfs, context);
     vm.runInContext(source, context);
     context.setConfiguration();
     let initialized = false;
@@ -143,6 +146,7 @@ function dialogShell(tree, url = 'http://localhost/') {
             },
         },
     });
+    vm.runInContext(lazyfs, context);
     vm.runInContext(source, context);
     return { context, htmlWrites, byId, downloads };
 }
@@ -788,6 +792,7 @@ async function loadDisc(url, served) {
             });
         },
     });
+    vm.runInContext(lazyfs, context);
     vm.runInContext(source, context);
     context.setConfiguration();
     const discFiles = JSON.parse(await vm.runInContext('loadCDRomDisc(0).then(() => JSON.stringify(cdromDiscFiles[0]))', context));
