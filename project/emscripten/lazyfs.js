@@ -28,6 +28,7 @@ var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, wai
 window.__lazyStats = lazyStats;
 var lazyCache = new Map(); // "file:block" → Uint8Array, insertion order = LRU order
 var lazyFiles = []; // jspi mode: File objects by index
+var lazyBase = typeof document !== "undefined" && document.currentScript ? new URL(".", document.currentScript.src).href : ""; // this file's folder, not the page's
 
 function vnboxReport(source, error) {
     var message = String(error && error.stack || error);
@@ -340,7 +341,7 @@ async function mountLazyAppJspi(mountPoint, name, dirHandle) {
 function mountLazyAppSab(mountPoint, name, dirHandle) {
     var ctl = new Int32Array(new SharedArrayBuffer(32)); // [state 0 idle/1 asked/2 answered, file, offLo, offHi, len, result]
     var data = new Uint8Array(new SharedArrayBuffer(LAZY_RUN_MAX));
-    var worker = new Worker("lazyfs-worker.js");
+    var worker = new Worker(lazyBase + "lazyfs-worker.js");
 
     function readRun(file, start, length) {
         var t = performance.now();
