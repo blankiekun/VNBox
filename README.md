@@ -14,6 +14,8 @@ Build (Emscripten 5.0.7): `make -C project/emscripten jitJspi`; output in `proje
 
 Releases: pushing a `v*` tag runs `.github/workflows/vn-release.yml`, which publishes the web build, an unmodified mirror of the root fs `TinyCore15Wine11.0-web.zip` it was tested with (from boxedwine.org; build scripts in `tools/buildWine`), `jp.zip` and `SHA256SUMS`.
 
+Merging upstream: keep our ntsync (`vn/build-wine-ntsync.sh`, the ntsync device) over upstream's `feat/ntsync`. In JSPI builds a call from the page into wasm that touches files may only run inside `boxedwine_tick`, so queue it for the next tick the way `boxedwineCDRomInsert` does (`devcdrom.cpp`).
+
 Licence: GPL-2.0 like Boxedwine (`license.txt`). The root fs holds Wine and Tiny Core Linux under their own GPL/LGPL licences. The IPA fonts are under the IPA Font License v1.0 (`vn/overlay-jp/opt/wine/share/wine/fonts/`).
 
 # Boxedwine

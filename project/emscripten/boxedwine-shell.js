@@ -873,7 +873,7 @@
         }
         // jspi builds read zips on demand from an OPFS copy (lazyfs.js); others load them whole.
         function loadZipFile(pathPrefix, filename, callback) {
-            if (typeof boxedwineJspiReads === "undefined" || new URLSearchParams(location.search).has("wholezips")) { // wholezips: compare
+            if (typeof boxedwineJspiReads === "undefined") {
                 loadFile(pathPrefix, filename, (bytes) => { createFile("/", filename, bytes); callback(); });
                 return;
             }
