@@ -1,0 +1,80 @@
+# VNBox checks on every pull request and push to master: the fork's own self-checks, which need no
+# browser, game files or emsdk and take seconds.
+name: VN CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vn-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Catches regressions in lazyfs.js ranged reads, frida-compat.js string/pattern/trans code,
+  # boxedwine-shell.js (URL options, CUE/BIN, zips) and source/io/readahead.h.
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      # No npm dependencies to cache: the checks use only Node's standard library.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: lazyfs.check.mjs
+        run: node project/emscripten/lazyfs.check.mjs
+
+      - name: frida-compat.check.mjs
+        run: node project/emscripten/frida-compat.check.mjs
+
+      - name: boxedwine-shell.test.cjs
+        run: node --test project/emscripten/boxedwine-shell.test.cjs
+
+      - name: test_read_ahead.cpp
+        run: |
+          g++ -std=c++17 -I source/io tools/test_read_ahead.cpp -o "$RUNNER_TEMP/test_read_ahead"
+          "$RUNNER_TEMP/test_read_ahead"
+
+  # Catches CPU emulation and WASM JIT regressions (the source/test suite: CPU/MMX/SSE/x87 ops, JIT
+  # chaining, hard links, ...) by building `make testJit` and running it under Node. -fast runs every test
+  # but fewer register/addressing combinations (~3 min instead of ~12).
+  testjit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      EMSDK_VERSION: 5.0.7 # same as vn-release.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # emsdk plus its cache of compiled system libraries, so only the first run pays for them.
+      - id: emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ env.EMSDK_VERSION }}-testjit-${{ runner.os }}
+
+      - name: Install emsdk ${{ env.EMSDK_VERSION }}
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+          ~/emsdk/emsdk install "$EMSDK_VERSION"
+          ~/emsdk/emsdk activate "$EMSDK_VERSION"
+
+      - name: Build testJit
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          make -C project/emscripten testJit make_jobs="$(nproc)"
+
+      - name: Run testJit
+        run: project/emscripten/run-testjit-node.sh -fast
