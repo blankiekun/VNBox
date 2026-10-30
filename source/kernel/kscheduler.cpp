@@ -299,6 +299,7 @@ bool runSlice() {
 
     U64 elapsedTime = 0;
     const U64 sliceStart = schedulerMicroCounter();
+    U64 now = sliceStart; // one clock read per thread turn: each turn starts where the last ended
     U64 nextTimerCheck = 1000;
 
     while (!scheduledThreads.isEmpty() && elapsedTime<9000) {
@@ -315,8 +316,9 @@ bool runSlice() {
             if (server && XServer::drawFps && server->draw()) {
                 break;
             }
+            now = schedulerMicroCounter(); // timers and draws aren't the thread's time
         }
-        U64 threadStartTime = KSystem::getMicroCounter();
+        U64 threadStartTime = now;
         KListNode<KThread*>* node = scheduledThreads.front();
         KThread* currentThread = (KThread*)node->data;
         KNativeSystem::scheduledNewThread(currentThread);
@@ -334,10 +336,10 @@ bool runSlice() {
 #endif
         rdtsc = currentThread->cpu->instructionCount;
 
-        U64 threadEndTime = KSystem::getMicroCounter();
-        U64 diff = threadEndTime - threadStartTime;
+        now = schedulerMicroCounter();
+        U64 diff = now - threadStartTime;
 
-        elapsedTime = schedulerMicroCounter() - sliceStart;
+        elapsedTime = now - sliceStart;
 
         elapsedTimeMIPS+=diff;
         if (vnboxStats.on) {
