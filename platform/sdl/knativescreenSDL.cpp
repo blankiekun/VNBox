@@ -609,7 +609,10 @@ void KNativeScreenSDL::present() {
             if (vnboxStats.on) vnboxStats.skippedSame++;
         }
         if (emscriptenSoftwareDirty) {
-            if (boxedwinePresentSoftwareFrame((const U32*)emscriptenSoftwareBuffer, screenWidth(), screenHeight())) {
+            double presentStart = vnboxStats.on ? emscripten_get_now() : 0;
+            bool shown = boxedwinePresentSoftwareFrame((const U32*)emscriptenSoftwareBuffer, screenWidth(), screenHeight());
+            if (vnboxStats.on) vnboxStats.presentSwMs += emscripten_get_now() - presentStart;
+            if (shown) {
                 emscriptenSoftwareDirty = false;
                 presented = true;
                 if (emscriptenShownFrameSize < frameBytes) {

@@ -23,6 +23,7 @@
 #include "../emulation/softmmu/soft_rw_page.h"
 #include "../emulation/softmmu/soft_copy_on_write_page.h"
 #include "../emulation/cpu/normal/normalCPU.h"
+#include "vnboxstats.h"
 #include <cstdlib>
 
 #ifdef BOXEDWINE_JIT
@@ -1774,6 +1775,7 @@ static void findCodeBlock(U32 address, DecodedOp* op, void* found) {
 }
 #endif
 void KMemory::removeCode(KThread* thread, U32 address, U32 len, bool becauseOfWrite) {
+    if (becauseOfWrite && vnboxStats.on) vnboxStats.codeRemovedByWrite++;
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex)
 #if defined(BOXEDWINE_JIT)
     bool hasCodeBlock = false;

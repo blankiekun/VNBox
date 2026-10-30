@@ -9,6 +9,10 @@ struct VnboxStats {
     unsigned glCalls = 0, glGetErrors = 0, presentsGl = 0, draws = 0, timers = 0, ticksBusy = 0, ticksIdle = 0;
     unsigned tickWaits = 0, msgWaits = 0, inputs = 0, motions = 0;
     unsigned presentsSw = 0, skippedSame = 0, busyDropped = 0; // software presents: shown, unchanged (skipped), JS side busy
+    // XServer::draw calls past the fps deadline (they composite every window, then present) and their ms; software present ms within them
+    unsigned composites = 0; double compositeMs = 0, presentSwMs = 0;
+    // JIT code pages: CodePage write calls (the slow path), code removed because of a write, ops decoded NO_JIT as dynamic code
+    unsigned codePageWrites = 0, codeRemovedByWrite = 0, opsNoJitDynamic = 0;
     // GPU->CPU reads (each one waits for the GPU): getBufferSubData, readPixels/getTexImage
     unsigned glReadbacks = 0, glReadPixels = 0; double glReadbackMs = 0, glReadPixelsMs = 0, glReadbackKB = 0;
     double glMs = 0, presentGlMs = 0, drawMs = 0, sliceMs = 0, timerLateMs = 0, timerLateMaxMs = 0;
