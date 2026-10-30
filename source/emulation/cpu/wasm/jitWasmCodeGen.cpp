@@ -1976,7 +1976,6 @@ static inline void wasmJitProfileSlotMiss() {
 }
 
 static inline void wasmJitProfileCompiledBlock(U32 opCount) {
-    if (vnboxStats.on) vnboxStats.blocksCompiled++;
     g_wasmJitProfileCompiledBlocks.fetch_add(1, std::memory_order_relaxed);
     g_wasmJitProfileCompiledOps.fetch_add(opCount, std::memory_order_relaxed);
     if (opCount <= 1) {
@@ -4857,6 +4856,7 @@ static void publishWasmJitBlock(WasmJitPendingBlock& pending, int tableIdx) {
     }
 
     claimJitBlockOps(pending.op, pending.blockOpCount, pending.emulatedLen);
+    if (vnboxStats.on) vnboxStats.blocksCompiled++; // stats=1, outside the profile build
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     wasmJitProfileCompiledBlock(pending.blockOpCount);
 #endif
@@ -5484,6 +5484,7 @@ static void wasmJitMtCancelPendingMemory(KMemory* memory) {
 
 static void publishMtPendingBlock(WasmJitMtPendingBlock& pending, int tableIdx) {
     claimJitBlockOps(pending.op, pending.blockOpCount, pending.emulatedLen);
+    if (vnboxStats.on) vnboxStats.blocksCompiled++; // stats=1, outside the profile build
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     wasmJitProfileCompiledBlock(pending.blockOpCount);
 #endif
@@ -15309,6 +15310,7 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
     // The owner's invalidation sweep frees any subblock table entries it
     // finds in the covered range. Only callable entries get OP_FLAG_JIT.
     claimJitBlockOps(op, this->blockOpCount, this->emulatedLen);
+    if (vnboxStats.on) vnboxStats.blocksCompiled++; // stats=1, outside the profile build
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     wasmJitProfileCompiledBlock(this->blockOpCount);
 #endif

@@ -55,8 +55,7 @@ jit: export EXTRA_LD_FLAGS := $(WASM_JIT_SIMD_FLAG) -sALLOW_TABLE_GROWTH $(RUNTI
 jit: export ASSET_FILES := boxedwine.css fsfs.js lazyfs.js lazyfs-worker.js boxedwine-shell.js vnbox-movie.js $(ZIP_ASSET_FILES)
 # jit plus JSPI: fd_read/fd_pread may suspend on async File reads of a lazy game folder
 # (lazyfs.js jspi mode), so no SharedArrayBuffer or cross-origin isolation is needed.
-# BOXEDWINE_JSPI drives the main loop through a promising export (required); add
-# -DBOXEDWINE_JSPI_PROBE to log test suspensions at hooked lines and every 5000th syscall.
+# BOXEDWINE_JSPI drives the main loop through a promising export (required).
 jitJspi: export BUILD_DIR := Build/JitJspi
 jitJspi: export EXTRA_CPP_FLAGS := -DBOXEDWINE_WASM_JIT -DBOXEDWINE_JSPI $(WASM_JIT_SIMD_FLAG)
 jitJspi: export SHELL_FILE := shell.html
