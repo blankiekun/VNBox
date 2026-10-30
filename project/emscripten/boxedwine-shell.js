@@ -172,7 +172,7 @@
             Config.rootZipFile = getRootZipFile("root"); //MANUAL:"base.zip";
             Config.extraZipFiles = getZipFileList("overlay"); //MANUAL:"dlls.zip;fonts.zip";
             Config.appZipFile = getAppZipFile("app"); //MANUAL:"chomp.zip";
-            Config.lazyApp = new URLSearchParams(location.search).get("lazy") || ""; // "opfs:vn/albatross": game folder read lazily (lazyfs.js)
+            Config.lazyApp = vnboxParam("lazy") || ""; // "opfs:vn/albatross": game folder read lazily (lazyfs.js)
             let cdrom = getCDRom("cdrom"); //MANUAL:{files: ["disc1.iso", "disc2.iso"], drive: "e"}
             Config.cdromISOFiles = cdrom.files;
             Config.cdromDrive = cdrom.drive;
@@ -3525,7 +3525,7 @@ function boxedwineMovie(id, cmd, arg) {
     if (cmd === "open") console.log("[movie] open " + arg);
     if (typeof vnboxMovieCommand === "function") return vnboxMovieCommand(id, cmd, arg);
     if (cmd === "open") {
-        if (new URLSearchParams(location.search).get("movies") === "0" || !vnboxMovieBlob(arg)) return -1;
+        if (vnboxParam("movies") === "0" || !vnboxMovieBlob(arg)) return -1;
         vnboxMovieLoad = vnboxMovieLoad || ["vnbox-movie-decoder.js", "vnbox-movie.js"].reduce((done, name) => done.then(() => new Promise((resolve, reject) => {
             var script = document.createElement("script");
             script.src = vnboxMovieBase + name;

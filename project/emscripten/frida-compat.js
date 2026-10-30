@@ -828,7 +828,7 @@
         return module.exports;
     }
 
-    const params = typeof location === 'undefined' ? null : new URLSearchParams(location.search);
+    const params = typeof vnboxParam === 'undefined' ? null : { get: vnboxParam }; // lazyfs.js; absent in node checks
     const scriptUrl = params && params.get('frida') ? new URL(params.get('frida'), location.href).href : null;
     const exe = lower(params && (params.get('p') || '').split(/[\\/]/).pop());
     // attachedPid: the game process (the exe's), attached once the boot script is fetched or, without one,

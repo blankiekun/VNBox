@@ -4280,10 +4280,7 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     if (eipProf && eipProfKey) {
         vnboxProfCharge(eipProfKey, eipProfT, eipProfCost, eipProfSys, eipProfInstr);
     }
-    if (vnboxStats.on) {
-        vnboxStats.jitEntries++;
-        vnboxStats.jitInstr += cpu->blockInstructionCount - statsStart - (U32)(vnboxStats.sysPadInstr - statsPadStart);
-    }
+    vnboxStatJit(cpu->blockInstructionCount - statsStart, statsPadStart);
     WASM_JIT_PROFILE_ONLY(if (loopProfileSample) { bool stoppedAtLimit = chainedBlocks == WASM_JIT_CHAIN_BLOCK_LIMIT && wasmJitCanChainTo(cpu, op); wasmJitProfileLoop(chainedBlocks, stoppedAtLimit, WASM_JIT_PROFILE_TIMING_SAMPLE); if (!stoppedAtLimit) { wasmJitProfileChainStop(cpu, op, WASM_JIT_PROFILE_TIMING_SAMPLE); } })
 #endif
 #endif

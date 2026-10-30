@@ -38,6 +38,13 @@ function vnboxReport(source, error) {
     } catch (e) { }
 }
 
+// A URL param of the player page, decoded; null when absent. Config.urlParams (boxedwine-shell.js) replaces the
+// page's query, as in getParameter. The embedding page's URL is not read: pages forward what the player needs.
+function vnboxParam(name) {
+    var override = typeof Config !== "undefined" && Config.urlParams;
+    return new URLSearchParams(override ? "?" + override : location.search).get(name);
+}
+
 function lazyOpfsDir(path) { // "vn/albatross" → handle inside the origin private file system
     return path.split("/").filter(Boolean).reduce(
         (dir, name) => dir.then(d => d.getDirectoryHandle(name)), navigator.storage.getDirectory());
