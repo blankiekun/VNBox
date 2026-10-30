@@ -107,10 +107,11 @@ public:
 	void changeScreen(U32 width, U32 height);
 	void processExit(U32 pid);
 
-	// true when the frame was composited (passed the fps gate)
-	bool draw(bool drawNow = false);
+	void draw(bool drawNow = false);
+	bool vnboxDrawShown(); // draw(), true when a frame was composited (passed the fps gate)
 	static U32 drawFps; // frames shown per second at most, 0 = no limit (the fps= URL param on the web)
 	static U64 nextDrawUs; // KSystem::getMicroCounter() time the next frame may be drawn
+	static bool composited; // set by draw() when it composited a frame
 	void colorMapChanged(const XColorMapPtr& colorMap);
 	const XWindowPtr& getRoot();
 	U32 getEventTime();
