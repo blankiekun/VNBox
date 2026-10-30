@@ -20,6 +20,10 @@
 #include "x11.h"
 #include "knativesystem.h"
 #include "ksocket.h"
+#include "vnboxstats.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #ifdef BOXEDWINE_OPENGL_OSMESA
 #include "../../source/opengl/osmesa/osmesa.h"
@@ -570,6 +574,9 @@ bool XServer::draw(bool drawNow) {
 	if (!screen->canBltToScreen()) {
 		return false;
 	}
+#ifdef __EMSCRIPTEN__
+	double compositeStart = vnboxStats.on ? emscripten_get_now() : 0;
+#endif
 	screen->getInput()->runOnUiThread([screen, this]() {
 		bool childWasDrawn = false;
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED) && defined(BOXEDWINE_OPENGL_SDL)
@@ -602,6 +609,12 @@ bool XServer::draw(bool drawNow) {
 #endif
 		screen->present();
 	});	
+#ifdef __EMSCRIPTEN__
+	if (vnboxStats.on) {
+		vnboxStats.composites++;
+		vnboxStats.compositeMs += emscripten_get_now() - compositeStart;
+	}
+#endif
 	return true;
 }
 

@@ -26,6 +26,7 @@
 #include "../armv8/armv8CPU.h"
 #include "../../../util/ptrpool.h"
 #include "../wasm/wasmMemoryOrdering.h"
+#include "vnboxstats.h"
 #if defined(BOXEDWINE_JIT) && !defined(BOXEDWINE_WASM_JIT)
 #include "../jit/jitCodeGen.h"
 #endif
@@ -685,6 +686,7 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                     }
                     if (memory->isAddressDynamic(address, nextOp->len)) {
                         nextOp->flags |= OP_FLAG_NO_JIT;
+                        if (vnboxStats.on) vnboxStats.opsNoJitDynamic++;
 #ifdef BOXEDWINE_JIT
                         nextOp->runCount = JIT_RUN_COUNT + 1;
 #endif

@@ -1,7 +1,26 @@
 diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
 --- a/dlls/dsound/mixer.c
 +++ b/dlls/dsound/mixer.c
-@@ -277,9 +277,66 @@
+@@ -97,6 +97,7 @@
+ 	DWORD ichannels = dsb->pwfx->nChannels;
+ 	DWORD ochannels = dsb->device->pwfx->nChannels;
+ 	LONG64 oldFreqAdjustDen = dsb->freqAdjustDen;
++	LONG64 oldFreqAdjustNum = dsb->freqAdjustNum;
+ 	WAVEFORMATEXTENSIBLE *pwfxe;
+ 	BOOL ieee = FALSE;
+ 
+@@ -105,6 +106,10 @@
+ 	pwfxe = (WAVEFORMATEXTENSIBLE *) dsb->pwfx;
+ 	dsb->freqAdjustNum = dsb->freq;
+ 	dsb->freqAdjustDen = dsb->device->pwfx->nSamplesPerSec;
++	/* VNBox: one line when a buffer starts mixing through the FIR resampler (cp_fields_resample) */
++	if (dsb->freqAdjustNum != dsb->freqAdjustDen && (!oldFreqAdjustDen || oldFreqAdjustNum == oldFreqAdjustDen))
++		ERR("VNBox: buffer %p resamples %lu Hz -> %lu Hz (%u ch, %u bit)\n", dsb, dsb->freq,
++			dsb->device->pwfx->nSamplesPerSec, dsb->pwfx->nChannels, dsb->pwfx->wBitsPerSample);
+ 
+ 	if ((pwfxe->Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT) || ((pwfxe->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+ 	    && (IsEqualGUID(&pwfxe->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT))))
+@@ -277,9 +282,66 @@
  {
      if (mixpos >= buflen && !(dsb->playflags & DSBPLAY_LOOPING))
          return 0.0f;
@@ -68,7 +87,7 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
  static UINT cp_fields_noresample(IDirectSoundBufferImpl *dsb, UINT count)
  {
      UINT istride = dsb->pwfx->nBlockAlign;
-@@ -295,6 +352,13 @@
+@@ -295,6 +357,13 @@
          committed_samples = committed_samples <= count ? committed_samples : count;
      }
  
@@ -82,7 +101,7 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
      for (i = 0; i < committed_samples; i++)
          for (channel = 0; channel < dsb->mix_channels; channel++)
              dsb->put(dsb, i * ostride, channel, get_current_sample(dsb, dsb->committedbuff,
-@@ -387,7 +451,10 @@
+@@ -387,7 +456,10 @@
              float* cache = &intermediate[channel * required_input + ipos];
              for (j = 0; j < fir_used; j++)
                  sum += fir_copy[j] * cache[j];

@@ -22,6 +22,7 @@
 #include "soft_ram.h"
 #include "kmemory_soft.h"
 #include "soft_mmu.h"
+#include "vnboxstats.h"
 
 
 void CodePage::onDemmand(MMU* mmu, U32 pageIndex) {
@@ -36,6 +37,7 @@ void CodePage::onDemmand(MMU* mmu, U32 pageIndex) {
 }
 
 void CodePage::writeb(MMU* mmu, U32 address, U8 value) {
+    if (vnboxStats.on) vnboxStats.codePageWrites++;
     if (!RWPage::canWriteRam(mmu)) {
         KThread::currentThread()->seg_access(address, false, true);
     }
@@ -54,6 +56,7 @@ void CodePage::writeb(MMU* mmu, U32 address, U8 value) {
 }
 
 void CodePage::writew(MMU* mmu, U32 address, U16 value) {
+    if (vnboxStats.on) vnboxStats.codePageWrites++;
     if (!RWPage::canWriteRam(mmu)) {
         KThread::currentThread()->seg_access(address, false, true);
     }
@@ -85,6 +88,7 @@ void CodePage::writew(MMU* mmu, U32 address, U16 value) {
 }
 
 void CodePage::writed(MMU* mmu, U32 address, U32 value) {
+    if (vnboxStats.on) vnboxStats.codePageWrites++;
     if (!RWPage::canWriteRam(mmu)) {
         KThread::currentThread()->seg_access(address, false, true);
     }
