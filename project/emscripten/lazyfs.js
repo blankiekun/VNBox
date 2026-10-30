@@ -28,6 +28,7 @@ var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, wai
 window.__lazyStats = lazyStats;
 var lazyCache = new Map(); // "file:block" → Uint8Array, insertion order = LRU order
 var lazyFiles = []; // jspi mode: File objects by index
+var lazyBase = typeof document !== "undefined" && document.currentScript ? new URL(".", document.currentScript.src).href : ""; // this file's folder, not the page's
 
 function vnboxReport(source, error) {
     var message = String(error && error.stack || error);
@@ -223,6 +224,7 @@ function lazyAddFile(parent, fileName, index, size, readSync, bytes) {
     node.node_ops = Object.assign({}, node.node_ops, {
         setattr: (n, attr) => { if (attr.size !== undefined) lazyCopyUp(n, attr.size === 0); return setattr(n, attr); },
     });
+    return node;
 }
 
 // jspi mode: fetches url into the origin private file system once (lazyfs-cache/), then adds
@@ -273,7 +275,7 @@ function lazyBuildTree(root, entries, readSync) {
             bytes = new Uint8Array(entry.size);
             readSync({ lazyFile: entry.file, lazySize: entry.size }, bytes, 0, entry.size, 0);
         }
-        lazyAddFile(parent, fileName, entry.file, entry.size, readSync, bytes);
+        lazyAddFile(parent, fileName, entry.file, entry.size, readSync, bytes).lazyBlob = entry.blob || null;
     });
     console.log("Lazy game folder " + root + " (" + lazyStats.mode + "): " + lazyStats.files + " files listed, " + lazyStats.overlay + " from the saved overlay");
 }
@@ -339,7 +341,7 @@ async function mountLazyAppJspi(mountPoint, name, dirHandle) {
 function mountLazyAppSab(mountPoint, name, dirHandle) {
     var ctl = new Int32Array(new SharedArrayBuffer(32)); // [state 0 idle/1 asked/2 answered, file, offLo, offHi, len, result]
     var data = new Uint8Array(new SharedArrayBuffer(LAZY_RUN_MAX));
-    var worker = new Worker("lazyfs-worker.js");
+    var worker = new Worker(lazyBase + "lazyfs-worker.js");
 
     function readRun(file, start, length) {
         var t = performance.now();
