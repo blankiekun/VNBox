@@ -1,5 +1,5 @@
 // Frida-compat layer: runs dc00 text-hook scripts (github.com/0xDC00/scripts, MIT) unmodified
-// against the emulated guest, over the host hook table in normalCPU.cpp (bw_* exports).
+// against the emulated guest, over the host hook table in hosthooks.cpp (bw_* exports).
 // Single-threaded builds only: hook callbacks run synchronously on the main thread with the
 // guest paused, as Frida's do.
 //
@@ -42,7 +42,7 @@
     const decoder = (enc) => decoders[enc] || (decoders[enc] = new TextDecoder(enc));
 
     const F = globalThis.boxedwineFrida = {
-        api: null, // set by the first poll from C (normalCPU.cpp)
+        api: null, // set by the first poll from C (hosthooks.cpp)
         pid: 0, tid: 0, teb: 0,
         lines: [],
         poll, attach, hit,
