@@ -6,7 +6,8 @@ const vm = require('node:vm');
 const zlib = require('node:zlib');
 const crypto = require('node:crypto');
 
-const source = readFileSync(path.join(__dirname, 'boxedwine-shell.js'), 'utf8');
+// lazyfs.js first, as shell.html loads it (vnboxParam)
+const source = readFileSync(path.join(__dirname, 'lazyfs.js'), 'utf8') + '\n' + readFileSync(path.join(__dirname, 'boxedwine-shell.js'), 'utf8');
 // shell.html loads lazyfs.js (vnboxParam) before the shell
 const lazyfs = readFileSync(path.join(__dirname, 'lazyfs.js'), 'utf8');
 
