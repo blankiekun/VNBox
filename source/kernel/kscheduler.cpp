@@ -26,11 +26,6 @@
 #include <chrono>
 #endif
 
-VnboxStats vnboxStats;
-bool vnboxProfOn = false;
-unsigned vnboxProfTick = 0;
-std::unordered_map<unsigned long long, VnboxProfEntry> vnboxProfBlocks;
-
 #ifdef BOXEDWINE_MULTI_THREADED
 static KList<KTimerCallback*> timers;
 static BOXEDWINE_MUTEX timerMutex;
@@ -258,12 +253,7 @@ void runTimers() {
         KTimerCallback* timer = node->data;
 
         if (timer->millies<=millies) {
-            if (vnboxStats.on) {
-                double late = (double)(millies - timer->millies);
-                vnboxStats.timers++;
-                vnboxStats.timerLateMs += late;
-                if (late > vnboxStats.timerLateMaxMs) vnboxStats.timerLateMaxMs = late;
-            }
+            vnboxStatTimer((double)(millies - timer->millies));
             if (timer->run()) {                
                 timer->node.remove();
             }
@@ -283,16 +273,9 @@ bool runSlice() {
         // a bit of a hack, sometimes popups in Basstour get missed and don't draw
         // (only while the guest runs; an idle tick still draws a frame the fps cap held back)
         if (!scheduledThreads.isEmpty()) server->isDisplayDirty = true;
-#ifdef __EMSCRIPTEN__
-        double drawStart = vnboxStats.on ? emscripten_get_now() : 0;
-#endif
+        double drawStart = vnboxStatNow();
         server->draw();
-#ifdef __EMSCRIPTEN__
-        if (vnboxStats.on && !scheduledThreads.isEmpty()) { // slice-start calls, as before idle ticks drew
-            vnboxStats.draws++;
-            vnboxStats.drawMs += emscripten_get_now() - drawStart;
-        }
-#endif
+        if (!scheduledThreads.isEmpty()) vnboxStatDraw(drawStart); // slice-start calls, as before idle ticks drew
     }
     if (scheduledThreads.isEmpty())
         return false;
@@ -342,16 +325,7 @@ bool runSlice() {
         elapsedTime = now - sliceStart;
 
         elapsedTimeMIPS+=diff;
-        if (vnboxStats.on) {
-            vnboxStats.sliceMs += diff / 1000.0;
-            vnboxStats.sysMs += sysCallTime / 1000.0;
-            vnboxStats.instr += currentThread->cpu->blockInstructionCount;
-            if (currentThread->process->name == "wineserver") vnboxStats.wineserverMs += diff / 1000.0;
-            unsigned long long key = ((unsigned long long)currentThread->process->id << 24) | (currentThread->id & 0xFFFFFF);
-            vnboxStats.threadMs[key] += diff / 1000.0;
-            vnboxStats.threadRuns[key]++;
-            if (!vnboxStats.processNames.count(currentThread->process->id)) vnboxStats.processNames[currentThread->process->id] = currentThread->process->name;
-        }
+        vnboxStatSlice(currentThread, diff, sysCallTime);
         elapsedInstructionsMIPS+=currentThread->cpu->blockInstructionCount;
 
         currentThread->userTime+=diff-sysCallTime;

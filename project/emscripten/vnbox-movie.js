@@ -16,7 +16,7 @@ var vnboxMovies = new Map(); // id → movie
 
 var VNBOX_MOVIE_CHUNK = 1 << 20;
 var VNBOX_MOVIE_AHEAD = 2 << 20; // keep this much undecoded data in the ring buffer
-var vnboxMovieStats = new URLSearchParams(location.search).get("stats") === "1";
+var vnboxMovieStats = vnboxParam("stats") === "1";
 
 function VnboxMovie(blob, canvas) {
     this.blob = blob;

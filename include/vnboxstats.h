@@ -47,4 +47,50 @@ extern unsigned vnboxProfTick;
 #define VNBOX_PROF_EVERY 32
 extern std::unordered_map<unsigned long long, VnboxProfEntry> vnboxProfBlocks;
 
+// The counting itself (vnboxstats.cpp), one line at each call site; each does nothing while stats=1 is off.
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+class CPU;
+class KThread;
+void vnboxStatSliceRecord(KThread* thread, U64 diffUs, U64 sysUs);
+void vnboxStatSyscallRecord(CPU* cpu, U32 no, U32 arg2, U32 len, U32 result, U64 diffUs, U32 padInstr);
+void vnboxStatGl(CPU* cpu, void (*fn)(CPU*), int kind); // runs fn timed; kind 1 GetError, 2 buffer readback, 3 pixel readback
+
+// clock for vnboxStatDraw, 0 while off
+inline double vnboxStatNow() {
+#ifdef __EMSCRIPTEN__
+    return vnboxStats.on ? emscripten_get_now() : 0;
+#else
+    return 0;
+#endif
+}
+inline void vnboxStatDraw(double start) {
+#ifdef __EMSCRIPTEN__
+    if (vnboxStats.on) { vnboxStats.draws++; vnboxStats.drawMs += emscripten_get_now() - start; }
+#endif
+}
+inline void vnboxStatTimer(double lateMs) {
+    if (!vnboxStats.on) return;
+    vnboxStats.timers++;
+    vnboxStats.timerLateMs += lateMs;
+    if (lateMs > vnboxStats.timerLateMaxMs) vnboxStats.timerLateMaxMs = lateMs;
+}
+inline void vnboxStatSlice(KThread* thread, U64 diffUs, U64 sysUs) { if (vnboxStats.on) vnboxStatSliceRecord(thread, diffUs, sysUs); }
+// EAX is guest-chosen; the arrays cover the known syscalls
+inline void vnboxStatSyscall(CPU* cpu, U32 no, U32 arg2, U32 len, U32 result, U64 diffUs, U32 padInstr) {
+    if (vnboxStats.on && no < 440) vnboxStatSyscallRecord(cpu, no, arg2, len, result, diffUs, padInstr);
+}
+// one run of chained JIT blocks: ranInstr counted since the first block, padStart = sysPadInstr then
+inline void vnboxStatJit(U32 ranInstr, unsigned long long padStart) {
+    if (vnboxStats.on) { vnboxStats.jitEntries++; vnboxStats.jitInstr += ranInstr - (U32)(vnboxStats.sysPadInstr - padStart); }
+}
+
+#ifdef __EMSCRIPTEN__
+// The main loop's side (mainloop.cpp): reads stats=1/prof=1 on the first tick, then per tick.
+extern unsigned vnboxStatsMips; // the last MIPS sample, for the [stats] line
+void vnboxStatsTick(int askedMs); // tick start; askedMs: the timeout the tick waited for, -1 a message
+void vnboxStatsTickEnd(bool idle);
+#endif
+
 #endif
