@@ -31,6 +31,7 @@
 #include "cpu/testCallRet.h"
 #include "cpu/testHostLibc.h"
 #include "cpu/testHostAcm.h"
+#include "cpu/testHostVorbis.h"
 #include "cpu/testCMov.h"
 #include "cpu/testCmp.h"
 #include "cpu/testCPU.h"
@@ -910,6 +911,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostLibcStrtol, "Test native libc strtol/strtoul"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
+    {testHostVorbisDecode, "Test native libvorbis decode"},
 #endif
     {testCallJw_0x0e8, "Test Call Jw 0e8"},
     {testCallJd_0x2e8, "Test Call Jd 2e8"},
