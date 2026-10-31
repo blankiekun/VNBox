@@ -102,6 +102,7 @@ static int mainLoopTimingValue = -1;
 static int jspiTickDelay = -1; // what boxedwine_tick returns: ms to wait before the next tick, -1 = next message
 #endif
 static U32 idleWaitMs = 16; // the idleWait= URL param: longest idle wait while no guest timer is due sooner
+static U32 wakeGridMs = 8; // the wakeGrid= URL param: idle wakes land on this ms grid, so guest timers due close together share one wake
 
 static void updateMainLoopTiming(bool idle) {
     int mode = EM_TIMING_SETTIMEOUT;
@@ -120,7 +121,7 @@ static void updateMainLoopTiming(bool idle) {
         // audio driver's 10 ms periods. A timeout set after a message is not held,
         // so wait for such a timer with one message and then one timeout.
         U32 nextTimer = getNextTimer();
-        if (nextTimer < 4) {
+        if (nextTimer == 0 || (nextTimer < 4 && wakeGridMs < 2)) {
             if (nextTimer == 0 || mainLoopTimingMode == EM_TIMING_SETTIMEOUT) {
                 mode = EM_TIMING_SETIMMEDIATE;
             } else {
@@ -135,6 +136,10 @@ static void updateMainLoopTiming(bool idle) {
             // own run time is already left out), at most idleWaitMs: a sleeping guest used to be
             // woken every 1 ms. Input wakes the JSPI loop at once (doMainLoop).
             value = (int)std::min(nextTimer, idleWaitMs);
+            if (wakeGridMs > 1) { // timer slack: wake at the grid line at or after the timer, late by less than one grid step
+                U32 now = KSystem::getMilliesSinceStart();
+                value = (int)((now + value + wakeGridMs - 1) / wakeGridMs * wakeGridMs - now);
+            }
         }
         // a frame the fps cap held back is drawn by the next tick once it is due (not while hidden: nothing is drawn)
         XServer* server = XServer::getServer(true);
@@ -281,6 +286,7 @@ bool doMainLoop() {
     // (the non-worklet audio path).
 #ifndef BOXEDWINE_MULTI_THREADED
     idleWaitMs = vnboxUrlInt("idleWait", idleWaitMs, 1, 1000);
+    wakeGridMs = vnboxUrlInt("wakeGrid", wakeGridMs, 0, 50);
 #endif
     XServer::drawFps = vnboxUrlInt("fps", XServer::drawFps, 0, 240); // frames shown per second at most, 0 = unlocked
     U32 period = vnboxUrlInt("audioPeriod", KDspAudioMath::sdlPeriodFrames, 256, 16384);
@@ -300,13 +306,15 @@ bool doMainLoop() {
     // Firefox runs a chain of messages ahead of painting (one frame per ~80 ms while the
     // guest is busy, during movies and loads): once a frame is due, the next tick waits for it.
     // Input during an idle wait runs the next tick right after the event's handlers have queued it.
+    // Frames are only watched while the guest is busy: an idle page asks for none, so the browser can sleep between ticks.
     // A hidden page gets no frames: the guest and audio keep running, nothing is drawn (vnbox_set_hidden),
     // a tick waiting for a frame goes on at once, and the next tick once visible draws the latest frame.
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
         var lastFrame = performance.now();
-        var frame = function() { lastFrame = performance.now(); requestAnimationFrame(frame); };
+        var busy = false; var watching = false;
+        var frame = function() { lastFrame = performance.now(); if (busy) requestAnimationFrame(frame); else watching = false; };
         var post = function() { channel.port2.postMessage(0); };
         var timer = 0;
         var wait = function(delay) { timer = setTimeout(function() { timer = 0; next(); }, delay); };
@@ -324,12 +332,13 @@ bool doMainLoop() {
             window.addEventListener(type, wake, true);
         });
         var next = function() { tick().then(function(delay) {
+            busy = delay < 0;
+            if (busy && !watching) { watching = true; lastFrame = performance.now(); requestAnimationFrame(frame); } // a busy stretch starts with a fresh frame budget
             if (delay >= 0) wait(delay);
             else if (!document.hidden && performance.now() - lastFrame > 12) raf = requestAnimationFrame(framed);
             else post();
         }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", e); else console.error("tick failed: " + e); }); };
         channel.port1.onmessage = next;
-        requestAnimationFrame(frame);
         next();
     });
     emscripten_exit_with_live_runtime();
