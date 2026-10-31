@@ -277,15 +277,12 @@ EM_JS(int, vnboxUrlInt, (const char* name, int dflt, int lo, int hi), {
 });
 
 bool doMainLoop() {
-    // Smoothness knobs, read before the guest runs. jitRunCount: interpreted runs before a block
-    // is compiled; audioPeriod: frames per SDL audio callback (the non-worklet audio path).
+    // Smoothness knobs, read before the guest runs. audioPeriod: frames per SDL audio callback
+    // (the non-worklet audio path).
 #ifndef BOXEDWINE_MULTI_THREADED
     idleWaitMs = vnboxUrlInt("idleWait", idleWaitMs, 1, 1000);
 #endif
     XServer::drawFps = vnboxUrlInt("fps", XServer::drawFps, 0, 240); // frames shown per second at most, 0 = unlocked
-#if defined(BOXEDWINE_WASM_JIT) && !defined(__TEST)
-    jitRunCount = vnboxUrlInt("jitRunCount", jitRunCount, 1, JIT_RUN_COUNT_MAX - 1);
-#endif
     U32 period = vnboxUrlInt("audioPeriod", KDspAudioMath::sdlPeriodFrames, 256, 16384);
     KDspAudioMath::sdlPeriodFrames = 1u << (31 - __builtin_clz(period)); // a power of two, as SDL wants
     EM_ASM(

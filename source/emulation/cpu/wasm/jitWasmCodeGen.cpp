@@ -414,9 +414,6 @@ static std::deque<WasmJitSealedRequest> g_wasmJitSealedRequests;
 static bool g_wasmJitCompilationPaused = false;
 // A release while paused unlocks exactly one browser compilation probe. The first standalone, grouped, or tiny attempt consumes this token.
 static bool g_wasmJitOomRetryProbePending = false;
-#ifndef __TEST
-U32 jitRunCount = 2000;
-#endif
 #define WASM_JIT_TINY_ADDITIONAL_HITS (3 * JIT_RUN_COUNT)
 
 struct WasmJitRuntimeStats {

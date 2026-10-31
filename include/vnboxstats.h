@@ -70,6 +70,11 @@ inline void vnboxStatDraw(double start) {
     if (vnboxStats.on) { vnboxStats.draws++; vnboxStats.drawMs += emscripten_get_now() - start; }
 #endif
 }
+inline void vnboxStatComposite(double start) {
+#ifdef __EMSCRIPTEN__
+    if (vnboxStats.on) { vnboxStats.composites++; vnboxStats.compositeMs += emscripten_get_now() - start; }
+#endif
+}
 inline void vnboxStatTimer(double lateMs) {
     if (!vnboxStats.on) return;
     vnboxStats.timers++;

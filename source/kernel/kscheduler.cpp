@@ -296,7 +296,7 @@ bool runSlice() {
             }
             // A frame due mid-slice is shown now, not at the next slice (fps=60/90/120 would
             // land on ~10 ms slice boundaries); ending the slice lets the browser paint it.
-            if (server && XServer::drawFps && server->draw()) {
+            if (server && XServer::drawFps && server->vnboxDrawShown()) {
                 break;
             }
             now = schedulerMicroCounter(); // timers and draws aren't the thread's time

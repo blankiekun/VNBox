@@ -21,9 +21,6 @@
 #include "knativesystem.h"
 #include "ksocket.h"
 #include "vnboxstats.h"
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-#endif
 
 #ifdef BOXEDWINE_OPENGL_OSMESA
 #include "../../source/opengl/osmesa/osmesa.h"
@@ -37,6 +34,30 @@ std::atomic_int XServer::nextId = 0x10000;
 XServer* XServer::server;
 U32 XServer::drawFps = 60;
 U64 XServer::nextDrawUs;
+bool XServer::composited;
+
+// The fps= gate, in place of upstream's 16 ms one: fps=0 draws every dirty frame. Flushes (drawNow) are
+// capped too, or fps=30 would not mean 30 for GDI games: a frame they flush early stays dirty and is drawn
+// at the deadline (runSlice checks every 1 ms).
+static bool vnboxDrawDue() {
+	if (!XServer::drawFps) {
+		return true;
+	}
+	U64 now = KSystem::getMicroCounter();
+	if (now < XServer::nextDrawUs) {
+		return false;
+	}
+	U64 interval = 1000000 / XServer::drawFps;
+	// next deadline from this one, so 60 means 60; a frame later than one interval starts over
+	XServer::nextDrawUs = now - XServer::nextDrawUs < interval ? XServer::nextDrawUs + interval : now + interval;
+	return true;
+}
+
+bool XServer::vnboxDrawShown() {
+	composited = false;
+	draw();
+	return composited;
+}
 
 XServer* XServer::getServer(bool existingOnly) {
 	if (server) {
@@ -547,36 +568,30 @@ void XServer::colorMapChanged(const XColorMapPtr& colorMap) {
 	isDisplayDirty = true;
 }
 
-bool XServer::draw(bool drawNow) {
+void XServer::draw(bool drawNow) {
+	static U32 lastDraw;
+
 	if (!isDisplayDirty || !root) {
-		return false;
+		return;
 	}
 	{
 		BOXEDWINE_CRITICAL_SECTION;
 		if (!isDisplayDirty) {
-			return false;
+			return;
 		}
-		if (drawFps) {
-			// Flushes are capped too, or fps=30 would not mean 30 for GDI games: a frame they
-			// flush early stays dirty and is drawn at the deadline (runSlice checks every 1 ms).
-			U64 now = KSystem::getMicroCounter();
-			if (now < nextDrawUs) {
-				return false;
-			}
-			U64 interval = 1000000 / drawFps;
-			// next deadline from this one, so 60 means 60; a frame later than one interval starts over
-			nextDrawUs = now - nextDrawUs < interval ? nextDrawUs + interval : now + interval;
+		U32 now = KSystem::getMilliesSinceStart();
+		if (!vnboxDrawDue()) {
+			return;
 		}
+		lastDraw = now;
 		isDisplayDirty = false;
 	}
 
 	KNativeScreenPtr screen = KNativeSystem::getScreen();
 	if (!screen->canBltToScreen()) {
-		return false;
+		return;
 	}
-#ifdef __EMSCRIPTEN__
-	double compositeStart = vnboxStats.on ? emscripten_get_now() : 0;
-#endif
+	double compositeStart = vnboxStatNow();
 	screen->getInput()->runOnUiThread([screen, this]() {
 		bool childWasDrawn = false;
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED) && defined(BOXEDWINE_OPENGL_SDL)
@@ -609,13 +624,8 @@ bool XServer::draw(bool drawNow) {
 #endif
 		screen->present();
 	});	
-#ifdef __EMSCRIPTEN__
-	if (vnboxStats.on) {
-		vnboxStats.composites++;
-		vnboxStats.compositeMs += emscripten_get_now() - compositeStart;
-	}
-#endif
-	return true;
+	composited = true;
+	vnboxStatComposite(compositeStart);
 }
 
 XWindowPtr XServer::getWindow(U32 window) {
