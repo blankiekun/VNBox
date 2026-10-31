@@ -235,7 +235,8 @@ void hostHookHit(CPU* cpu) {
 enum : U32 {
     LIBC_NONE, LIBC_MEMCPY, LIBC_MEMMOVE, LIBC_MEMSET, LIBC_MEMCMP, LIBC_MEMCHR, LIBC_STRLEN, LIBC_STRNLEN,
     LIBC_STRCMP, LIBC_STRNCMP, LIBC_STRCHR, LIBC_STRRCHR, LIBC_STRCPY, LIBC_STRTOL, LIBC_STRTOUL,
-    LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_COUNT
+    LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_COUNT,
+    HOST_ACM = LIBC_COUNT // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
 };
 static const char* const hostLibcNames[LIBC_COUNT] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
@@ -289,9 +290,22 @@ static bool hostLibcParse(KFile* file) {
     return false;
 }
 
-// Called by KMemory::mmap for every file mapping; the first libc.so.6 mapped loads the table.
+bool hostAcmMapped(KFile* file, U32& driverProc); // hostacm.cpp
+bool hostAcmAt(const BString& path, U32 fileOffset);
+bool hostAcmRun(CPU* cpu);
+static std::atomic<bool> hostAcmAny;
+
+// Called by KMemory::mmap for every file mapping; the first libc.so.6 mapped loads the table, a known
+// vorbis.acm adds its DriverProc.
 void hostLibcMapped(KFile* file) {
-    if (hostLibcState || !file || !file->openFile || !file->openFile->node) return;
+    if (!file || !file->openFile || !file->openFile->node) return;
+    U32 driverProc;
+    if (hostAcmMapped(file, driverProc)) {
+        hostLibcPageOffsets[(driverProc & K_PAGE_MASK) >> 3] |= 1 << (driverProc & 7);
+        hostAcmAny = true;
+        return;
+    }
+    if (hostLibcState) return;
     const BString& path = file->openFile->node->path;
     if (!path.endsWith("/libc.so.6")) return;
 #ifdef __EMSCRIPTEN__
@@ -307,16 +321,20 @@ void hostLibcMapped(KFile* file) {
     klog_fmt("[vnbox] native libc: %s, %d functions", path.c_str(), (int)hostLibcEntries.size());
 }
 
-// LIBC_* when the block at eip (linear) starts one of the wrapped exports in this process, else LIBC_NONE.
+// LIBC_* (or HOST_ACM) when the block at eip (linear) starts one of the wrapped exports in this process, else LIBC_NONE.
 U32 hostLibcAt(CPU* cpu, U32 eip) {
-    if (hostLibcState != 1 || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
+    if ((hostLibcState != 1 && !hostAcmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();
     U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
-    if (!offset || !(process->getModuleName(eip) == hostLibcPath)) return LIBC_NONE;
-    for (auto& e : hostLibcEntries) {
-        if (e.first == offset) return e.second;
+    if (!offset) return LIBC_NONE;
+    BString name = process->getModuleName(eip);
+    if (hostLibcState == 1 && name == hostLibcPath) {
+        for (auto& e : hostLibcEntries) {
+            if (e.first == offset) return e.second;
+        }
+        return LIBC_NONE;
     }
-    return LIBC_NONE;
+    return hostAcmAny && hostAcmAt(name, offset) ? HOST_ACM : LIBC_NONE;
 }
 
 // Guest address as host RAM if its page is plain RAM with that access (the soft MMU's own fast-path test).
@@ -468,6 +486,7 @@ static bool libcStrtol(KMemory* memory, U32 nptr, U32 endptr, S32 base, bool isS
 // above it); on success sets EAX and pops the return address into eip, as the function's `ret` would.
 // False (nothing changed) means the guest function has to run.
 bool hostLibcRun(CPU* cpu, U32 fn) {
+    if (fn == HOST_ACM) return hostAcmRun(cpu);
     KMemory* memory = cpu->memory;
     if (cpu->getDirection() < 0 || cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF ||
         cpu->seg[CS].address || cpu->seg[DS].address || cpu->seg[ES].address || cpu->seg[SS].address ||
