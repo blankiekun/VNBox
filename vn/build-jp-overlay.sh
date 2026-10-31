@@ -4,7 +4,7 @@
 # the name to pick code page 932), plus the root fs's Wine prefix registry with unneeded
 # services turned off (see below), and Wine 11.0's wineboot and explorer with vn/wine/*.patch
 # (build-wine-boot.sh, needs Docker): they skip shell32/wininet/rpcss work a game doesn't use,
-# and wineboot imports jp-fonts.reg (below) once per version of the file, and quartz hands
+# and wineboot imports jp-fonts.reg (below) into prefixes older than this jp.zip's, and quartz hands
 # MPEG-1 movies to the browser page (/dev/vnbox-movie, vnbox-movie.js), and dsound mixes 16-bit
 # and float sound without a function call per sample; and ntdll.so and
 # wineserver built with ntsync support (build-wine-ntsync.sh); and the WebGL wined3d.dll with
@@ -29,11 +29,7 @@ test -s "$work/usr/lib/locale/ja_JP.utf8/LC_CTYPE"
 # Font replacements (jp-fonts.reg, imported by the patched wineboot): the Windows Japanese font names
 # as aliases of the IPA fonts. A version 5 .reg file is UTF-16LE, so the names don't depend on
 # the code page reg import runs under.
-{
-  printf 'Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\Wine\\Fonts\\Replacements]\r\n'
-  while IFS='|' read -r name font; do
-    printf '"%s"="%s"\r\n' "$name" "$font"
-  done <<'FONTS'
+cat > "$work/fonts.txt" <<'FONTS'
 MS Gothic|IPAGothic
 MS PGothic|IPAPGothic
 MS UI Gothic|IPAPGothic
@@ -44,6 +40,11 @@ MS PMincho|IPAPMincho
 ＭＳ 明朝|IPAMincho
 ＭＳ Ｐ明朝|IPAPMincho
 FONTS
+{
+  printf 'Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\Wine\\Fonts\\Replacements]\r\n'
+  while IFS='|' read -r name font; do
+    printf '"%s"="%s"\r\n' "$name" "$font"
+  done < "$work/fonts.txt"
   # Faster Wine boot: services.exe starts every auto-start service and root device before the
   # game may run (~1.4 s in VNBox). A VN needs none of these: the event log, Plug and Play,
   # networking drivers, and the Bluetooth/HID/USB buses (no such devices in the browser; HID
@@ -56,6 +57,8 @@ FONTS
   for d in $boot_devices; do
     printf '[-HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Enum\\ROOT\\WINE\\%s]\r\n\r\n' "$d"
   done
+  # No desktop shortcuts or file associations: winemenubuilder -a -r is a process per launch for nothing.
+  printf '[HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\RunServices]\r\n"winemenubuilder"=-\r\n\r\n'
 } > "$work/jp-fonts.utf8"
 { printf '\xff\xfe'; iconv -f UTF-8 -t UTF-16LE "$work/jp-fonts.utf8"; } > "$work/opt/wine/share/wine/jp-fonts.reg"
 rm "$work/jp-fonts.utf8"
@@ -88,13 +91,16 @@ cp "$here"/webgl/*.patch "$work/opt/wine/share/wine/vnbox-patches/webgl/"
 printf '\nhome/username/.wine/drive_c/webgl/wined3d.dll is Wine 11.0 with the WebGL series v47\n(tools/wineTests/webgl-test-divergences-v47.json) and the patches in webgl/, built by\nvn/build-webgl-wined3d.sh in https://github.com/blankiekun/VNBox.\n' \
   >> "$work/opt/wine/share/wine/vnbox-patches/README"
 
-# The root fs's prefix with the same changes, so a new prefix boots fast from the first launch.
-# Existing prefixes keep their own system.reg (it wins over the zips) and get the import.
+# The root fs's prefix with the same changes, so a new prefix boots fast from the first launch and
+# wineboot never imports into it: system.reg with the services off and no winemenubuilder, user.reg
+# with the font replacements and the file's hash (HKCU\Software\VNBox JpFontsReg, FNV-1a as in
+# wineboot-import-jp-fonts.patch). Existing prefixes keep their own .reg files (they win over the
+# zips) and get the import once.
 mkdir -p "$work/home/username/.wine"
 unzip -p "$root_zip" home/username/.wine/system.reg | python3 -c '
 import re, sys
 services, devices = sys.argv[1].split(), sys.argv[2].split()
-out, n = [], 0
+out, n, menu = [], 0, 0
 for block in re.split(r"(?m)^(?=\[)", sys.stdin.read()):
     m = re.match(r"\[System\\\\ControlSet001\\\\(Services|Enum\\\\ROOT\\\\WINE)\\\\([^]\\\\]+)", block)
     if m and m.group(1) == "Services" and m.group(2) in services and "]" == block[m.end()]:
@@ -102,9 +108,33 @@ for block in re.split(r"(?m)^(?=\[)", sys.stdin.read()):
         n += k
     elif m and m.group(1) != "Services" and m.group(2) in devices:
         continue
+    elif block.startswith("[Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunServices]"):
+        block, menu = re.subn(r"(?m)^\"winemenubuilder\"=.*\n", "", block)
     out.append(block)
 assert n == len(services), "a service to disable is missing from system.reg"
+assert menu == 1, "winemenubuilder is missing from system.reg RunServices"
 sys.stdout.write("".join(out))
 ' "$boot_services" "$boot_devices" > "$work/home/username/.wine/system.reg"
+unzip -p "$root_zip" home/username/.wine/user.reg | python3 -c '
+import sys
+fonts, reg = sys.argv[1:]
+data = open(reg, "rb").read()
+h = 2166136261
+for b in data:
+    h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+# Wine registry strings: \\ and \" escaped, other non-ASCII as UTF-16 units (\x + 4 digits, as wineserver saves them)
+def esc(s):
+    s = s.replace("\\", "\\\\").replace("\"", "\\\"")
+    u = s.encode("utf-16-le")
+    units = (int.from_bytes(u[i:i + 2], "little") for i in range(0, len(u), 2))
+    return "".join(chr(c) if c < 128 else "\\x%04x" % c for c in units)
+text = sys.stdin.read()
+assert "[Software\\\\Wine\\\\Fonts\\\\Replacements]" not in text and "[Software\\\\VNBox]" not in text
+pairs = [l.rstrip("\n").split("|") for l in open(fonts, encoding="utf-8") if l.strip()]
+text += "\n[Software\\\\Wine\\\\Fonts\\\\Replacements]\n" + "".join("\"%s\"=\"%s\"\n" % (esc(n), esc(f)) for n, f in pairs)
+text += "\n[Software\\\\VNBox]\n\"JpFontsReg\"=\"fnv1a-%08x\"\n" % h
+sys.stdout.write(text)
+' "$work/fonts.txt" "$work/opt/wine/share/wine/jp-fonts.reg" > "$work/home/username/.wine/user.reg"
+rm "$work/fonts.txt"
 rm -f "$out"
 (cd "$work" && find usr opt home | LC_ALL=C sort | zip -q -X -9 "$out" -@)
