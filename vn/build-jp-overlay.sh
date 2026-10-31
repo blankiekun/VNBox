@@ -77,7 +77,7 @@ mkdir -p "$work/opt/wine/bin"
 mv "$work/ntsync/wineserver" "$work/opt/wine/bin/"
 mv "$work/ntsync/patches" "$work/opt/wine/share/wine/vnbox-patches/rootfs"
 rm -r "$work/ntsync"
-printf '\nntdll.so (i386-unix) and wineserver (bin) are Wine 11.0 with the root fs patches in rootfs/\n(tools/buildWine/wine_builds.json), configured with Linux 6.14'"'"'s include/uapi/linux/ntsync.h,\nbuilt by vn/build-wine-ntsync.sh in https://github.com/blankiekun/VNBox.\n' \
+printf '\nntdll.so (i386-unix) and wineserver (bin) are Wine 11.0 with the root fs patches in rootfs/\n(tools/buildWine/wine_builds.json) and, ntdll.so only, ntdll-dir-search-cache.patch, configured with Linux 6.14'"'"'s include/uapi/linux/ntsync.h,\nbuilt by vn/build-wine-ntsync.sh in https://github.com/blankiekun/VNBox.\n' \
   >> "$work/opt/wine/share/wine/vnbox-patches/README"
 
 # WebGL WineD3D: Direct3D 10/11 SM4 shaders run on GLSL ES 3.00, and draws with no vertex shader

@@ -1,0 +1,123 @@
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -2708,6 +2708,85 @@
+ }
+ 
+ 
++/* VNBox: the results of recent searches, reused while their directory is unchanged. Games poll
++ * their save folder with FindFirstFile many times a second, and each poll otherwise reads and
++ * matches the whole directory again. Any create, delete or rename in the directory changes its
++ * mtime/ctime, so one fstat validates an entry. Protected by dir_mutex. */
++struct dir_search
++{
++    struct stat      st;    /* the directory when it was read: dev, ino, mtime, ctime */
++    struct dir_data *data;  /* the sorted result, with its mask */
++};
++
++static struct dir_search dir_searches[8];  /* most recently used first */
++
++static BOOL dir_search_matches( const struct dir_search *s, const struct stat *st, const UNICODE_STRING *mask )
++{
++    USHORT len = mask ? mask->Length : 0;
++
++    return s->data && s->st.st_dev == st->st_dev && s->st.st_ino == st->st_ino &&
++           s->st.st_mtime == st->st_mtime && s->st.st_ctime == st->st_ctime &&
++#ifdef HAVE_STRUCT_STAT_ST_MTIM
++           s->st.st_mtim.tv_nsec == st->st_mtim.tv_nsec && s->st.st_ctim.tv_nsec == st->st_ctim.tv_nsec &&
++#elif defined(HAVE_STRUCT_STAT_ST_MTIMESPEC)
++           s->st.st_mtimespec.tv_nsec == st->st_mtimespec.tv_nsec &&
++           s->st.st_ctimespec.tv_nsec == st->st_ctimespec.tv_nsec &&
++#endif
++           s->data->mask.Length == len && (!len || !memcmp( s->data->mask.Buffer, mask->Buffer, len ));
++}
++
++/* append the names of src to dst */
++static BOOL copy_dir_data_names( struct dir_data *dst, const struct dir_data *src )
++{
++    unsigned int i;
++
++    for (i = 0; i < src->count; i++)
++        if (!add_dir_data_names( dst, src->names[i].long_name, src->names[i].short_name, src->names[i].unix_name ))
++            return FALSE;
++    return TRUE;
++}
++
++/* the cached result of a search, or NULL */
++static const struct dir_data *find_dir_search( const struct stat *st, const UNICODE_STRING *mask )
++{
++    struct dir_search found;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(dir_searches); i++)
++        if (dir_search_matches( &dir_searches[i], st, mask )) break;
++    if (i == ARRAY_SIZE(dir_searches)) return NULL;
++    found = dir_searches[i];
++    memmove( dir_searches + 1, dir_searches, i * sizeof(*dir_searches) );
++    dir_searches[0] = found;
++    return found.data;
++}
++
++/* remember a search, dropping the least recently used one */
++static void add_dir_search( const struct dir_data *data, const struct stat *st )
++{
++    struct dir_search *last = &dir_searches[ARRAY_SIZE(dir_searches) - 1];
++    struct dir_data *copy;
++
++    /* a change within the timestamps' granularity (1 s, 2 s on FAT) of the read may leave them
++     * as they were, so only directories that have been unchanged for 2 s are cached */
++    if (st->st_mtime >= time( NULL ) - 1 || st->st_ctime >= time( NULL ) - 1) return;
++    if (!(copy = calloc( 1, sizeof(*copy) ))) return;
++    if (!copy_dir_data_names( copy, data ) ||
++        (data->mask.Length && !(copy->mask.Buffer = malloc( data->mask.Length ))))
++    {
++        free_dir_data( copy );
++        return;
++    }
++    copy->mask.Length = copy->mask.MaximumLength = data->mask.Length;
++    if (data->mask.Length) memcpy( copy->mask.Buffer, data->mask.Buffer, data->mask.Length );
++
++    free_dir_data( last->data );
++    memmove( dir_searches + 1, dir_searches, (ARRAY_SIZE(dir_searches) - 1) * sizeof(*dir_searches) );
++    dir_searches[0].st = *st;
++    dir_searches[0].data = copy;
++}
++
++
+ /***********************************************************************
+  *           init_cached_dir_data
+  *
+@@ -2719,10 +2798,18 @@
+     struct stat st;
+     NTSTATUS status;
+     unsigned int i;
++    const struct dir_data *cached = NULL;
++    BOOL have_st;
+ 
+     if (!(data = calloc( 1, sizeof(*data) ))) return STATUS_NO_MEMORY;
+ 
+-    if ((status = read_directory_data( data, fd, mask )))
++    have_st = !fstat( fd, &st );
++    if (have_st && (cached = find_dir_search( &st, mask )) && !copy_dir_data_names( data, cached ))
++    {
++        free_dir_data( data );
++        return STATUS_NO_MEMORY;
++    }
++    if (!cached && (status = read_directory_data( data, fd, mask )))
+     {
+         free_dir_data( data );
+         return status;
+@@ -2743,11 +2830,11 @@
+     i = 0;
+     if (i < data->count && !strcmp( data->names[i].unix_name, "." )) i++;
+     if (i < data->count && !strcmp( data->names[i].unix_name, ".." )) i++;
+-    if (i < data->count) qsort( data->names + i, data->count - i, sizeof(*data->names), name_compare );
++    if (!cached && i < data->count) qsort( data->names + i, data->count - i, sizeof(*data->names), name_compare );
++    if (!cached && have_st) add_dir_search( data, &st );
+ 
+     if (data->count)
+     {
+-        fstat( fd, &st );
+         data->id.dev = st.st_dev;
+         data->id.ino = st.st_ino;
+     }
