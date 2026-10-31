@@ -112,6 +112,7 @@ public:
 	static U32 drawFps; // frames shown per second at most, 0 = no limit (the fps= URL param on the web)
 	static U64 nextDrawUs; // KSystem::getMicroCounter() time the next frame may be drawn
 	static bool composited; // set by draw() when it composited a frame
+	static bool hidden; // the web page is in the background: nothing is drawn, the frame stays dirty for the next visible tick
 	void colorMapChanged(const XColorMapPtr& colorMap);
 	const XWindowPtr& getRoot();
 	U32 getEventTime();

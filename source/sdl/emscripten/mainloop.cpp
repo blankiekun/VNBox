@@ -136,9 +136,9 @@ static void updateMainLoopTiming(bool idle) {
             // woken every 1 ms. Input wakes the JSPI loop at once (doMainLoop).
             value = (int)std::min(nextTimer, idleWaitMs);
         }
-        // a frame the fps cap held back is drawn by the next tick once it is due
+        // a frame the fps cap held back is drawn by the next tick once it is due (not while hidden: nothing is drawn)
         XServer* server = XServer::getServer(true);
-        if (server && server->isDisplayDirty && server->getRoot() && XServer::drawFps && mode == EM_TIMING_SETTIMEOUT) {
+        if (server && server->isDisplayDirty && server->getRoot() && XServer::drawFps && !XServer::hidden && mode == EM_TIMING_SETTIMEOUT) {
             U64 now = KSystem::getMicroCounter();
             int due = XServer::nextDrawUs > now ? (int)((XServer::nextDrawUs - now + 999) / 1000) : 0;
             value = std::min(value, due);
@@ -300,6 +300,8 @@ bool doMainLoop() {
     // Firefox runs a chain of messages ahead of painting (one frame per ~80 ms while the
     // guest is busy, during movies and loads): once a frame is due, the next tick waits for it.
     // Input during an idle wait runs the next tick right after the event's handlers have queued it.
+    // A hidden page gets no frames: the guest and audio keep running, nothing is drawn (vnbox_set_hidden),
+    // a tick waiting for a frame goes on at once, and the next tick once visible draws the latest frame.
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
@@ -309,12 +311,21 @@ bool doMainLoop() {
         var timer = 0;
         var wait = function(delay) { timer = setTimeout(function() { timer = 0; next(); }, delay); };
         var wake = function() { if (timer) { clearTimeout(timer); wait(0); } };
+        var raf = 0; // the frame a tick waits for, which never comes once the page is hidden
+        var framed = function() { raf = 0; post(); };
+        var visibility = function() {
+            wasmExports["vnbox_set_hidden"](document.hidden ? 1 : 0);
+            if (!document.hidden) wake();
+            else if (raf) { cancelAnimationFrame(raf); framed(); }
+        };
+        document.addEventListener("visibilitychange", visibility);
+        visibility(); // a player opened in a background tab
         "keydown keyup mousedown mouseup mousemove wheel touchstart touchend touchmove".split(" ").forEach(function(type) {
             window.addEventListener(type, wake, true);
         });
         var next = function() { tick().then(function(delay) {
             if (delay >= 0) wait(delay);
-            else if (!document.hidden && performance.now() - lastFrame > 12) requestAnimationFrame(post);
+            else if (!document.hidden && performance.now() - lastFrame > 12) raf = requestAnimationFrame(framed);
             else post();
         }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", e); else console.error("tick failed: " + e); }); };
         channel.port1.onmessage = next;
@@ -329,6 +340,9 @@ bool doMainLoop() {
 }
 #ifdef BOXEDWINE_JSPI
 void cdromRunQueuedInsert();
+extern "C" EMSCRIPTEN_KEEPALIVE void vnbox_set_hidden(int hidden) {
+    XServer::hidden = hidden != 0;
+}
 extern "C" EMSCRIPTEN_KEEPALIVE int boxedwine_tick() {
     cdromRunQueuedInsert();
     mainloop();
