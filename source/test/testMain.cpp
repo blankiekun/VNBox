@@ -29,6 +29,7 @@
 #include "cpu/testBCD.h"
 #include "cpu/testBit.h"
 #include "cpu/testCallRet.h"
+#include "cpu/testHostLibc.h"
 #include "cpu/testCMov.h"
 #include "cpu/testCmp.h"
 #include "cpu/testCPU.h"
@@ -902,6 +903,10 @@ const TestEntry TEST_ENTRIES[] = {
     {testRetn32Iw_0x2c2, "Test Retn32,Iw 2c2"},
     {testRetn16_0x0c3, "Test Retn16 0c3"},
     {testRetn32_0x2c3, "Test Retn32 2c3"},
+    {testHostLibcCopy, "Test native libc memcpy/memmove/memset"},
+    {testHostLibcCompare, "Test native libc memcmp/strcmp/strncmp"},
+    {testHostLibcScan, "Test native libc strlen/memchr/strchr/strrchr/strcpy"},
+    {testHostLibcStrtol, "Test native libc strtol/strtoul"},
     {testCallJw_0x0e8, "Test Call Jw 0e8"},
     {testCallJd_0x2e8, "Test Call Jd 2e8"},
     {testCallR16_0x0ff, "Test Call R16 0ff"},

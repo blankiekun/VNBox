@@ -30,6 +30,8 @@
 #include "../emulation/cpu/jit/jitCodeLifecycle.h"
 #endif
 
+void hostLibcMapped(KFile* file); // hosthooks.cpp
+
 MappedFileCache::MappedFileCache(BString name, const std::shared_ptr<KFile>& file, U64 length)
     : name(name), file(file), length(length) {
 }
@@ -837,6 +839,7 @@ U32 KMemory::mmap(KThread* thread, U32 addr, U32 len, S32 prot, S32 flags, FD fi
                 this->process->mappedFiles.set(mappedFile->key, mappedFile);
             }
             this->data->allocPages(thread, pageStart, pageCount, permissions, fildes, off, mappedFile);
+            hostLibcMapped(mappedFile->file.get()); // native libc table (hosthooks.cpp), once
         } else {
             if (fixedReplacement) {
                 U32 result = this->unmapLocked(addr, len, replacementRetirements);

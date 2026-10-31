@@ -381,6 +381,24 @@ static void OPCALL hostHookOp(CPU* cpu, DecodedOp* op) {
 #endif
 }
 
+// Native libc (hosthooks.cpp): a wrapped export's block starts with hostLibcOp, which runs the call as
+// host code and returns, or else (a case it leaves to the guest) runs the function's first op as usual.
+U32 hostLibcAt(CPU* cpu, U32 eip);
+bool hostLibcRun(CPU* cpu, U32 fn);
+
+static void OPCALL hostLibcOp(CPU* cpu, DecodedOp* op) {
+    if (hostLibcRun(cpu, op->imm)) {
+        NEXT_DONE();
+        return;
+    }
+    DecodedOp* real = reinterpret_cast<DecodedOp*>(op->data.nextJump);
+#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT)
+    MUSTTAIL return normalDispatch(cpu, real);
+#else
+    real->pfn(cpu, real);
+#endif
+}
+
 static void initNormalOps() {
     if (normalOpsInitialized)
         return;
@@ -463,7 +481,9 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                 U32 eipLen = 0;
                 U32 address = startIp;
 
-                bool hooked = hostHookAt(this, startIp);
+                bool frida = hostHookAt(this, startIp);
+                U32 libcFn = frida || !this->isBig() ? 0 : hostLibcAt(this, startIp);
+                bool hooked = frida || libcFn;
                 op = decodeBlock(this, startIp, this->isBig(), opCount, eipLen, hooked ? 0 : 0xFFFFFFFF);
                 if (!op) {
                     return nullptr;
@@ -473,7 +493,8 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                     op->pfn = getFunctionForOp(op);
                     DecodedOp* head = DecodedOp::alloc();
                     head->inst = Custom1;
-                    head->pfn = hostHookOp;
+                    head->pfn = frida ? hostHookOp : hostLibcOp;
+                    head->imm = libcFn;
                     head->len = op->len;
                     head->flags2 = op->flags2;
                     head->flags |= OP_FLAG_NO_JIT;
