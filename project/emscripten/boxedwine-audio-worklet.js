@@ -177,7 +177,28 @@ addToLibrary({
         window.addEventListener(event, audio.resume, true);
       }
       if (navigator.userActivation && navigator.userActivation.hasBeenActive) audio.resume();
-      audio.timer = setInterval(function() { audio.tick(); }, 10);
+      context.addEventListener('statechange', audio.schedule);
+    },
+
+    // The 10 ms drain timer only has work while the context is not running,
+    // a node is still loading or a device drains; otherwise it would wake the
+    // main thread 100 times a second for nothing.
+    schedule: function() {
+      const audio = BoxedwineAudio;
+      let needed = false;
+      if (audio.context && audio.context.state !== 'closed') {
+        needed = audio.context.state !== 'running';
+        for (const device of audio.devices.values()) needed = needed || !device.node || device.closing;
+      }
+      if (needed && audio.timer === null) {
+        // Nothing was drained while the timer was off: count from now.
+        const now = performance.now();
+        for (const device of audio.devices.values()) device.lastDrain = now;
+        audio.timer = setInterval(audio.tick, 10);
+      } else if (!needed && audio.timer !== null) {
+        clearInterval(audio.timer);
+        audio.timer = null;
+      }
     },
 
     open: function(channels, rate, targetFrames) {
@@ -198,6 +219,7 @@ addToLibrary({
           queueFailures: 0, targetFrames: targetFrames
         };
         audio.devices.set(id, device);
+        audio.schedule();
         audio.loading.then(function() {
           if (!audio.devices.has(id) || audio.failed) return;
           try {
@@ -268,6 +290,7 @@ addToLibrary({
       if (drain && !BoxedwineAudio.failed && (device.node || BoxedwineAudio.queued(device))) {
         device.closing = true;
         Atomics.store(device.control, 2, 2);
+        BoxedwineAudio.schedule();
       }
       else BoxedwineAudio.dispose(device);
     },
@@ -291,6 +314,7 @@ addToLibrary({
         if (device.closing && (Atomics.load(device.control, 9) ||
             ((!device.node || audio.context.state !== 'running') && !audio.queued(device)))) audio.dispose(device);
       }
+      audio.schedule();
     },
 
     snapshot: function() {
