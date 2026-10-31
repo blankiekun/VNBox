@@ -21,7 +21,9 @@
 // Native libvorbis: games that ship libvorbis.dll (イマ, Muramasa, ...) decode their Ogg audio through it, emulated, in
 // x87 code the JIT runs ~40x slower than native. The decode-side exports get a head op (hostLibcOp, the native libc
 // mechanism in hosthooks.cpp) and run on host libvorbis (Emscripten port) instead, on a host copy of each guest
-// object: vorbis_info by guest vi, vorbis_dsp_state by guest vd, vorbis_block by guest vb.
+// object: vorbis_info by the guest vi's codec_setup pointer (vorbisfile copies vorbis_info structs by value, so the
+// vi address a stream is decoded with isn't always the one its headers went into), vorbis_dsp_state by guest vd,
+// vorbis_block by guest vb.
 //
 // - Host only (the guest function never runs): vorbis_synthesis, _trackonly, _blockin, _pcmout, _read. After each,
 //   the guest vd's public fields are set from the host's; _pcmout copies the host's pending samples into the guest's
@@ -200,14 +202,14 @@ U32 hostVorbisAt(CPU* cpu, U32 eip) {
 
 #ifdef BOXEDWINE_HOST_VORBIS
 struct HostVorbisInfo { vorbis_info vi; vorbis_comment vc; bool ok = true; };
-struct HostVorbisDsp { vorbis_dsp_state vd; U64 viKey; bool host = true, checked = false; };
+struct HostVorbisDsp { vorbis_dsp_state vd; U64 viKey; U32 guestVi; bool host = true, checked = false; };
 struct HostVorbisBlock { vorbis_block vb; HostVorbisDsp* dsp; };
-static std::unordered_map<U64, std::unique_ptr<HostVorbisInfo>> hostVorbisInfos; // pid << 32 | guest vi
+static std::unordered_map<U64, std::unique_ptr<HostVorbisInfo>> hostVorbisInfos; // pid << 32 | guest vi->codec_setup
 static std::unordered_map<U64, std::unique_ptr<HostVorbisDsp>> hostVorbisDsps; // pid << 32 | guest vd
 static std::unordered_map<U64, std::unique_ptr<HostVorbisBlock>> hostVorbisBlocks; // pid << 32 | guest vb
 
 // Guest vorbis_dsp_state offsets (public, libvorbis 1.x, 32-bit with 8-aligned int64 like MSVC/MinGW).
-enum : U32 { VD_VI = 4, VD_PCM = 8, VD_PCMRET = 0xc, VD_PCM_STORAGE = 0x10, VD_PCM_CURRENT = 0x14, VD_SIZE = 0x48 };
+enum : U32 { VI_CHANNELS = 4, VI_CODEC_SETUP = 0x1c, VD_VI = 4, VD_PCM = 8, VD_PCMRET = 0xc, VD_PCM_STORAGE = 0x10, VD_PCM_CURRENT = 0x14, VD_SIZE = 0x48 };
 
 static void hostVorbisFreeBlock(decltype(hostVorbisBlocks)::iterator it) {
     vorbis_block_clear(&it->second->vb);
@@ -271,22 +273,28 @@ bool hostVorbisRun(CPU* cpu, U32 fn) {
         cpu->seg[ES].address || cpu->seg[SS].address || !memory->canRead(ESP, 16)) return false;
     U64 pid = (U64)cpu->thread->process->id << 32;
     U32 a0 = memory->readd(ESP + 4), a1 = memory->readd(ESP + 8), a2 = memory->readd(ESP + 12);
+    auto infoKey = [&](U32 vi) -> U64 { // 0 when the guest vi isn't readable or has no codec_setup
+        U32 setup = vi && memory->canRead(vi + VI_CODEC_SETUP, 4) ? memory->readd(vi + VI_CODEC_SETUP) : 0;
+        return setup ? pid | setup : 0;
+    };
     static thread_local std::vector<U8> data;
     ogg_packet op;
     S32 result = 0;
     switch (fn) {
     case VB_HEADERIN: { // (vi, vc, op)
+        U64 key = infoKey(a0);
+        if (!key) return false;
         if (!hostVorbisPacket(memory, a2, op, data)) {
-            hostVorbisFreeInfo(pid | a0); // can't follow this vi any more
+            hostVorbisFreeInfo(key); // can't follow this vi any more
             return false;
         }
-        auto it = hostVorbisInfos.find(pid | a0);
+        auto it = hostVorbisInfos.find(key);
         if (op.bytes >= 7 && op.packet[0] == 1 && !memcmp(op.packet + 1, "vorbis", 6)) { // id header: a new stream
-            if (it != hostVorbisInfos.end()) hostVorbisFreeInfo(pid | a0);
+            if (it != hostVorbisInfos.end()) hostVorbisFreeInfo(key);
             auto info = std::make_unique<HostVorbisInfo>();
             vorbis_info_init(&info->vi);
             vorbis_comment_init(&info->vc);
-            it = hostVorbisInfos.emplace(pid | a0, std::move(info)).first;
+            it = hostVorbisInfos.emplace(key, std::move(info)).first;
         }
         if (it != hostVorbisInfos.end() && it->second->ok && vorbis_synthesis_headerin(&it->second->vi, &it->second->vc, &op)) it->second->ok = false;
         return false;
@@ -294,10 +302,15 @@ bool hostVorbisRun(CPU* cpu, U32 fn) {
     case VB_SYNTHESIS_INIT: { // (vd, vi)
         auto old = hostVorbisDsps.find(pid | a0);
         if (old != hostVorbisDsps.end()) hostVorbisFreeDsp(old);
-        auto info = hostVorbisInfos.find(pid | a1);
-        if (info == hostVorbisInfos.end() || !info->second->ok) return false;
+        U64 key = infoKey(a1);
+        auto info = hostVorbisInfos.find(key);
+        if (!key || info == hostVorbisInfos.end() || !info->second->ok) {
+            klog_fmt("[vnbox] native vorbis: vd %x init with vi %x whose headers weren't followed, decoded by the guest", a0, a1);
+            return false;
+        }
         auto dsp = std::make_unique<HostVorbisDsp>();
-        dsp->viKey = pid | a1;
+        dsp->viKey = key;
+        dsp->guestVi = a1;
         if (vorbis_synthesis_init(&dsp->vd, &info->second->vi)) return false;
         hostVorbisDsps.emplace(pid | a0, std::move(dsp));
         return false;
@@ -319,7 +332,7 @@ bool hostVorbisRun(CPU* cpu, U32 fn) {
         return false;
     }
     case VB_HALFRATE: { // (vi, flag)
-        auto info = hostVorbisInfos.find(pid | a0);
+        auto info = hostVorbisInfos.find(infoKey(a0));
         if (info != hostVorbisInfos.end() && info->second->ok) vorbis_synthesis_halfrate(&info->second->vi, (int)a1);
         return false;
     }
@@ -334,7 +347,7 @@ bool hostVorbisRun(CPU* cpu, U32 fn) {
         return false;
     }
     case VB_INFO_CLEAR:
-        hostVorbisFreeInfo(pid | a0);
+        if (U64 key = infoKey(a0)) hostVorbisFreeInfo(key);
         return false;
     case VB_LAPOUT: {
         static bool logged;
@@ -351,9 +364,9 @@ bool hostVorbisRun(CPU* cpu, U32 fn) {
             U32 vd = 0;
             for (auto& d : hostVorbisDsps) if (d.second.get() == dsp) vd = (U32)d.first;
             const vorbis_info* vi = dsp->vd.vi;
-            bool ok = vd && memory->canRead(vd, VD_SIZE) && memory->canWrite(vd, VD_SIZE) && memory->readd(vd + VD_VI) == (U32)dsp->viKey &&
-                memory->readd(vd + VD_PCM_STORAGE) == (U32)dsp->vd.pcm_storage && memory->canRead((U32)dsp->viKey, 8) &&
-                memory->readd((U32)dsp->viKey + 4) == (U32)vi->channels;
+            bool ok = vd && memory->canRead(vd, VD_SIZE) && memory->canWrite(vd, VD_SIZE) && memory->readd(vd + VD_VI) == dsp->guestVi &&
+                memory->readd(vd + VD_PCM_STORAGE) == (U32)dsp->vd.pcm_storage && infoKey(dsp->guestVi) == dsp->viKey &&
+                memory->readd(dsp->guestVi + VI_CHANNELS) == (U32)vi->channels;
             klog_fmt("[vnbox] native vorbis: stream at vd %x (%d ch, %ld Hz) decoded by the %s", vd, vi->channels, vi->rate, ok ? "host" : "guest");
             if (!ok) {
                 vorbis_dsp_clear(&dsp->vd);

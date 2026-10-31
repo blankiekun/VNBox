@@ -30,7 +30,7 @@ bool hostVorbisRun(CPU* cpu, U32 fn);
 namespace {
 
 constexpr U32 HEAP = 0xF0000000; // 32 RW pages (testCPU.cpp)
-constexpr U32 STACK = HEAP + 0x400, VI = HEAP + 0x500, VC = HEAP + 0x540, VD = HEAP + 0x600, VB = HEAP + 0x700;
+constexpr U32 STACK = HEAP + 0x400, VI = HEAP + 0x500, VI2 = HEAP + 0x5a0, SETUP = HEAP + 0x5e0, VC = HEAP + 0x540, VD = HEAP + 0x600, VB = HEAP + 0x700;
 constexpr U32 OP = HEAP + 0x800, PCMARR = HEAP + 0x900, RETARR = HEAP + 0x910, PCMOUT = HEAP + 0x920;
 constexpr U32 PACKET = HEAP + 0x1000, CH0 = HEAP + 0x8000, CH1 = HEAP + 0x10000, RET = 0x12345678;
 
@@ -134,8 +134,11 @@ void guestInit(int storage, U32 vdVi) {
     testNewInstruction(0);
     for (int s : { CS, DS, ES, SS }) cpu->seg[s].address = 0;
     memory->memset(HEAP, 0, 32 * K_PAGE_SIZE);
-    memory->writed(VI + 4, 2); // channels
-    memory->writed(VI + 8, 44100);
+    for (U32 vi : { VI, VI2 }) { // VI2: a by-value copy, as vorbisfile makes (same codec_setup)
+        memory->writed(vi + 4, 2); // channels
+        memory->writed(vi + 8, 44100);
+        memory->writed(vi + 0x1c, SETUP);
+    }
     memory->writed(VD + 4, vdVi);
     memory->writed(VD + 8, PCMARR);
     memory->writed(VD + 0xc, RETARR);
@@ -144,12 +147,12 @@ void guestInit(int storage, U32 vdVi) {
     memory->writed(PCMARR + 4, CH1);
 }
 
-void initCalls(const std::vector<ogg_packet>& packets) {
+void initCalls(const std::vector<ogg_packet>& packets, U32 initVi) {
     for (int i = 0; i < 3; i++) {
         putPacket(packets[i]);
         if (call("vorbis_synthesis_headerin", { VI, VC, OP })) testFail("headerin not left to the guest");
     }
-    if (call("vorbis_synthesis_init", { VD, VI })) testFail("synthesis_init not left to the guest");
+    if (call("vorbis_synthesis_init", { VD, initVi })) testFail("synthesis_init not left to the guest");
     if (call("vorbis_block_init", { VD, VB })) testFail("block_init not left to the guest");
 }
 
@@ -166,8 +169,8 @@ void testHostVorbisDecode() {
     int blocksize1;
     std::vector<ogg_packet> packets = encode(store, blocksize1);
     std::vector<float> want = reference(packets), got;
-    guestInit(blocksize1, VI);
-    initCalls(packets);
+    guestInit(blocksize1, VI2);
+    initCalls(packets, VI2); // headers went into VI, the stream decodes with its copy
     for (size_t i = 3; i < packets.size(); i++) {
         putPacket(packets[i]);
         if (!call("vorbis_synthesis", { VB, OP })) testFail("synthesis not done on the host");
@@ -198,7 +201,7 @@ void testHostVorbisDecode() {
     clearCalls();
     // a guest vd that doesn't point at the vi it was initialized with (another layout): left to the guest for good
     guestInit(blocksize1, VI + 4);
-    initCalls(packets);
+    initCalls(packets, VI);
     putPacket(packets[3]);
     if (call("vorbis_synthesis", { VB, OP })) testFail("mismatched vd taken");
     if (call("vorbis_synthesis_pcmout", { VD, 0 })) testFail("mismatched vd's pcmout taken");
