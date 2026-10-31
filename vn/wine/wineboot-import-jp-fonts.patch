@@ -1,27 +1,33 @@
 diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
 --- a/programs/wineboot/wineboot.c
 +++ b/programs/wineboot/wineboot.c
-@@ -1464,6 +1464,45 @@
+@@ -1464,6 +1464,51 @@
      return 1;
  }
  
 +/* VNBox: the player used to start every game as "cmd /c reg import jp-fonts.reg & game", so
 + * conhost, cmd and reg ran before the game on each launch (about 2 s in the emulator). wineboot
 + * imports the file instead, once per version of it, and before services.exe starts, so the
-+ * service settings in it apply from that launch on. */
++ * service settings in it apply from that launch on. The version is a hash of the file, which
++ * jp.zip's prefix carries with the values already in it, so a new prefix never imports. */
 +static void import_vnbox_reg(void)
 +{
 +    static const WCHAR file[] = L"Z:\\opt\\wine\\share\\wine\\jp-fonts.reg";
-+    WIN32_FILE_ATTRIBUTE_DATA data;
 +    WCHAR stamp[64], old[64], cmdline[MAX_PATH];
-+    DWORD size = sizeof(old), code = 1;
++    DWORD size = sizeof(old), code = 1, len, i, hash = 2166136261u;
 +    STARTUPINFOW si = { sizeof(si) };
 +    PROCESS_INFORMATION pi;
++    BYTE buf[4096];
++    HANDLE file_handle;
 +    HKEY key;
 +
-+    if (!GetFileAttributesExW( file, GetFileExInfoStandard, &data )) return;
-+    swprintf( stamp, ARRAY_SIZE(stamp), L"%lu-%08lx%08lx", data.nFileSizeLow,
-+              data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime );
++    /* FNV-1a, as vn/build-jp-overlay.sh computes it for the prefix it bakes */
++    file_handle = CreateFileW( file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
++    if (file_handle == INVALID_HANDLE_VALUE) return;
++    while (ReadFile( file_handle, buf, sizeof(buf), &len, NULL ) && len)
++        for (i = 0; i < len; i++) hash = (hash ^ buf[i]) * 16777619u;
++    CloseHandle( file_handle );
++    swprintf( stamp, ARRAY_SIZE(stamp), L"fnv1a-%08lx", hash );
 +    if (RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\VNBox", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL ))
 +        return;
 +    /* the font check: a prefix whose registry was saved without the import's values imports again */
@@ -47,7 +53,7 @@ diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
  static BOOL start_services_process(void)
  {
      static const WCHAR svcctl_started_event[] = SVCCTL_STARTED_EVENT;
-@@ -1938,6 +1977,7 @@
+@@ -1938,6 +1983,7 @@
      if (init || (kill && !restart))
      {
          ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServices", FALSE, FALSE );
