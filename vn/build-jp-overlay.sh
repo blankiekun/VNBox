@@ -65,11 +65,11 @@ rm "$work/jp-fonts.utf8"
 
 # Faster boot, part 2: patched wineboot (no shell32/wininet for its registry defaults) and explorer
 # (no Program Manager DDE or ShellWindows on a desktop without the shell), with their LGPL source;
-# quartz with browser movies, and dsound with the call-free mixer.
+# quartz with browser movies, dsound with the call-free mixer, and wineoss with a 20 ms audio period.
 "$here/build-wine-boot.sh" "$work/opt/wine/lib/wine/i386-unix"
 mkdir -p "$work/opt/wine/share/wine/vnbox-patches"
 cp "$here"/wine/*.patch "$work/opt/wine/share/wine/vnbox-patches/"
-printf 'wineboot.exe.so, explorer.exe.so, quartz.dll.so and dsound.dll.so in opt/wine/lib/wine/i386-unix are Wine 11.0\n(LGPL-2.1, https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz) with these\npatches, built by vn/build-wine-boot.sh in https://github.com/blankiekun/VNBox.\n' \
+printf 'wineboot.exe.so, explorer.exe.so, quartz.dll.so, dsound.dll.so and wineoss.so in opt/wine/lib/wine/i386-unix are Wine 11.0\n(LGPL-2.1, https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz) with these\npatches, built by vn/build-wine-boot.sh in https://github.com/blankiekun/VNBox.\n' \
   > "$work/opt/wine/share/wine/vnbox-patches/README"
 
 # ntsync: the root fs's ntdll.so and wineserver rebuilt with linux/ntsync.h, so event, mutex and
