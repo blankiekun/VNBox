@@ -957,6 +957,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostAcmBadSource, "Test a bad source length can't make the host allocate gigabytes"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
     {testHostVorbisSeek, "Test native libvorbis restart, trackonly and a second stream on the same objects"},
+    {testHostVorbisPack16, "Test native libvorbisfile ov_read pack"},
 #endif
 #ifdef BOXEDWINE_HOST_FREETYPE
     {testHostFreetypeGlyphs, "Test host FreeType faces and glyphs as win32u uses them"},
