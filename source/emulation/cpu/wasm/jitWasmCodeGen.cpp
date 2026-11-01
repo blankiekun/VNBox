@@ -5083,11 +5083,11 @@ static void submitPendingWasmJitBlock(CPU* cpu, DecodedOp* op, U32 address, U32 
     U64 byteCount = pending->bytes.size();
     WasmJitBatchKey key{pending->memory, pending->mappedFileKey};
     WasmJitPendingKind pendingKind = pending->kind;
-    if (pendingKind == WasmJitPendingKind::FileBatch) {
+    if (mappedFileKey) {
         ++g_wasmJitRuntimeStats.translatedFileBacked;
     } else {
         ++g_wasmJitRuntimeStats.translatedAnonymous;
-        ++g_wasmJitRuntimeStats.tinyDeferred;
+        if (pendingKind == WasmJitPendingKind::TinyAnonymous) ++g_wasmJitRuntimeStats.tinyDeferred;
     }
     g_wasmJitRuntimeStats.rawInputBytes += byteCount;
     registerPendingWasmJitBlock(std::move(pending));
@@ -15158,17 +15158,15 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
                 (U32)(uintptr_t)&contextTimeRemaining,
                 (U32)m_relocValues.size());
         }
-        if (mappedFile) {
-            submitPendingWasmJitBlock(cpu, op, this->startingEip, this->blockOpCount, this->emulatedLen, mappedFile->key, WasmJitPendingKind::FileBatch, m_needsWasmMemoryPageArrays, std::move(m_wasmBinary), std::move(m_relocValues));
-            return;
-        }
-        if (this->blockOpCount < 4) {
+        if (!mappedFile && this->blockOpCount < 4) {
             submitPendingWasmJitBlock(cpu, op, this->startingEip, this->blockOpCount, this->emulatedLen, 0, WasmJitPendingKind::TinyAnonymous, m_needsWasmMemoryPageArrays, std::move(m_wasmBinary), std::move(m_relocValues));
             return;
         }
-        bool retryProbe = wasmJitBeginOomRetryProbe();
-        tableIdx = boxedwine_wasm_instantiate(m_wasmBinary.data(), (int)m_wasmBinary.size(), g_wasmHelperTable, WASM_HELPER_COUNT);
-        wasmJitRecordStandaloneTranslation(m_wasmBinary.size(), tableIdx, retryProbe);
+        // Anonymous code batches too, keyed by address space (key 0): Wine loads PEs whose file alignment isn't the
+        // page size into anonymous memory (Muramasa's exe, game DLLs), and as one module per block nearly every
+        // chained hop between them crossed instances, which Firefox makes ~20-30 ns slower than a same-instance hop.
+        submitPendingWasmJitBlock(cpu, op, this->startingEip, this->blockOpCount, this->emulatedLen, mappedFile ? mappedFile->key : 0, WasmJitPendingKind::FileBatch, m_needsWasmMemoryPageArrays, std::move(m_wasmBinary), std::move(m_relocValues));
+        return;
     }
   #else
     if (g_wasmJitTestRuntimeBatchingEnabled) {
@@ -15177,10 +15175,8 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
             MappedFilePtr mappedFile = cpu->thread->process->getMappedFileForRange(this->startingEip, this->emulatedLen);
             mappedFileKey = mappedFile ? (S32)mappedFile->key : 0;
         }
-        if (mappedFileKey || this->blockOpCount < 4) {
-            submitPendingWasmJitBlock(cpu, op, this->startingEip, this->blockOpCount, this->emulatedLen, (U32)mappedFileKey, mappedFileKey ? WasmJitPendingKind::FileBatch : WasmJitPendingKind::TinyAnonymous, m_needsWasmMemoryPageArrays, std::move(m_wasmBinary), std::move(m_relocValues));
-            return;
-        }
+        submitPendingWasmJitBlock(cpu, op, this->startingEip, this->blockOpCount, this->emulatedLen, (U32)mappedFileKey, (mappedFileKey || this->blockOpCount >= 4) ? WasmJitPendingKind::FileBatch : WasmJitPendingKind::TinyAnonymous, m_needsWasmMemoryPageArrays, std::move(m_wasmBinary), std::move(m_relocValues));
+        return;
     }
     bool retryProbe = wasmJitBeginOomRetryProbe();
     int tableIdx = boxedwine_wasm_instantiate(m_wasmBinary.data(), (int)m_wasmBinary.size(), g_wasmHelperTable, WASM_HELPER_COUNT);

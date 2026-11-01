@@ -1805,8 +1805,14 @@ void testWasmJitTinyAnonymousPromotion() {
     }
 
     DecodedOp* normal = compile(normalAddress);
-    if (!isStandaloneJit(normal) || wasmJitTestPendingCount() != 0 || wasmJitTestRuntimeGroupCount() != 0) {
-        testFail("four-op anonymous block installs immediately");
+    if (!normal || !(normal->flags2 & OP_FLAG2_WASM_JIT_PENDING) || normal->pfnJitCode || wasmJitTestPendingCount() != 1) {
+        testFail("four-op anonymous block waits in its address space's runtime batch");
+        return;
+    }
+    wasmJitHandlePendingHit(testContext().cpu, normal);
+    wasmJitHandlePendingHit(testContext().cpu, normal);
+    if (!isStandaloneJit(normal) || wasmJitTestPendingCount() != 0 || wasmJitTestRuntimeGroupCount() != 1) {
+        testFail("four-op anonymous block installs through a runtime batch group");
     }
 
     DecodedOp* invalidated = compile(invalidatedAddress);
@@ -1880,13 +1886,12 @@ void testWasmJitGroupedOomRecovery() {
     limits.maxProcessOpenBytes = 4 * 1024 * 1024;
     wasmJitTestSetBatchLimits(limits);
     wasmJitTestSetMappedFileKeyOverride(0);
+    wasmJitTestSetTinyAdditionalHits(1);
     wasmJitTestEnableRuntimeBatching(true);
 
+    // A tiny anonymous block promotes to a standalone slot (other anonymous blocks batch).
     U32 releasableAddress = testContext().codeIp;
     testPushCode8(0x40); // inc eax
-    testPushCode8(0x41); // inc ecx
-    testPushCode8(0x42); // inc edx
-    testPushCode8(0x43); // inc ebx
     testPushCode8(0xcd);
     testPushCode8(0x97);
 
@@ -1908,6 +1913,7 @@ void testWasmJitGroupedOomRecovery() {
     };
 
     DecodedOp* releasable = compile(releasableAddress);
+    wasmJitHandlePendingHit(testContext().cpu, releasable);
     if (!isInstalled(releasable)) {
         testFail("grouped OOM setup creates a releasable standalone slot");
         return;
