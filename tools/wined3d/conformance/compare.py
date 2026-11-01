@@ -8,7 +8,8 @@ from collections import defaultdict
 
 ESC = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
 STAMP = re.compile(r'^\[[0-9.]+\] ')
-END = re.compile(r'^### END (\d+) (\S+) ok=(-?\d+) fail=(-?\d+) todofail=(-?\d+) todo=(-?\d+) skip=(-?\d+)')
+# the tail can be cut by another console line written into the middle of it (Chromium): missing counts are 0
+END = re.compile(r'^### END (\d+) (\S+) ok=(-?\d+) fail=(-?\d+) todofail=(-?\d+) todo=(-?\d+)(?: skip=(-?\d+))?')
 FAILED = re.compile(r'^(\w+\.c):(\d+): (Test failed|Test succeeded inside todo block)')
 
 
@@ -30,7 +31,7 @@ def parse(path):
             if f.get('state') != 'crash':
                 f['state'] = 'done'
             for i, n in enumerate(('ok', 'fail', 'todofail', 'todo', 'skip')):
-                f[n] = int(m[3 + i])
+                f[n] = int(m[3 + i] or 0)
             cur = None
             continue
         m = re.match(r'^### (CRASH|HANG) (\d+) (\S+) ?(.*)', line)
