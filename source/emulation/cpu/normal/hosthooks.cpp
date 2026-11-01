@@ -236,7 +236,8 @@ enum : U32 {
     LIBC_NONE, LIBC_MEMCPY, LIBC_MEMMOVE, LIBC_MEMSET, LIBC_MEMCMP, LIBC_MEMCHR, LIBC_STRLEN, LIBC_STRNLEN,
     LIBC_STRCMP, LIBC_STRNCMP, LIBC_STRCHR, LIBC_STRRCHR, LIBC_STRCPY, LIBC_STRTOL, LIBC_STRTOUL,
     LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_COUNT,
-    HOST_ACM = LIBC_COUNT // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
+    HOST_ACM = LIBC_COUNT, // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
+    HOST_VORBIS // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
 };
 static const char* const hostLibcNames[LIBC_COUNT] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
@@ -294,6 +295,8 @@ bool hostAcmMapped(KFile* file, U32& driverProc); // hostacm.cpp
 bool hostAcmAt(const BString& path, U32 fileOffset);
 bool hostAcmRun(CPU* cpu);
 static std::atomic<bool> hostAcmAny;
+U32 hostVorbisAt(CPU* cpu, U32 eip); // hostvorbis.cpp
+bool hostVorbisRun(CPU* cpu, U32 fn);
 
 // Called by KMemory::mmap for every file mapping; the first libc.so.6 mapped loads the table, a known
 // vorbis.acm adds its DriverProc.
@@ -321,8 +324,10 @@ void hostLibcMapped(KFile* file) {
     klog_fmt("[vnbox] native libc: %s, %d functions", path.c_str(), (int)hostLibcEntries.size());
 }
 
-// LIBC_* (or HOST_ACM) when the block at eip (linear) starts one of the wrapped exports in this process, else LIBC_NONE.
+// LIBC_* (or HOST_ACM, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
+// process, else LIBC_NONE.
 U32 hostLibcAt(CPU* cpu, U32 eip) {
+    if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
     if ((hostLibcState != 1 && !hostAcmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();
     U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
@@ -487,6 +492,7 @@ static bool libcStrtol(KMemory* memory, U32 nptr, U32 endptr, S32 base, bool isS
 // False (nothing changed) means the guest function has to run.
 bool hostLibcRun(CPU* cpu, U32 fn) {
     if (fn == HOST_ACM) return hostAcmRun(cpu);
+    if (fn >= HOST_VORBIS) return hostVorbisRun(cpu, fn - HOST_VORBIS);
     KMemory* memory = cpu->memory;
     if (cpu->getDirection() < 0 || cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF ||
         cpu->seg[CS].address || cpu->seg[DS].address || cpu->seg[ES].address || cpu->seg[SS].address ||
