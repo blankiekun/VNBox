@@ -955,6 +955,9 @@ public:
     bool shouldStopBlockBefore(U32 eip, DecodedOp* op) override;
     bool supportsConditionalSideExit(U32, U32) const override { return true; }
 
+    // Recompiling a hot block into a hot group (ST): no entry counter, joins the hot batch.
+    bool m_hotTier = false;
+    void emitHotEntryCounter(DecodedOp* op);
     // Per-block exit metadata recorded while compiling, exported with the
     // saved module as boxedwine-jit-manifest.json so the offline cache
     // pipeline can build the successor graph for grouping and direct-call
@@ -964,6 +967,7 @@ public:
     U32 m_manifestNext2Target = 0;
     U32 m_manifestJumpTarget = 0;
     U32 m_manifestNext1Count = 0;
+    U32 m_hopKind = 3; // hop-count builds (BOXEDWINE_WASM_JIT_HOPCOUNT): exit kind of the next chain
     U32 m_manifestNext2Count = 0;
     U32 m_manifestJumpCount = 0;
     struct ForwardTarget {
@@ -1312,6 +1316,11 @@ void wasmJitTestSetTinyAdditionalHits(U32 hits);
 extern "C" void wasmJitTestFailBatchAfterSlots(S32 slotCount);
 void wasmJitTestResetRuntimeBatching();
 U32 wasmJitTestPendingCount();
+void wasmJitTestSetHotGroups(U32 entries, double waitMs);
+U32 wasmJitTestHotQueueSize();
+void wasmJitTestHotFlush(CPU* cpu);
+U64 wasmJitTestHotModules();
+U64 wasmJitTestHotBlocks();
 bool wasmJitTestRelocAllocationTransfer();
 U32 wasmJitTestSealedCount();
 extern "C" U32 wasmJitTestRuntimeGroupCount();

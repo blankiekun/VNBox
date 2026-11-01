@@ -255,6 +255,9 @@ static void statsTickStart(int asked) {
             s.jitEntries / sec, s.blocksCompiled / sec,
             s.wineserverMs / sec, s.wineserverRequests / sec, statsWineRequests(s, sec).c_str(), s.signals / sec, s.faults / sec,
             s.codePageWrites / sec, s.codeRemovedByWrite / sec, s.opsNoJitDynamic / sec, s.sysCount[407] / sec, s.audioUnderruns / sec, s.audioQueuedMinMs, s.zipMisses / sec, s.zipMs / sec, js);
+#if defined(BOXEDWINE_WASM_JIT_HOPCOUNT) && !defined(BOXEDWINE_MULTI_THREADED)
+        { extern void hopStatsPrint(double); hopStatsPrint(sec); } // HOPCOUNT
+#endif
         s = VnboxStats();
         s.on = true;
         statsLastLog = now;
