@@ -505,6 +505,11 @@ public:
     // --- JitFPU backend hooks ---
     bool supportsFpuStackCache() const override { return true; }
     bool supportsFpuLoopCache() const override { return true; }
+    int fastX87() const override;
+    void roundFpuResultToPrecision(FPURegPtr result) override;
+    void guardCachedFpuFallback(RegPtr state) override;
+    // Rounds f64 local src by cpu->fpu.round into local dst without a branch.
+    void emitFastX87RoundByMode(U32 src, U32 dst);
     void materializeFpuCache(U8 slotMask = 0xff) override;
     RegPtr getFpuCacheValidReg(U8 index) override;
     FPURegPtr getFpuCacheReg(U8 index) override;
