@@ -1209,6 +1209,15 @@ static void wasmJitRecordHelperDetail(WasmJitHelperDetail detail) {
 #define WASM_JIT_HELPER_STAT(STAT) do {} while (0)
 #define WASM_JIT_HELPER_DETAIL(DETAIL) do {} while (0)
 #endif
+#ifdef __TEST
+// testJit: count memory slow-path helper calls, so tests can tell whether
+// an access took the inline fast path.
+static std::atomic<U32> g_wasmJitTestMemHelperCalls{0};
+extern "C" U32 wasmJitTestMemHelperCalls() { return g_wasmJitTestMemHelperCalls.load(); }
+#define WASM_JIT_TEST_MEM_STAT(STAT) do { if (!strncmp(#STAT, "ReadMem", 7) || !strncmp(#STAT, "WriteMem", 8)) g_wasmJitTestMemHelperCalls++; } while (0)
+#else
+#define WASM_JIT_TEST_MEM_STAT(STAT) do {} while (0)
+#endif
 
 #ifdef BOXEDWINE_MULTI_THREADED
 #ifndef WASM_JIT_MT_CHAIN_BLOCK_LIMIT
@@ -4394,7 +4403,7 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
 // (rather than cpu->src.u32 / cpu->dst.u32) keeps lazy-flag state intact
 // across an RMW op's callback.
 static void wasmHelper_readMem32(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(ReadMem);
+    WASM_JIT_HELPER_STAT(ReadMem); WASM_JIT_TEST_MEM_STAT(ReadMem);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemRead();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemReadUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);
@@ -4402,7 +4411,7 @@ static void wasmHelper_readMem32(CPU* cpu) {
     cpu->memHelperValue = cpu->memory->readd(cpu->memHelperAddr);
 }
 static void wasmHelper_writeMem32(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(WriteMem);
+    WASM_JIT_HELPER_STAT(WriteMem); WASM_JIT_TEST_MEM_STAT(WriteMem);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemWrite();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemWriteUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);
@@ -4410,7 +4419,7 @@ static void wasmHelper_writeMem32(CPU* cpu) {
     cpu->memory->writed(cpu->memHelperAddr, cpu->memHelperValue);
 }
 static void wasmHelper_readMem8(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(ReadMem);
+    WASM_JIT_HELPER_STAT(ReadMem); WASM_JIT_TEST_MEM_STAT(ReadMem);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemRead();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemReadUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);
@@ -4418,7 +4427,7 @@ static void wasmHelper_readMem8(CPU* cpu) {
     cpu->memHelperValue = cpu->memory->readb(cpu->memHelperAddr);
 }
 static void wasmHelper_writeMem8(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(WriteMem);
+    WASM_JIT_HELPER_STAT(WriteMem); WASM_JIT_TEST_MEM_STAT(WriteMem);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemWrite();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemWriteUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);
@@ -4426,7 +4435,7 @@ static void wasmHelper_writeMem8(CPU* cpu) {
     cpu->memory->writeb(cpu->memHelperAddr, (U8)cpu->memHelperValue);
 }
 static void wasmHelper_readMem16(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(ReadMem);
+    WASM_JIT_HELPER_STAT(ReadMem); WASM_JIT_TEST_MEM_STAT(ReadMem);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemRead();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemReadUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);
@@ -4434,7 +4443,7 @@ static void wasmHelper_readMem16(CPU* cpu) {
     cpu->memHelperValue = cpu->memory->readw(cpu->memHelperAddr);
 }
 static void wasmHelper_writeMem16(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(WriteMem);
+    WASM_JIT_HELPER_STAT(WriteMem); WASM_JIT_TEST_MEM_STAT(WriteMem);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemWrite();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemWriteUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);
@@ -4473,7 +4482,7 @@ static inline void checkActiveBlockAfterWrite(CPU* cpu) {
     }
 }
 static void wasmHelper_writeMem32_check(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(WriteMemCheck);
+    WASM_JIT_HELPER_STAT(WriteMemCheck); WASM_JIT_TEST_MEM_STAT(WriteMemCheck);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemWriteCheck();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemWriteCheckUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);
@@ -4482,7 +4491,7 @@ static void wasmHelper_writeMem32_check(CPU* cpu) {
     checkActiveBlockAfterWrite(cpu);
 }
 static void wasmHelper_writeMem16_check(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(WriteMemCheck);
+    WASM_JIT_HELPER_STAT(WriteMemCheck); WASM_JIT_TEST_MEM_STAT(WriteMemCheck);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemWriteCheck();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemWriteCheckUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);
@@ -4491,7 +4500,7 @@ static void wasmHelper_writeMem16_check(CPU* cpu) {
     checkActiveBlockAfterWrite(cpu);
 }
 static void wasmHelper_writeMem8_check(CPU* cpu) {
-    WASM_JIT_HELPER_STAT(WriteMemCheck);
+    WASM_JIT_HELPER_STAT(WriteMemCheck); WASM_JIT_TEST_MEM_STAT(WriteMemCheck);
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     bool profileSample = wasmJitProfileHelperMemWriteCheck();
     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperMemWriteCheckUs, profileSample, WASM_JIT_PROFILE_TIMING_SAMPLE);

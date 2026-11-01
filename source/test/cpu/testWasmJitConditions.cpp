@@ -717,6 +717,90 @@ static void testWasmReadGroups() {
     }
 }
 
+// The page-table bases are loaded once in the block prologue (only when the
+// block touches memory) and every access recomputes its own page. Cover a
+// first access that is only reached on one path, pushes/pops whose stack
+// slots cross a page, a helper call between accesses, a store that rewrites
+// later code in the same block, and remapping between activations.
+extern "C" U32 wasmJitTestMemHelperCalls();
+static void testWasmPageTableLocals() {
+    extern void startNewJIT(CPU*, U32, DecodedOp*);
+    auto compile = [&](const char* what) {
+        auto& ctx = testContext();
+        testPushCode8(0xcd); testPushCode8(0x97);
+        DecodedOp* op = ctx.cpu->getOp(TEST_CODE_ADDRESS, 0);
+        op->runCount = JIT_RUN_COUNT + 1;
+        startNewJIT(ctx.cpu, TEST_CODE_ADDRESS, op);
+        if (!op->pfnJitCode) testFail("WASM page-table locals: %s did not compile", what);
+    };
+    const U32 stackBase = TEST_STACK_ADDRESS - K_PAGE_SIZE * 32;
+    // First memory access behind a forward branch; later ones at the join.
+    for (bool taken : {false, true}) {
+        testNewInstruction(taken ? ZF : 0); auto& ctx = testContext(); CPU* cpu = ctx.cpu;
+        cpu->reg[6].u32 = 0x1ffe; cpu->reg[0].u32 = 0x11223344;
+        ctx.memory->writed(TEST_HEAP_ADDRESS + 0x2002, 0x55667788);
+        testPushCode8(0x74); testPushCode8(2);                       // jz +2
+        testPushCode8(0x89); testPushCode8(0x06);                    // mov [esi],eax (crosses page)
+        testPushCode8(0x8b); testPushCode8(0x5e); testPushCode8(4);  // mov ebx,[esi+4]
+        testPushCode8(0x01); testPushCode8(0x5e); testPushCode8(8);  // add [esi+8],ebx
+        compile("branch"); testRunCPU();
+        if (cpu->reg[3].u32 != 0x55667788 || ctx.memory->readd(TEST_HEAP_ADDRESS + 0x1ffe) != (taken ? 0u : 0x11223344u) ||
+                ctx.memory->readd(TEST_HEAP_ADDRESS + 0x2006) != 0x55667788)
+            testFail("WASM page-table locals: first access behind a branch taken=%u", taken);
+    }
+    // push/pop around a stack page boundary: same base register, the slot
+    // moves to the next page (or straddles it) between neighbouring accesses.
+    for (U32 esp : {0x1006u, 0x1004u, 0x1008u, 0x2000u, 0x1ffeu}) {
+        testNewInstruction(0); auto& ctx = testContext(); CPU* cpu = ctx.cpu;
+        cpu->reg[4].u32 = esp;
+        cpu->reg[0].u32 = 0xa0a0a0a0; cpu->reg[3].u32 = 0xb0b0b0b0; cpu->reg[1].u32 = 0xc0c0c0c0;
+        testPushCode8(0x50); testPushCode8(0x53); testPushCode8(0x51); // push eax,ebx,ecx
+        testPushCode8(0x8b); testPushCode8(0x54); testPushCode8(0x24); testPushCode8(4); // mov edx,[esp+4]
+        testPushCode8(0x5f); testPushCode8(0x5e); testPushCode8(0x5d); // pop edi,esi,ebp
+        compile("push/pop"); U32 helpers = wasmJitTestMemHelperCalls(); testRunCPU();
+        // Slots that stay inside one page must all take the inline path.
+        if ((esp == 0x1008 || esp == 0x2000) && wasmJitTestMemHelperCalls() != helpers)
+            testFail("WASM page-table locals: push/pop esp=%x used %u memory helpers", esp, wasmJitTestMemHelperCalls() - helpers);
+        if (cpu->reg[7].u32 != 0xc0c0c0c0 || cpu->reg[6].u32 != 0xb0b0b0b0 || cpu->reg[5].u32 != 0xa0a0a0a0 ||
+                cpu->reg[2].u32 != 0xb0b0b0b0 || cpu->reg[4].u32 != esp ||
+                ctx.memory->readd(stackBase + esp - 8) != 0xb0b0b0b0)
+            testFail("WASM page-table locals: push/pop esp=%x", esp);
+    }
+    // A helper call (cpuid) between a store and a load of the same page.
+    {
+        testNewInstruction(0); auto& ctx = testContext(); CPU* cpu = ctx.cpu;
+        cpu->reg[6].u32 = 0x100; cpu->reg[7].u32 = 0x12345678; cpu->reg[0].u32 = 0;
+        testPushCode8(0x89); testPushCode8(0x3e);                    // mov [esi],edi
+        testPushCode8(0x0f); testPushCode8(0xa2);                    // cpuid
+        testPushCode8(0x8b); testPushCode8(0x6e); testPushCode8(0);  // mov ebp,[esi]
+        testPushCode8(0x89); testPushCode8(0x6e); testPushCode8(4);  // mov [esi+4],ebp
+        compile("helper"); U32 helpers = wasmJitTestMemHelperCalls(); testRunCPU();
+        if (wasmJitTestMemHelperCalls() != helpers) testFail("WASM page-table locals: accesses around a helper left the inline path");
+        if (cpu->reg[5].u32 != 0x12345678 || ctx.memory->readd(TEST_HEAP_ADDRESS + 0x104) != 0x12345678)
+            testFail("WASM page-table locals: access after a helper call");
+    }
+    // A store that rewrites a later instruction of the same block (inc eax ->
+    // inc ebx), then more accesses: the code page write takes the helper path
+    // and the block resumes in the interpreter at the next instruction.
+    {
+        testNewInstruction(0); auto& ctx = testContext(); CPU* cpu = ctx.cpu;
+        cpu->reg[0].u32 = 0; cpu->reg[3].u32 = 0; cpu->reg[6].u32 = 0x200;
+        ctx.memory->writed(TEST_HEAP_ADDRESS + 0x200, 77);
+        cpu->seg[ES].address = 0; // es:[edi] reaches the code segment's linear address
+        testPushCode8(0x8b); testPushCode8(0x2e);                    // mov ebp,[esi]
+        U32 incAt = ctx.codeIp + 4 + 5;
+        cpu->reg[7].u32 = incAt;
+        testPushCode8(0x26); testPushCode8(0xc6); testPushCode8(0x07); testPushCode8(0x43); // mov byte es:[edi],43h
+        testPushCode8(0x90); testPushCode8(0x90);
+        testPushCode8(0x90); testPushCode8(0x90); testPushCode8(0x90);
+        testPushCode8(0x40);                                         // inc eax (becomes inc ebx)
+        testPushCode8(0x89); testPushCode8(0x6e); testPushCode8(4);  // mov [esi+4],ebp
+        compile("smc"); testRunCPU();
+        if (cpu->reg[0].u32 != 0 || cpu->reg[3].u32 != 1 || ctx.memory->readd(TEST_HEAP_ADDRESS + 0x204) != 77)
+            testFail("WASM page-table locals: self-modifying store eax=%x ebx=%x", cpu->reg[0].u32, cpu->reg[3].u32);
+    }
+}
+
 static void testWasmForwardRegionState() {
     auto nearJump = [](U32 target) {
         testPushCode8(0xe9); testPushCode32(target - testContext().codeIp - 4);
@@ -948,6 +1032,7 @@ static void testWasmForwardRegionState() {
 
 void testWasmJitForwardBranches() {
     testWasmReadGroups();
+    testWasmPageTableLocals();
     testWasmForwardRegionState();
     auto patch = [](U32 displacement, U32 target) {
         testContext().memory->writeb(displacement, (U8)(target - displacement - 1));
