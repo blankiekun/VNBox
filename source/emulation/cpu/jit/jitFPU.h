@@ -168,9 +168,9 @@ protected:
     void cachedFpuBinary(U8 dst, U8 src, XmmXmmCallback callback, bool reverse, bool pop);
     void cachedFpuDiv(U8 dst, U8 src, bool reverse, bool pop);
     virtual void guardCachedFpuFallback(RegPtr state);
-    // Experimental fast x87 (VNBox fastX87 URL flag, Wasm only). 1: branch-free
-    // lowering with the same results. 2: also no precision control (PC=single
-    // rounding), no div fault/tag guards and no FSTP-empty guard.
+    // Fast x87 (VNBox fastX87 URL flag, Wasm only, default 1). 1: branch-free
+    // lowering with the same results. 2 (opt-in): also no precision control
+    // (PC=single rounding), no div fault/tag guards and no FSTP-empty guard.
     virtual int fastX87() const { return 0; }
     void cachedFpuMemory(DecodedOp* op, XmmXmmCallback callback, JitWidth width, bool integer, bool reverse, bool division = false);
 

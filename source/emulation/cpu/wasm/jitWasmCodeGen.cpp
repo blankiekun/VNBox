@@ -10268,18 +10268,19 @@ void JitWasmCodeGen::regToFpuReg64(FPURegPtr dst, RegPtr src) {
 }
 #endif
 
-// Experimental fast x87 switch (URL fastX87=1|2, default 0; node tests: env FASTX87).
-// Read once at the first compile. See JitFPU::fastX87 for what each level changes.
+// Fast x87 switch (URL fastX87=0|1|2, default 1; node tests: env FASTX87).
+// 1 gives the same results as 0 without branches; 2 drops checks (opt-in only,
+// fails testJit). Read once at the first compile. See JitFPU::fastX87.
 static int g_wasmFastX87 = -1;
 int JitWasmCodeGen::fastX87() const {
     if (g_wasmFastX87 < 0) {
         g_wasmFastX87 = EM_ASM_INT({
             var v = typeof vnboxParam === "function" ? vnboxParam("fastX87") : null;
             if (v == null && typeof process !== "undefined" && process.env) v = process.env.FASTX87;
-            v = parseInt(v || "0", 10);
-            return v >= 0 && v <= 2 ? v : 0;
+            v = (v == null || v === "") ? 1 : parseInt(v, 10);
+            return v >= 0 && v <= 2 ? v : 1;
         });
-        if (g_wasmFastX87) klog_fmt("[vnbox] fast x87 level %d (fastX87)", g_wasmFastX87);
+        klog_fmt("[vnbox] fast x87 level %d (fastX87)", g_wasmFastX87);
     }
     return g_wasmFastX87;
 }
