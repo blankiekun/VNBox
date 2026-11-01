@@ -197,6 +197,7 @@
 #include "../jit/jitSSE.h"
 #include "wasmEmitter.h"
 #include <array>
+#include <chrono>
 
 // Number of WASM locals used as GP register slots (eax-edi = 8).
 static constexpr U32 WASM_GP_LOCAL_COUNT  = 8;
@@ -1137,6 +1138,9 @@ protected:
     U32 lastCompiledOpLen = 0;
     bool m_emulatedCurrentOp = false;
     bool m_needsWasmMemoryPageArrays = false;
+#ifdef __TEST
+    std::chrono::steady_clock::time_point m_testGenStart;
+#endif
     DecodedOp* m_wasmBlockStartOp = nullptr;
     DecodedOp* m_currentWasmOp = nullptr;
     // FNV-1a hash over the block's decoded ops, accumulated by preCompile and
@@ -1300,6 +1304,7 @@ bool wasmJitCompilationPaused();
 
 #ifdef __TEST
 extern "C" U32 wasmJitTestEmissionCount();
+void wasmJitTestPrintSizeStats();
 void wasmJitTestSetFailInvalidationPreparation(bool fail);
 #endif
 

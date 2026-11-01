@@ -7019,6 +7019,9 @@ static bool wasmJitPrepareSlotForWorker(int tableIndex, CPU* cpu, DecodedOp* op,
 // JitWasmCodeGen constructor
 // ---------------------------------------------------------------------------
 JitWasmCodeGen::JitWasmCodeGen(CPU* cpu) : JitSSE(cpu) {
+#ifdef __TEST
+    m_testGenStart = std::chrono::steady_clock::now();
+#endif
     // Register common function types for the module being built.
     m_typeVoidVoid   = m_emitter.addFuncType({}, {});
     m_typeVoidI32    = m_emitter.addFuncType({ WasmType::I32 }, {});
@@ -15146,6 +15149,15 @@ static std::atomic<U32> g_wasmJitTestEmissionCount{0};
 extern "C" U32 wasmJitTestEmissionCount() {
     return g_wasmJitTestEmissionCount.load(std::memory_order_relaxed);
 }
+// Module size / codegen time totals, printed at the end of testJit.
+static std::atomic<U64> g_wasmJitTestBytes{0}, g_wasmJitTestOneOpModules{0}, g_wasmJitTestOneOpBytes{0}, g_wasmJitTestGenNs{0};
+void wasmJitTestPrintSizeStats() {
+    U32 n = g_wasmJitTestEmissionCount.load();
+    U64 b = g_wasmJitTestBytes.load(), n1 = g_wasmJitTestOneOpModules.load(), b1 = g_wasmJitTestOneOpBytes.load();
+    printf("[JITSIZE] modules=%u bytes=%llu avg=%llu oneOpModules=%llu oneOpAvg=%llu genMs=%llu\n", n, (unsigned long long)b,
+        (unsigned long long)(n ? b / n : 0), (unsigned long long)n1, (unsigned long long)(n1 ? b1 / n1 : 0),
+        (unsigned long long)(g_wasmJitTestGenNs.load() / 1000000));
+}
 #endif
 
 void JitWasmCodeGen::commitJIT(DecodedOp* op) {
@@ -15177,6 +15189,9 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
 
     if (m_wasmBinary.empty()) return;
 #ifdef __TEST
+    g_wasmJitTestBytes += m_wasmBinary.size();
+    if (this->blockOpCount == 1) { g_wasmJitTestOneOpModules++; g_wasmJitTestOneOpBytes += m_wasmBinary.size(); }
+    g_wasmJitTestGenNs += (U64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - m_testGenStart).count();
     if (std::getenv("BOXEDWINE_TEST_DUMP_WASM_MODULES")) {
         printf("JIT_MODULE %08x %zu ", this->startingEip, m_wasmBinary.size());
         for (U8 byte : m_wasmBinary) printf("%02x", byte);
