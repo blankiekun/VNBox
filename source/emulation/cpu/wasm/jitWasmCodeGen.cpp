@@ -488,7 +488,7 @@ static void retryOldestSealedRequest();
 // block is on the stack) the queued blocks are compiled again, without the counter, into one hot module, and their
 // old slots are freed. A rate rather than a total: only blocks of the loop running now qualify, and they all qualify
 // in the same period, so they share one module. hotGroup=0 (URL) turns it off.
-#define WASM_JIT_HOT_ENTRIES 8192
+#define WASM_JIT_HOT_ENTRIES 2048
 #define WASM_JIT_HOT_MAX_BLOCKS 1024
 #define WASM_JIT_HOT_WAIT_MS 1000.0
 #define WASM_JIT_HOT_COUNTERS (1 << 16) // shared on wrap: a collision only queues a block early (it is checked)
@@ -15114,8 +15114,9 @@ bool JitWasmCodeGen::shouldStopBlockBefore(U32 eip, DecodedOp* op) {
         : (this->firstOp && this->startingEip + this->firstOp->len == eip ? this->firstOp : nullptr);
     m_stopScanPrev = op;
     m_stopScanPrevEip = eip;
-    if (op && eip != this->startingEip && ((prev && prev->isCall()) ||
-            (op->flags2 & OP_FLAG2_WASM_JIT_PENDING) || ((op->flags & OP_FLAG_JIT) && op->pfnJitCode))) {
+    // A hot-group block runs through other block starts: a hop saved is worth more than the duplicated code.
+    if (op && eip != this->startingEip && ((prev && prev->isCall()) || (!m_hotTier &&
+            ((op->flags2 & OP_FLAG2_WASM_JIT_PENDING) || ((op->flags & OP_FLAG_JIT) && op->pfnJitCode))))) {
         return true;
     }
     // Honor profile-guided split hints from the grouped manifest: end the
