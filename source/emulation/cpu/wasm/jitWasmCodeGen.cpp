@@ -379,7 +379,7 @@ static std::vector<U32*> g_wasmRelocBaseByTable;
 static inline U32 wasmJitRelocBaseForTable(int tableIndex);
 
 #ifndef BOXEDWINE_MULTI_THREADED
-enum class WasmJitPendingKind : U8 { FileBatch, TinyAnonymous };
+enum class WasmJitPendingKind : U8 { FileBatch, TinyAnonymous, HotGroup };
 enum class WasmJitPendingState : U8 { Open, SealedOom };
 enum class WasmJitSealedKind : U8 { RuntimeBatch, TinyAnonymous };
 
@@ -454,6 +454,66 @@ static void failPendingWasmJitBlock(WasmJitPendingBlock& pending);
 static void erasePendingWasmJitBlock(U64 id);
 static void flushRuntimeBatch(const WasmJitFlushRequest& request);
 static void retryOldestSealedRequest();
+
+// Hot groups (ST). Runtime batches group blocks in compile order, so the blocks of one hot loop land in different
+// modules, and Firefox makes every chained hop into another instance ~20-30 ns slower than a same-instance hop.
+// Each chained tier-1 block counts its entries in its start op's runCount (free once the block is compiled: it only
+// has to stay above JIT_RUN_COUNT). At the threshold it queues itself; at the next dispatcher exit the queued blocks
+// are compiled again, without the counter, into one hot module, and the old slots are freed. Blocks that get hot
+// together (one loop) share a module. hotGroup=0 (URL) turns it off.
+#define WASM_JIT_HOT_ENTRIES 16384
+#define WASM_JIT_HOT_MAX_BLOCKS 256
+#define WASM_JIT_HOT_WAIT_MS 20.0
+struct WasmJitHotEntry {
+    KMemory* memory = nullptr;
+    DecodedOp* op = nullptr;
+    U32 eip = 0;
+    int slot = -1;
+};
+static std::vector<WasmJitHotEntry> g_wasmJitHotQueue;
+static double g_wasmJitHotFirstQueuedMs = 0;
+static U64 g_wasmJitHotSubmittedId = 0;
+static U64 g_wasmJitHotModules = 0;
+static U64 g_wasmJitHotBlocks = 0;
+static U64 g_wasmJitHotBytes = 0;
+static int g_wasmJitHotEnabled = -1;
+static U32 g_wasmJitHotEntries = WASM_JIT_HOT_ENTRIES;
+static double g_wasmJitHotWaitMs = WASM_JIT_HOT_WAIT_MS;
+
+static bool wasmJitHotEnabled() {
+    if (g_wasmJitHotEnabled < 0) {
+#if defined(__EMSCRIPTEN__) && !defined(__TEST)
+        g_wasmJitHotEnabled = EM_ASM_INT({ return typeof vnboxParam === "function" && vnboxParam("hotGroup") === "0" ? 0 : 1; });
+        if (!g_wasmJitHotEnabled) klog_fmt("[vnbox] hot groups off (hotGroup=0)");
+#else
+        g_wasmJitHotEnabled = 1;
+#endif
+    }
+    return g_wasmJitHotEnabled != 0;
+}
+
+// The runCount value at which a block queues itself (absolute; runCount starts at JIT_RUN_COUNT + 1).
+static U32 wasmJitHotThreshold() {
+    U32 threshold = JIT_RUN_COUNT + 1 + g_wasmJitHotEntries;
+    return threshold < JIT_RUN_COUNT_MAX - 1 ? threshold : JIT_RUN_COUNT_MAX - 1;
+}
+
+static void wasmJitHotForgetSlot(int slot) {
+    if (g_wasmJitHotQueue.empty()) return;
+    g_wasmJitHotQueue.erase(std::remove_if(g_wasmJitHotQueue.begin(), g_wasmJitHotQueue.end(), [slot](const WasmJitHotEntry& e) {
+        return e.slot == slot;
+    }), g_wasmJitHotQueue.end());
+}
+
+static void wasmJitHotForgetMemory(KMemory* memory) {
+    if (g_wasmJitHotQueue.empty()) return;
+    g_wasmJitHotQueue.erase(std::remove_if(g_wasmJitHotQueue.begin(), g_wasmJitHotQueue.end(), [memory](const WasmJitHotEntry& e) {
+        return e.memory == memory;
+    }), g_wasmJitHotQueue.end());
+}
+static void wasmJitHotFlush(CPU* cpu);
+static void wasmJitHotMaybeFlush(CPU* cpu);
+void clearJitBlock(const std::vector<void*>& jitOps);
 #endif
 
 #ifdef BOXEDWINE_MULTI_THREADED
@@ -4277,6 +4337,9 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     if (eipProf && eipProfKey) {
         vnboxProfCharge(eipProfKey, eipProfT, eipProfCost, eipProfSys, eipProfInstr);
     }
+    if (!g_wasmJitHotQueue.empty()) {
+        wasmJitHotMaybeFlush(cpu);
+    }
     vnboxStatJit(cpu->blockInstructionCount - statsStart, statsPadStart);
     WASM_JIT_PROFILE_ONLY(if (loopProfileSample) { bool stoppedAtLimit = chainedBlocks == WASM_JIT_CHAIN_BLOCK_LIMIT && wasmJitCanChainTo(cpu, op); wasmJitProfileLoop(chainedBlocks, stoppedAtLimit, WASM_JIT_PROFILE_TIMING_SAMPLE); if (!stoppedAtLimit) { wasmJitProfileChainStop(cpu, op, WASM_JIT_PROFILE_TIMING_SAMPLE); } })
 #endif
@@ -4650,6 +4713,21 @@ static void wasmHelper_movsd32r(CPU* cpu) {
     checkActiveBlockAfterWrite(cpu);
 }
 
+#ifndef BOXEDWINE_MULTI_THREADED
+// A tier-1 block's entry counter reached the hot threshold: queue the block for the next hot group.
+static void wasmHelper_hotBlock(CPU* cpu, U32 eip) {
+    DecodedOp* op = cpu->memory->getDecodedOp(eip);
+    if (!op || !op->pfnJitCode || op->pfn != cpu->thread->process->startJITOp || (op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
+        return;
+    }
+    for (const WasmJitHotEntry& e : g_wasmJitHotQueue) {
+        if (e.op == op) return;
+    }
+    if (g_wasmJitHotQueue.empty()) g_wasmJitHotFirstQueuedMs = emscripten_get_now();
+    g_wasmJitHotQueue.push_back({cpu->memory, op, eip, (int)(uintptr_t)op->pfnJitCode});
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Helper table: array of C++ function pointers exported to WASM modules.
 // Order must match WasmHelperIdx below.
@@ -4729,6 +4807,9 @@ static const void* g_wasmHelperTable[] = {
     (void*)scasb32rPrefix,
     (void*)scasw32rPrefix,
     (void*)scasd32rPrefix,
+#ifndef BOXEDWINE_MULTI_THREADED
+    (void*)wasmHelper_hotBlock,
+#endif
 };
 static constexpr int WASM_HELPER_COUNT = (int)(sizeof(g_wasmHelperTable) / sizeof(g_wasmHelperTable[0]));
 
@@ -4759,6 +4840,8 @@ static void wasmJitRecordFlushReason(WasmJitFlushReason reason) {
         break;
     case WasmJitFlushReason::ProcessBytes:
         ++g_wasmJitRuntimeStats.processCapFlushes;
+        break;
+    case WasmJitFlushReason::HotGroup:
         break;
     }
 }
@@ -5083,6 +5166,13 @@ static void submitPendingWasmJitBlock(CPU* cpu, DecodedOp* op, U32 address, U32 
     U64 byteCount = pending->bytes.size();
     WasmJitBatchKey key{pending->memory, pending->mappedFileKey};
     WasmJitPendingKind pendingKind = pending->kind;
+    if (pendingKind == WasmJitPendingKind::HotGroup) {
+        // Flushed by wasmJitHotFlush with the rest of its hot group, not by the batch policy.
+        g_wasmJitHotSubmittedId = id;
+        g_wasmJitHotBytes += byteCount;
+        registerPendingWasmJitBlock(std::move(pending));
+        return;
+    }
     if (mappedFileKey) {
         ++g_wasmJitRuntimeStats.translatedFileBacked;
     } else {
@@ -5185,7 +5275,69 @@ static void wasmJitCancelPendingBlock(DecodedOp* op) {
     cancelPendingWasmJitBlock(byOp->second, op);
 }
 
+static void wasmJitHotFlush(CPU* cpu) {
+    if (g_wasmJitCompilationPaused || !g_wasmJitSealedRequests.empty()) {
+        return; // retried at a later dispatcher exit
+    }
+    std::vector<WasmJitHotEntry> mine;
+    std::vector<WasmJitHotEntry> others;
+    for (const WasmJitHotEntry& e : g_wasmJitHotQueue) {
+        (e.memory == cpu->memory ? mine : others).push_back(e);
+    }
+    g_wasmJitHotQueue.swap(others);
+    if (!g_wasmJitHotQueue.empty()) g_wasmJitHotFirstQueuedMs = emscripten_get_now();
+    std::vector<WasmJitBatchEntryId> ids;
+    std::vector<void*> oldSlots;
+    for (const WasmJitHotEntry& e : mine) {
+        DecodedOp* op = e.op;
+        // Still the block that queued itself? (A cleared slot already dropped its entry.)
+        if (op->pfnJitCode != (void*)(uintptr_t)(U32)e.slot || !(op->flags & OP_FLAG_JIT) ||
+                op->pfn != cpu->thread->process->startJITOp || (op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
+            continue;
+        }
+        g_wasmJitHotSubmittedId = 0;
+        op->flags &= ~OP_FLAG_JIT; // doJIT skips compiled entries
+        JitWasmCodeGen* jit = static_cast<JitWasmCodeGen*>(startNewJIT(cpu));
+        jit->m_hotTier = true;
+        jit->doJIT(e.eip, op);
+        delete jit;
+        if (g_wasmJitHotSubmittedId) {
+            // Pending now (pfnJitCode cleared): the old slot is unreachable once the group publishes.
+            ids.push_back(g_wasmJitHotSubmittedId);
+            oldSlots.push_back((void*)(uintptr_t)(U32)e.slot);
+        } else if (op->pfnJitCode == (void*)(uintptr_t)(U32)e.slot && !(op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
+            op->flags |= OP_FLAG_JIT;
+        }
+        g_wasmJitHotSubmittedId = 0;
+    }
+    if (ids.empty()) {
+        return;
+    }
+    WasmJitFlushRequest request;
+    request.key = {cpu->memory, 0};
+    request.reason = WasmJitFlushReason::HotGroup;
+    request.entries = ids;
+    ++g_wasmJitHotModules;
+    g_wasmJitHotBlocks += ids.size();
+    queueRuntimeFlushes({request});
+    clearJitBlock(oldSlots);
+    if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0) {
+        klog_fmt("[WASM JIT hot] group %llu: %u blocks; total %llu blocks, %llu KB", (unsigned long long)g_wasmJitHotModules,
+            (U32)ids.size(), (unsigned long long)g_wasmJitHotBlocks, (unsigned long long)(g_wasmJitHotBytes / 1024));
+    }
+}
+
+// Dispatcher exit (no compiled block on the stack): build a hot group once the queue is full or has waited a bit,
+// so the other blocks of the same loop can reach the threshold and join it.
+static void wasmJitHotMaybeFlush(CPU* cpu) {
+    if (g_wasmJitHotQueue.size() < WASM_JIT_HOT_MAX_BLOCKS && emscripten_get_now() - g_wasmJitHotFirstQueuedMs < g_wasmJitHotWaitMs) {
+        return;
+    }
+    wasmJitHotFlush(cpu);
+}
+
 static void wasmJitCancelPendingMemory(KMemory* memory) {
+    wasmJitHotForgetMemory(memory);
     std::vector<WasmJitBatchEntryId> ids;
     for (const auto& pending : g_wasmJitPendingBlocks) {
         if (pending.second->memory == memory) {
@@ -5235,6 +5387,29 @@ void wasmJitTestResetRuntimeBatching() {
     g_wasmJitTestTinyAdditionalHits = WASM_JIT_TINY_ADDITIONAL_HITS;
     g_wasmJitRuntimeStats = {};
     boxedwine_wasm_test_reset_runtime_batching_js();
+    g_wasmJitHotQueue.clear();
+    g_wasmJitHotModules = 0;
+    g_wasmJitHotBlocks = 0;
+    g_wasmJitHotBytes = 0;
+    wasmJitTestSetHotGroups(WASM_JIT_HOT_ENTRIES, WASM_JIT_HOT_WAIT_MS);
+}
+
+// Entries count only for blocks compiled after this call (the threshold is part of the code).
+void wasmJitTestSetHotGroups(U32 entries, double waitMs) {
+    g_wasmJitHotEntries = entries;
+    g_wasmJitHotWaitMs = waitMs;
+}
+
+U32 wasmJitTestHotQueueSize() {
+    return (U32)g_wasmJitHotQueue.size();
+}
+
+U64 wasmJitTestHotModules() {
+    return g_wasmJitHotModules;
+}
+
+U64 wasmJitTestHotBlocks() {
+    return g_wasmJitHotBlocks;
 }
 
 U32 wasmJitTestPendingCount() {
@@ -14416,6 +14591,44 @@ bool JitWasmCodeGen::emitDirectLoopBackedge(U32 address) {
     return true;
 }
 
+#ifndef BOXEDWINE_MULTI_THREADED
+// Block entry: count entries in the start op's runCount; at the hot threshold, queue the block (wasmHelper_hotBlock).
+void JitWasmCodeGen::emitHotEntryCounter(DecodedOp* op) {
+    U32 helperIdx = HELPER_CPU_FIRST;
+    while (helperIdx < WASM_HELPER_COUNT && g_wasmHelperTable[helperIdx] != (const void*)wasmHelper_hotBlock) ++helperIdx;
+    if (helperIdx == WASM_HELPER_COUNT) kpanic("hot block helper is not imported");
+    const U32 threshold = wasmJitHotThreshold();
+    const S32 opAddr = (S32)(uintptr_t)op;
+    const U32 runCount = (U32)offsetof(DecodedOp, runCount);
+    m_emitter.emitI32Const(opAddr);
+    m_emitter.emitI32Load16U(runCount);
+    m_emitter.emitI32Const((S32)(threshold - 1));
+    m_emitter.emitOp(WASM_I32_LT_U);
+    m_emitter.setNextBranchHint(WasmBranchHint::Likely);
+    m_emitter.emitIf();
+    m_emitter.emitI32Const(opAddr);
+    m_emitter.emitI32Const(opAddr);
+    m_emitter.emitI32Load16U(runCount);
+    m_emitter.emitI32Const(1);
+    m_emitter.emitOp(WASM_I32_ADD);
+    m_emitter.emitI32Store16(runCount);
+    m_emitter.emitElse();
+    m_emitter.emitI32Const(opAddr);
+    m_emitter.emitI32Load16U(runCount);
+    m_emitter.emitI32Const((S32)(threshold - 1));
+    m_emitter.emitOp(WASM_I32_EQ);
+    m_emitter.emitIf();
+    m_emitter.emitI32Const(opAddr);
+    m_emitter.emitI32Const((S32)threshold);
+    m_emitter.emitI32Store16(runCount);
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Const((S32)this->startingEip);
+    m_emitter.emitCall(helperIdx);
+    m_emitter.emitEnd();
+    m_emitter.emitEnd();
+}
+#endif
+
 void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
     m_emulatedCurrentOp = false;
     // Reset per-instruction scratch state, then run base bookkeeping (block
@@ -14424,6 +14637,11 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
     if (this->blockOpCount == 0) {
         m_wasmBlockStartOp = op;
         m_preCompileBlockHash = 2166136261u;
+#ifndef BOXEDWINE_MULTI_THREADED
+        if (m_chainBlocks && !m_hotTier && wasmJitHotEnabled()) {
+            emitHotEntryCounter(op);
+        }
+#endif
 #ifdef BOXEDWINE_MULTI_THREADED
         // Separate fenced and unfenced modules, including grouped caches.
         // A safe-memory launch must never replay blocks recorded without it.
@@ -15122,6 +15340,10 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
         }
     }
 #else
+    if (m_hotTier) {
+        submitPendingWasmJitBlock(cpu, op, this->startingEip, this->blockOpCount, this->emulatedLen, 0, WasmJitPendingKind::HotGroup, m_needsWasmMemoryPageArrays, std::move(m_wasmBinary), std::move(m_relocValues));
+        return;
+    }
   #ifndef __TEST
     // When persistence is active, try the persistent cache first and save
     // fresh compiles; a plain session goes straight to instantiation.
@@ -16049,6 +16271,7 @@ void clearJitBlock(const std::vector<void*>& jitOps) {
             }
 #else
             boxedwine_wasm_free_block(tableIdx);
+            wasmJitHotForgetSlot(tableIdx);
             releasedSlot = true;
             // The function is now unreachable (removeFunction); release its
             // relocation slot array. Every pointer in it shared this block's

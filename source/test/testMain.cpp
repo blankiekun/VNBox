@@ -376,6 +376,7 @@ const TestEntry TEST_ENTRIES[] = {
 #endif
 #if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
     {testWasmJitStBoundedDispatch, "Test ST WASM JIT instruction budget", TEST_ENTRY_SERIAL},
+    {testWasmJitHotGroups, "Test ST WASM JIT hot groups", TEST_ENTRY_SERIAL},
     {testWasmJitRuntimeGrouping, "Test WASM JIT runtime grouping"},
     {testWasmJitPendingLifecycle, "Test WASM JIT pending lifecycle"},
     {testWasmJitTinyAnonymousPromotion, "Test WASM JIT tiny anonymous promotion"},
