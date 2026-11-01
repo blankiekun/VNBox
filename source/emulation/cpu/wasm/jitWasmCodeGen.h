@@ -1318,6 +1318,7 @@ void wasmJitTestResetRuntimeBatching();
 U32 wasmJitTestPendingCount();
 void wasmJitTestSetHotGroups(U32 entries, double waitMs);
 U32 wasmJitTestHotQueueSize();
+void wasmJitTestHotFlush(CPU* cpu);
 U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
 bool wasmJitTestRelocAllocationTransfer();

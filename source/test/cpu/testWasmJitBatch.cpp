@@ -118,7 +118,7 @@ void testWasmJitHotGroups() {
     constexpr U32 blockBytes = 8;
     constexpr U32 hotEntries = 4;
     wasmJitTestResetRuntimeBatching();
-    wasmJitTestSetHotGroups(hotEntries, 1e12); // queue only; flush below
+    wasmJitTestSetHotGroups(hotEntries, 1e12); // entries per period; the period never ends here: flush below
     for (U32 i = 0; i < blockCount; ++i) {
         testPushCode8(0x43); // inc ebx
         testPushCode8(0xb8); testPushCode32((i + 1) * blockBytes); // mov eax,next
@@ -171,8 +171,8 @@ void testWasmJitHotGroups() {
     if (wasmJitTestHotQueueSize() != blockCount - 1) {
         testFail("a cleared slot must drop its hot queue entry");
     }
-    wasmJitTestSetHotGroups(hotEntries, 0); // flush at the next dispatcher exit
-    if (!runOnce()) testFail("blocks must run while their hot group builds");
+    wasmJitTestHotFlush(cpu); // what the end of a period does at a dispatcher exit
+    if (!runOnce()) testFail("hot-group blocks must run the chain after the flush");
     if (wasmJitTestHotModules() != 1 || wasmJitTestHotBlocks() != blockCount - 1 || wasmJitTestHotQueueSize() != 0) {
         testFail("queued hot blocks must be compiled into one hot group");
     }

@@ -483,13 +483,19 @@ static void retryOldestSealedRequest();
 
 // Hot groups (ST). Runtime batches group blocks in compile order, so the blocks of one hot loop land in different
 // modules, and Firefox makes every chained hop into another instance ~20-30 ns slower than a same-instance hop.
-// Each chained tier-1 block counts its entries in its start op's runCount (free once the block is compiled: it only
-// has to stay above JIT_RUN_COUNT). At the threshold it queues itself; at the next dispatcher exit the queued blocks
-// are compiled again, without the counter, into one hot module, and the old slots are freed. Blocks that get hot
-// together (one loop) share a module. hotGroup=0 (URL) turns it off.
-#define WASM_JIT_HOT_ENTRIES 16384
-#define WASM_JIT_HOT_MAX_BLOCKS 256
-#define WASM_JIT_HOT_WAIT_MS 20.0
+// Each chained tier-1 block counts its entries in a counter slot; the counters reset every period. A block that
+// reaches the threshold within one period queues itself; at the end of the period (a dispatcher exit, so no compiled
+// block is on the stack) the queued blocks are compiled again, without the counter, into one hot module, and their
+// old slots are freed. A rate rather than a total: only blocks of the loop running now qualify, and they all qualify
+// in the same period, so they share one module. hotGroup=0 (URL) turns it off.
+#define WASM_JIT_HOT_ENTRIES 8192
+#define WASM_JIT_HOT_MAX_BLOCKS 1024
+#define WASM_JIT_HOT_WAIT_MS 1000.0
+#define WASM_JIT_HOT_COUNTERS (1 << 16) // shared on wrap: a collision only queues a block early (it is checked)
+static U32 g_wasmJitHotCounts[WASM_JIT_HOT_COUNTERS];
+static U32 g_wasmJitHotNextCounter = 0;
+static U32 g_wasmJitHotExitTick = 0;
+static double g_wasmJitHotPeriodStartMs = 0;
 struct WasmJitHotEntry {
     KMemory* memory = nullptr;
     DecodedOp* op = nullptr;
@@ -497,7 +503,6 @@ struct WasmJitHotEntry {
     int slot = -1;
 };
 static std::vector<WasmJitHotEntry> g_wasmJitHotQueue;
-static double g_wasmJitHotFirstQueuedMs = 0;
 static U64 g_wasmJitHotSubmittedId = 0;
 static U64 g_wasmJitHotModules = 0;
 static U64 g_wasmJitHotBlocks = 0;
@@ -527,10 +532,9 @@ static bool wasmJitHotEnabled() {
     return g_wasmJitHotEnabled != 0;
 }
 
-// The runCount value at which a block queues itself (absolute; runCount starts at JIT_RUN_COUNT + 1).
+// Entries per period at which a block queues itself.
 static U32 wasmJitHotThreshold() {
-    U32 threshold = JIT_RUN_COUNT + 1 + g_wasmJitHotEntries;
-    return threshold < JIT_RUN_COUNT_MAX - 1 ? threshold : JIT_RUN_COUNT_MAX - 1;
+    return g_wasmJitHotEntries > 1 ? g_wasmJitHotEntries : 2;
 }
 
 static void wasmJitHotForgetSlot(int slot) {
@@ -547,7 +551,7 @@ static void wasmJitHotForgetMemory(KMemory* memory) {
     }), g_wasmJitHotQueue.end());
 }
 static void wasmJitHotFlush(CPU* cpu);
-static void wasmJitHotMaybeFlush(CPU* cpu);
+static void wasmJitHotPeriod(CPU* cpu);
 void clearJitBlock(const std::vector<void*>& jitOps);
 #endif
 
@@ -4372,8 +4376,8 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
     if (eipProf && eipProfKey) {
         vnboxProfCharge(eipProfKey, eipProfT, eipProfCost, eipProfSys, eipProfInstr);
     }
-    if (!g_wasmJitHotQueue.empty()) {
-        wasmJitHotMaybeFlush(cpu);
+    if (!(++g_wasmJitHotExitTick & 255)) {
+        wasmJitHotPeriod(cpu);
     }
     vnboxStatJit(cpu->blockInstructionCount - statsStart, statsPadStart);
     WASM_JIT_PROFILE_ONLY(if (loopProfileSample) { bool stoppedAtLimit = chainedBlocks == WASM_JIT_CHAIN_BLOCK_LIMIT && wasmJitCanChainTo(cpu, op); wasmJitProfileLoop(chainedBlocks, stoppedAtLimit, WASM_JIT_PROFILE_TIMING_SAMPLE); if (!stoppedAtLimit) { wasmJitProfileChainStop(cpu, op, WASM_JIT_PROFILE_TIMING_SAMPLE); } })
@@ -4758,7 +4762,6 @@ static void wasmHelper_hotBlock(CPU* cpu, U32 eip) {
     for (const WasmJitHotEntry& e : g_wasmJitHotQueue) {
         if (e.op == op) return;
     }
-    if (g_wasmJitHotQueue.empty()) g_wasmJitHotFirstQueuedMs = emscripten_get_now();
     g_wasmJitHotQueue.push_back({cpu->memory, op, eip, (int)(uintptr_t)op->pfnJitCode});
 }
 #endif
@@ -5329,7 +5332,6 @@ static void wasmJitHotFlush(CPU* cpu) {
         (e.memory == cpu->memory ? mine : others).push_back(e);
     }
     g_wasmJitHotQueue.swap(others);
-    if (!g_wasmJitHotQueue.empty()) g_wasmJitHotFirstQueuedMs = emscripten_get_now();
     std::vector<WasmJitBatchEntryId> ids;
     std::vector<void*> oldSlots;
     for (const WasmJitHotEntry& e : mine) {
@@ -5371,13 +5373,18 @@ static void wasmJitHotFlush(CPU* cpu) {
     }
 }
 
-// Dispatcher exit (no compiled block on the stack): build a hot group once the queue is full or has waited a bit,
-// so the other blocks of the same loop can reach the threshold and join it.
-static void wasmJitHotMaybeFlush(CPU* cpu) {
-    if (g_wasmJitHotQueue.size() < g_wasmJitHotMaxBlocks && emscripten_get_now() - g_wasmJitHotFirstQueuedMs < g_wasmJitHotWaitMs) {
+// Every 256th dispatcher exit (no compiled block on the stack): at the end of a period, compile the blocks that got
+// hot in it into one hot group and restart the counts.
+static void wasmJitHotPeriod(CPU* cpu) {
+    double now = emscripten_get_now();
+    if (now - g_wasmJitHotPeriodStartMs < g_wasmJitHotWaitMs && g_wasmJitHotQueue.size() < g_wasmJitHotMaxBlocks) {
         return;
     }
-    wasmJitHotFlush(cpu);
+    g_wasmJitHotPeriodStartMs = now;
+    memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
+    if (!g_wasmJitHotQueue.empty()) {
+        wasmJitHotFlush(cpu);
+    }
 }
 
 static void wasmJitCancelPendingMemory(KMemory* memory) {
@@ -5432,6 +5439,7 @@ void wasmJitTestResetRuntimeBatching() {
     g_wasmJitRuntimeStats = {};
     boxedwine_wasm_test_reset_runtime_batching_js();
     g_wasmJitHotQueue.clear();
+    memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
     g_wasmJitHotModules = 0;
     g_wasmJitHotBlocks = 0;
     g_wasmJitHotBytes = 0;
@@ -5442,6 +5450,10 @@ void wasmJitTestResetRuntimeBatching() {
 void wasmJitTestSetHotGroups(U32 entries, double waitMs) {
     g_wasmJitHotEntries = entries;
     g_wasmJitHotWaitMs = waitMs;
+}
+
+void wasmJitTestHotFlush(CPU* cpu) {
+    wasmJitHotFlush(cpu);
 }
 
 U32 wasmJitTestHotQueueSize() {
@@ -14663,40 +14675,31 @@ bool JitWasmCodeGen::emitDirectLoopBackedge(U32 address) {
 }
 
 #ifndef BOXEDWINE_MULTI_THREADED
-// Block entry: count entries in the start op's runCount; at the hot threshold, queue the block (wasmHelper_hotBlock).
+// Block entry: count entries in this block's counter slot; at the hot threshold, queue the block (wasmHelper_hotBlock).
 void JitWasmCodeGen::emitHotEntryCounter(DecodedOp* op) {
+    (void)op;
     U32 helperIdx = HELPER_CPU_FIRST;
     while (helperIdx < WASM_HELPER_COUNT && g_wasmHelperTable[helperIdx] != (const void*)wasmHelper_hotBlock) ++helperIdx;
     if (helperIdx == WASM_HELPER_COUNT) kpanic("hot block helper is not imported");
     const U32 threshold = wasmJitHotThreshold();
-    const S32 opAddr = (S32)(uintptr_t)op;
-    const U32 runCount = (U32)offsetof(DecodedOp, runCount);
-    m_emitter.emitI32Const(opAddr);
-    m_emitter.emitI32Load16U(runCount);
-    m_emitter.emitI32Const((S32)(threshold - 1));
-    m_emitter.emitOp(WASM_I32_LT_U);
-    m_emitter.setNextBranchHint(WasmBranchHint::Likely);
-    m_emitter.emitIf();
-    m_emitter.emitI32Const(opAddr);
-    m_emitter.emitI32Const(opAddr);
-    m_emitter.emitI32Load16U(runCount);
-    m_emitter.emitI32Const(1);
-    m_emitter.emitOp(WASM_I32_ADD);
-    m_emitter.emitI32Store16(runCount);
-    m_emitter.emitElse();
-    m_emitter.emitI32Const(opAddr);
-    m_emitter.emitI32Load16U(runCount);
+    const S32 counter = (S32)(uintptr_t)&g_wasmJitHotCounts[g_wasmJitHotNextCounter++ & (WASM_JIT_HOT_COUNTERS - 1)];
+    // if (count == threshold - 1) queue; count++
+    m_emitter.emitI32Const(counter);
+    m_emitter.emitI32Load(0);
     m_emitter.emitI32Const((S32)(threshold - 1));
     m_emitter.emitOp(WASM_I32_EQ);
+    m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
     m_emitter.emitIf();
-    m_emitter.emitI32Const(opAddr);
-    m_emitter.emitI32Const((S32)threshold);
-    m_emitter.emitI32Store16(runCount);
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Const((S32)this->startingEip);
     m_emitter.emitCall(helperIdx);
     m_emitter.emitEnd();
-    m_emitter.emitEnd();
+    m_emitter.emitI32Const(counter);
+    m_emitter.emitI32Const(counter);
+    m_emitter.emitI32Load(0);
+    m_emitter.emitI32Const(1);
+    m_emitter.emitOp(WASM_I32_ADD);
+    m_emitter.emitI32Store(0);
 }
 #endif
 
