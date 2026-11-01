@@ -20,6 +20,7 @@
 #include "vnboxstats.h"
 #include <stdlib.h>
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(hostwd3d_callback) == 16, "guest layout");
@@ -42,9 +43,12 @@ bool loggedOnce[WD3D_ID_COUNT];
 // The stub's _wd3d_pending (hello's second argument) in the memory of the process that said hello: set to the
 // number of queued callbacks after every call, so an export only asks for them (id 2) when there are some.
 // Process-wide, not per thread: whichever thread queues a callback, the next export the guest returns from sees it.
-KMemory* pendingMemory;
-U32 pendingGuest;
-U32 pendingWritten;
+// Per process (one guest address space each): where its stub wants the pending-callback count (hello's argument) and
+// what was written there last. Host wined3d is one per emulator, shared by every process that loads the stub (d3d11's
+// conformance test runs a child that does): each process's count goes to its own memory. hello resets a process's
+// entry, so one that reuses a dead process's KMemory address starts clean.
+struct Pending { U32 guest = 0, written = 0; };
+std::unordered_map<KMemory*, Pending> pending;
 // stats=1: calls and host ms per id in this [stats] window (nested calls count in both).
 U32 statCalls[WD3D_ID_COUNT];
 double statMs[WD3D_ID_COUNT];
@@ -74,30 +78,29 @@ bool attach() {
     return attached;
 }
 
-U32 hello(U32 hash, U32 pending) {
+U32 hello(U32 hash, U32 pendingAddress) {
     if (hash != WD3D_PROTOCOL_HASH) {
         klog_fmt("[wined3d] guest wined3d.dll speaks protocol %.8X, host %.8X: refusing the load", hash, WD3D_PROTOCOL_HASH);
         return 0;
     }
     if (!attach()) return 0;
-    if (pending) {
-        if (pendingGuest && pendingMemory != callCpu->memory) {
-            klog("[wined3d] a second process loaded the wined3d stub: host wined3d is shared, callbacks follow the latest");
+    if (pendingAddress) {
+        if (!pending.empty() && !pending.count(callCpu->memory)) {
+            klog("[wined3d] another process loaded the wined3d stub: host wined3d is shared between them");
         }
-        pendingMemory = callCpu->memory;
-        pendingGuest = pending;
-        pendingWritten = 0;
-        pendingMemory->writed(pendingGuest, 0);
+        pending[callCpu->memory] = Pending{pendingAddress, 0};
+        callCpu->memory->writed(pendingAddress, 0);
     }
     return 1;
 }
 
 void updatePending() {
-    if (!pendingGuest || pendingMemory != callCpu->memory) return;
+    auto it = pending.find(callCpu->memory);
+    if (it == pending.end()) return;
     U32 n = hostwd3d_callbacks_pending();
-    if (n != pendingWritten) {
-        pendingMemory->writed(pendingGuest, n);
-        pendingWritten = n;
+    if (n != it->second.written) {
+        callCpu->memory->writed(it->second.guest, n);
+        it->second.written = n;
     }
 }
 
