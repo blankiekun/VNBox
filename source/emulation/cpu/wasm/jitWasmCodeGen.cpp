@@ -505,12 +505,21 @@ static U64 g_wasmJitHotBytes = 0;
 static int g_wasmJitHotEnabled = -1;
 static U32 g_wasmJitHotEntries = WASM_JIT_HOT_ENTRIES;
 static double g_wasmJitHotWaitMs = WASM_JIT_HOT_WAIT_MS;
+static U32 g_wasmJitHotMaxBlocks = WASM_JIT_HOT_MAX_BLOCKS;
 
 static bool wasmJitHotEnabled() {
     if (g_wasmJitHotEnabled < 0) {
 #if defined(__EMSCRIPTEN__) && !defined(__TEST)
         g_wasmJitHotEnabled = EM_ASM_INT({ return typeof vnboxParam === "function" && vnboxParam("hotGroup") === "0" ? 0 : 1; });
         if (!g_wasmJitHotEnabled) klog_fmt("[vnbox] hot groups off (hotGroup=0)");
+        // Tuning (measurement): hotEntries, hotWaitMs, hotMax URL params.
+        int entries = EM_ASM_INT({ var v = typeof vnboxParam === "function" ? parseInt(vnboxParam("hotEntries")) : NaN; return v > 0 ? v : 0; });
+        int waitMs = EM_ASM_INT({ var v = typeof vnboxParam === "function" ? parseInt(vnboxParam("hotWaitMs")) : NaN; return v >= 0 ? v : -1; });
+        int maxBlocks = EM_ASM_INT({ var v = typeof vnboxParam === "function" ? parseInt(vnboxParam("hotMax")) : NaN; return v > 0 ? v : 0; });
+        if (entries) g_wasmJitHotEntries = (U32)entries;
+        if (waitMs >= 0) g_wasmJitHotWaitMs = waitMs;
+        if (maxBlocks) g_wasmJitHotMaxBlocks = (U32)maxBlocks;
+        if (g_wasmJitHotEnabled) klog_fmt("[vnbox] hot groups: entries=%u waitMs=%.0f max=%u", g_wasmJitHotEntries, g_wasmJitHotWaitMs, g_wasmJitHotMaxBlocks);
 #else
         g_wasmJitHotEnabled = 1;
 #endif
@@ -5365,7 +5374,7 @@ static void wasmJitHotFlush(CPU* cpu) {
 // Dispatcher exit (no compiled block on the stack): build a hot group once the queue is full or has waited a bit,
 // so the other blocks of the same loop can reach the threshold and join it.
 static void wasmJitHotMaybeFlush(CPU* cpu) {
-    if (g_wasmJitHotQueue.size() < WASM_JIT_HOT_MAX_BLOCKS && emscripten_get_now() - g_wasmJitHotFirstQueuedMs < g_wasmJitHotWaitMs) {
+    if (g_wasmJitHotQueue.size() < g_wasmJitHotMaxBlocks && emscripten_get_now() - g_wasmJitHotFirstQueuedMs < g_wasmJitHotWaitMs) {
         return;
     }
     wasmJitHotFlush(cpu);
