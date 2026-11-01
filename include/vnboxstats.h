@@ -25,6 +25,8 @@ struct VnboxStats {
     // idle/cpu cap (mainloop.cpp): ms the guest was held back, ticks that ended at the cap; wakes by reason
     double capHeldMs = 0; unsigned capTicks = 0, capWakeInput = 0, capWakeFrame = 0, capWakeFile = 0, capWakeAudio = 0, capWakeGl = 0;
     unsigned smallFrames = 0; // shown frames whose change counted as idle
+    // hot-thread throttle (kscheduler.cpp): threads it slept, how many sleeps and their ms
+    unsigned hotThreads = 0, hotThrottles = 0; double hotThrottleMs = 0;
     unsigned audioUnderruns = 0; double audioQueuedMinMs = -1; // SDL audio path: callbacks that ran dry, least queued at a callback
     unsigned sysCount[440] = {};
     double sysMsBy[440] = {};
@@ -38,6 +40,7 @@ struct VnboxStats {
     std::unordered_map<unsigned long long, unsigned> threadRuns;
 };
 extern VnboxStats vnboxStats;
+extern unsigned vnboxStatsLogs; // [stats] lines logged so far (a window id for per-window counts)
 
 // prof=1 in the page URL (emscripten): where guest JIT time goes. One compiled block entry in VNBOX_PROF_EVERY is timed
 // until the next entry (minus one clock read and any syscalls) and charged, scaled up, to that block (key: process id << 32 | block eip); the main loop prints

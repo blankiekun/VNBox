@@ -80,6 +80,7 @@ public:
 #endif
 
     FsOpenNode* openFile;
+    U64 vnboxLastReadUs = 0; // the last read through this fd (kfile.cpp fileWake: steady streaming isn't loading)
 
 private:
     friend class KMemory;

@@ -32,6 +32,7 @@
 #include <vector>
 
 VnboxStats vnboxStats;
+unsigned vnboxStatsLogs;
 bool vnboxProfOn = false;
 unsigned vnboxProfTick = 0;
 std::unordered_map<unsigned long long, VnboxProfEntry> vnboxProfBlocks;
@@ -251,7 +252,7 @@ static void statsTickStart(int asked) {
             " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f shown/s=%.1f skippedSame/s=%.1f busyDropped/s=%.1f composites/s=%.1f compositeMs/s=%.0f swPresentMs/s=%.0f"
             " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f readbacks/s=%.1f readbackMs/s=%.0f readbackKB/s=%.0f readPixels/s=%.1f readPixelsMs/s=%.0f | input/s=%.1f motion/s=%.0f"
             " | sys ms/s=%.0f user ms/s=%.0f | threads/s:%s | topSys: %s | jit instr=%.0f%% (interp %.0f%%) entries/s=%.0f blocksCompiled/s=%.0f"
-            " | clockBackoffs/s=%.0f capHeldMs/s=%.0f capTicks/s=%.0f capWake/s input=%.1f frame=%.1f file=%.1f audio=%.1f gl=%.1f smallFrames/s=%.1f"
+            " | clockBackoffs/s=%.0f capHeldMs/s=%.0f capTicks/s=%.0f capWake/s input=%.1f frame=%.1f file=%.1f audio=%.1f gl=%.1f smallFrames/s=%.1f hotThreads=%u hotThrottles/s=%.0f throttleMs/s=%.0f"
             " | wineserver ms/s=%.0f req/s=%.0f | wineReq %s | signals/s=%.1f faults/s=%.1f | codePageWrites/s=%.0f codeRemovedByWrite/s=%.1f noJitDynamicOps/s=%.1f clock_nanosleep64/s=%.1f | audio underruns/s=%.1f queuedMin=%.0fms | zipMiss/s=%.1f zipMs/s=%.0f%s%s",
             sec, vnboxStatsMips, s.sliceMs / sec / 10.0, s.ticksBusy, s.ticksIdle,
             s.tickWaits, s.tickWaits ? s.tickLateMs / s.tickWaits : 0, s.tickLateMaxMs,
@@ -263,7 +264,7 @@ static void statsTickStart(int asked) {
             s.sysMs / sec, (s.sliceMs - s.sysMs) / sec, statsBusyThreads(s, sec).c_str(), statsTopSyscalls(s).c_str(),
             guestInstr ? 100.0 * s.jitInstr / guestInstr : 0, guestInstr ? 100.0 - 100.0 * s.jitInstr / guestInstr : 0,
             s.jitEntries / sec, s.blocksCompiled / sec,
-            s.clockBackoffs / sec, s.capHeldMs / sec, s.capTicks / sec, s.capWakeInput / sec, s.capWakeFrame / sec, s.capWakeFile / sec, s.capWakeAudio / sec, s.capWakeGl / sec, s.smallFrames / sec,
+            s.clockBackoffs / sec, s.capHeldMs / sec, s.capTicks / sec, s.capWakeInput / sec, s.capWakeFrame / sec, s.capWakeFile / sec, s.capWakeAudio / sec, s.capWakeGl / sec, s.smallFrames / sec, s.hotThreads, s.hotThrottles / sec, s.hotThrottleMs / sec,
             s.wineserverMs / sec, s.wineserverRequests / sec, statsWineRequests(s, sec).c_str(), s.signals / sec, s.faults / sec,
             s.codePageWrites / sec, s.codeRemovedByWrite / sec, s.opsNoJitDynamic / sec, s.sysCount[407] / sec, s.audioUnderruns / sec, s.audioQueuedMinMs, s.zipMisses / sec, s.zipMs / sec, js, wd3d);
 #if defined(BOXEDWINE_WASM_JIT_HOPCOUNT) && !defined(BOXEDWINE_MULTI_THREADED)
@@ -271,6 +272,7 @@ static void statsTickStart(int asked) {
 #endif
         s = VnboxStats();
         s.on = true;
+        vnboxStatsLogs++;
         statsLastLog = now;
     }
 }

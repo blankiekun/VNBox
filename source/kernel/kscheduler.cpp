@@ -20,6 +20,7 @@
 #include "../x11/x11.h"
 #include "knativeaudio.h"
 #include "vnboxstats.h"
+#include "vnboxidle.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #else
@@ -98,6 +99,8 @@ void removeTimer(KTimerCallback* timer) {
     timer->active = false;
 }
 
+static U64 schedulerMicroCounter();
+
 void scheduleThread(KThread* thread) {
 #ifdef _DEBUG
     if (thread->waitingCond) {
@@ -105,6 +108,12 @@ void scheduleThread(KThread* thread) {
     }
     if (thread->condTimer.active) {
         kpanic("can't schedule a thread that is waiting on a timer");
+    }
+#endif
+#ifdef __EMSCRIPTEN__
+    if (thread->hotBlockedSinceUs) { // hot-thread throttle: how long it waited
+        thread->hotBlockedUs += schedulerMicroCounter() - thread->hotBlockedSinceUs;
+        thread->hotBlockedSinceUs = 0;
     }
 #endif
     thread->cpu->yield = false;
@@ -280,6 +289,52 @@ U64 elapsedInstructionsMIPS;
 
 U64 vnboxSliceLimitUs = 9000; // guest time one runSlice may use (the main loop lowers it under a CPU cap)
 
+bool KThreadThrottleTimer::run() {
+    active = false;
+    // a signal may have run the thread early; it may be waiting on something else by now
+    if (!thread->terminating && !thread->waitingCond && !thread->ptraceStopped && !thread->scheduledThreadNode.isInList()) {
+        scheduleThread(thread);
+    }
+    return true;
+}
+
+#if defined(__EMSCRIPTEN__)
+// Hot-thread throttle (vnboxidle.h): called at the end of a thread's turn in which it put a frame. A thread is hot
+// when it was runnable at least half the time since its previous frame (a busy loop, Sleep(0) included, not a game
+// that sleeps or waits between frames; a CPU cap holding the guest doesn't count as waiting). A hot thread whose
+// frames change nothing that matters (vnboxIdleNow: none of the idle cap's wake reasons lately) sleeps, 1 ms after
+// the first such frame, twice as long after each next one, up to hotThrottle= ms. Any wake reason or a frame drawn
+// without busy-looping starts the ramp over. The sleep is a real one: guest clocks keep time. Rate alone never
+// throttles: a busy game whose screen changes (or that presents with GL) runs at full speed.
+static bool hotThrottle(KThread* thread, U64 now) {
+    bool hot = thread->hotSinceUs && now > thread->hotSinceUs && thread->hotBlockedUs * 2 <= now - thread->hotSinceUs;
+    thread->hotBlockedUs = 0;
+    thread->hotSinceUs = now;
+    if (!hot || !vnboxHotThrottleMaxMs || !vnboxIdleNow()) {
+        thread->hotThrottleMs = 0;
+        return false;
+    }
+    U32 ms = thread->hotThrottleMs ? std::min(thread->hotThrottleMs * 2, vnboxHotThrottleMaxMs) : 1;
+    thread->hotThrottleMs = ms;
+    thread->hotSinceUs = now + ms * 1000ull; // the sleep isn't the thread's idle time
+    if (thread->hotTimer.active) { // a signal ran it before its sleep was over
+        removeTimer(&thread->hotTimer);
+    }
+    thread->hotTimer.thread = thread;
+    thread->hotTimer.millies = KSystem::getMilliesSinceStart() + ms;
+    addTimer(&thread->hotTimer);
+    if (vnboxStats.on) {
+        vnboxStats.hotThrottles++;
+        vnboxStats.hotThrottleMs += ms;
+        if (thread->hotStatsLog != vnboxStatsLogs + 1) {
+            thread->hotStatsLog = vnboxStatsLogs + 1;
+            vnboxStats.hotThreads++;
+        }
+    }
+    return true;
+}
+#endif
+
 bool runSlice() {    
     runTimers();
 
@@ -346,6 +401,16 @@ bool runSlice() {
         vnboxStatSlice(currentThread, diff, sysCallTime);
         elapsedInstructionsMIPS+=currentThread->cpu->blockInstructionCount;
 
+        bool throttle = false;
+#if defined(__EMSCRIPTEN__)
+        if (vnboxFramePutThread == currentThread) {
+            vnboxFramePutThread = nullptr;
+            throttle = !currentThread->terminating && !currentThread->ptraceStopped && !currentThread->waitingCond && hotThrottle(currentThread, now);
+        }
+        if (currentThread->waitingCond) {
+            currentThread->hotBlockedSinceUs = now; // scheduleThread adds the time when it runs again
+        }
+#endif
         currentThread->userTime+=diff-sysCallTime;
         currentThread->kernelTime+=sysCallTime;
 
@@ -358,7 +423,9 @@ bool runSlice() {
         } else if (!currentThread->waitingCond) {
             // make sure we are behind any threads that were recently scheduled
             node->remove();
-            scheduledThreads.addToBack(node);
+            if (!throttle) { // a throttled thread comes back from its timer (hotTimer)
+                scheduledThreads.addToBack(node);
+            }
         }
     }
     if (!scheduledThreads.isEmpty() && vnboxSliceLimitUs >= 9000) { // a capped slice is short on purpose

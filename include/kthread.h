@@ -59,6 +59,15 @@ public:
 
 typedef std::shared_ptr<KThreadGlContext> KThreadGlContextPtr;
 
+#ifndef BOXEDWINE_MULTI_THREADED
+// hot-thread throttle (kscheduler.cpp): puts a throttled thread back on the run queue when its sleep is over
+class KThreadThrottleTimer : public KTimerCallback {
+public:
+    bool run() override;
+    KThread* thread = nullptr;
+};
+#endif
+
 class KThread {
 public:
     KThread(U32 id, const KProcessPtr& process);
@@ -209,6 +218,12 @@ public:
     KListNode<KThread*> waitThreadNode;
         
     BoxedWineConditionTimer condTimer;
+    // hot-thread throttle (kscheduler.cpp): time the thread spent blocked (waiting, sleeping) since its last frame
+    // put, when that window started, since when it is blocked (0: runnable), its current sleep per frame (ramps up
+    // while the screen stays idle), the timer that ends it
+    U64 hotBlockedUs = 0, hotSinceUs = 0, hotBlockedSinceUs = 0;
+    U32 hotThrottleMs = 0, hotStatsLog = 0;
+    KThreadThrottleTimer hotTimer;
 #endif
 
     U32 condStartWaitTime = 0;

@@ -162,6 +162,9 @@ void vnboxIdleFrameChanged(unsigned x0, unsigned y0, unsigned x1, unsigned y1, u
 // that blinks on time still shows each blink, ~0.1 s late at worst in a game that needs a whole frame to draw). A guest that runs without putting frames
 // (loading, decoding) is not held; one that busy-waits on the clock gets the clock back-off instead.
 bool vnboxFramePut;
+KThread* vnboxFramePutThread;
+unsigned vnboxHotThrottleMaxMs = 16;
+bool vnboxIdleNow() { return KSystem::getMicroCounter() >= idleAwakeUntilUs; }
 static U64 idleMaxHoldUs = 50000; // idleCapHold=<ms>
 static U64 idleHoldUntilUs, idleFrameUsedUs;
 
@@ -407,6 +410,7 @@ bool doMainLoop() {
     if (idleCapPct == 100) idleCapPct = 0;
     if (cpuCapPct == 100) cpuCapPct = 0;
     vnboxClockBackoff = vnboxUrlInt("clockBackoff", 1, 0, 1);
+    vnboxHotThrottleMaxMs = vnboxUrlInt("hotThrottle", vnboxHotThrottleMaxMs, 0, 100);
     if (idleCapPct || cpuCapPct) klog_fmt("CPU caps: idle %u%% (changes under %u%% of the screen count as idle), fixed %u%%", idleCapPct, idleCapAreaPct, cpuCapPct);
 #endif
     XServer::drawFps = vnboxUrlInt("fps", XServer::drawFps, 0, 240); // frames shown per second at most, 0 = unlocked

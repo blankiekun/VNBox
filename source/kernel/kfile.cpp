@@ -26,6 +26,23 @@ static inline void fileWake(FsOpenNode* openFile) {
     if (type == FsNode::Type::File || type == FsNode::Type::Zip) vnboxIdleWake(VNBOX_WAKE_FILE);
 }
 
+// A read() / pread() wakes like that unless it looks like streaming: a small read (BGM, voice) on an fd that was
+// last read a while ago. A game streaming 64 KB of music every 200 ms keeps a static screen idle; the first read of
+// an fd, a big read or reads in quick succession (loading) still wake.
+static constexpr U64 STREAM_READ_GAP_US = 50000;
+static constexpr U32 STREAM_READ_MAX = 256 * 1024;
+static inline void fileReadWake(KFile* file, U32 len) {
+#if defined(__EMSCRIPTEN__) && !defined(BOXEDWINE_MULTI_THREADED)
+    U64 now = KSystem::getMicroCounter();
+    bool streaming = file->vnboxLastReadUs && now - file->vnboxLastReadUs >= STREAM_READ_GAP_US && len <= STREAM_READ_MAX;
+    file->vnboxLastReadUs = now;
+    if (streaming) {
+        return;
+    }
+#endif
+    fileWake(file->openFile);
+}
+
 void KWritebackResult::recordIo(U64 bytes, S32 error) {
     if (bytes > std::numeric_limits<U64>::max() - bytesWritten) {
         bytesWritten = std::numeric_limits<U64>::max();
@@ -150,7 +167,7 @@ U32 KFile::writeNative(U8* buffer, U32 len) {
 
 U32 KFile::read(KThread* thread, U32 buffer, U32 len) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(filePosMutex);
-    fileWake(this->openFile);
+    fileReadWake(this, len);
     return this->openFile->read(thread, buffer, len);
 }
 
@@ -213,7 +230,7 @@ S64 KFile::length() {
 }
 
 U32 KFile::pread(KThread* thread, U32 buffer, S64 offset, U32 len) {
-    fileWake(this->openFile);
+    fileReadWake(this, len);
     if (offset < 0) {
         return -K_EINVAL;
     }

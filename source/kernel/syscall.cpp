@@ -20,6 +20,7 @@
 
 #include "kinotify.h"
 #include "vnboxstats.h"
+#include "vnboxidle.h"
 
 #include "log.h"
 #include "kscheduler.h"
@@ -811,6 +812,11 @@ static U32 clockPollBackoff(CPU* cpu) {
         return 0;
     }
     thread->clockPolls = 0;
+    // only while the screen is idle (vnboxidle.h): in a live scene the 1 ms sleeps cost a game its frame
+    // limiter's timing (Muramasa's title 60 -> 58 presents/s)
+    if (!vnboxIdleNow()) {
+        return 0;
+    }
     if (vnboxStats.on) vnboxStats.clockBackoffs++;
     thread->clockPollSleeping = true;
     U32 result = thread->sleep(1);
