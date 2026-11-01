@@ -15,8 +15,10 @@
 #include "../../emulation/cpu/wasm/wasmEmitter.h"
 #include "../../emulation/cpu/wasm/wasmJitBatchPolicy.h"
 #include "../../emulation/cpu/wasm/wasmModuleMerger.h"
+#include "../../emulation/cpu/normal/normalCPU.h"
 #include <climits>
 #include <emscripten.h>
+void clearJitBlock(const std::vector<void*>& jitOps);
 #ifdef BOXEDWINE_MULTI_THREADED
 #include <emscripten/threading.h>
 #include <memory>
@@ -104,6 +106,101 @@ void testWasmJitStBoundedDispatch() {
     }
     contextTimeRemaining = savedBudget;
     cpu->nextOp = nullptr;
+}
+
+// Hot groups: chained standalone blocks that reach the entry threshold are compiled again into one module, keep
+// running correctly, and a block whose slot is cleared while queued drops out of the queue.
+void testWasmJitHotGroups() {
+    testNewInstruction(0);
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    constexpr U32 blockCount = 8;
+    constexpr U32 blockBytes = 8;
+    constexpr U32 hotEntries = 4;
+    wasmJitTestResetRuntimeBatching();
+    wasmJitTestSetHotGroups(hotEntries, 1e12); // entries per period; the period never ends here: flush below
+    for (U32 i = 0; i < blockCount; ++i) {
+        testPushCode8(0x43); // inc ebx
+        testPushCode8(0xb8); testPushCode32((i + 1) * blockBytes); // mov eax,next
+        testPushCode8(0xff); testPushCode8(0xe0); // jmp eax: separate blocks
+    }
+    testPushCode8(0xcd); testPushCode8(0x97);
+    std::vector<DecodedOp*> blocks;
+    std::vector<void*> tier1;
+    for (U32 i = 0; i < blockCount; ++i) {
+        U32 address = TEST_CODE_ADDRESS + i * blockBytes;
+        DecodedOp* op = cpu->getOp(address, 0);
+        startNewJIT(cpu, address, op);
+        if (!op->pfnJitCode || op->pfn != context.process->startJITOp) {
+            testFail("hot group test requires compiled block entries");
+            wasmJitTestResetRuntimeBatching();
+            return;
+        }
+        op->runCount = JIT_RUN_COUNT + 1;
+        blocks.push_back(op);
+        tier1.push_back(op->pfnJitCode);
+    }
+    auto runOnce = [&]() {
+        cpu->eip.u32 = 0;
+        cpu->reg[3].u32 = 0;
+        cpu->nextOp = blocks[0];
+        cpu->yield = false;
+        for (U32 i = 0; i < 4 * blockCount && cpu->nextOp->inst != TestEnd; ++i) {
+            cpu->blockInstructionCount = 0;
+            cpu->run();
+        }
+        return cpu->reg[3].u32 == blockCount && cpu->nextOp->inst == TestEnd;
+    };
+    for (U32 i = 0; i < hotEntries - 1; ++i) {
+        if (!runOnce()) testFail("tier-1 blocks must run the chain");
+    }
+    if (wasmJitTestHotQueueSize() != 0) {
+        testFail("blocks below the hot threshold must not queue");
+    }
+    if (!runOnce()) testFail("tier-1 blocks must run the chain at the threshold");
+    if (wasmJitTestHotQueueSize() != blockCount || wasmJitTestHotModules() != 0) {
+        testFail("every block at the hot threshold must queue once and wait for its group");
+    }
+    // A slot cleared while queued (code invalidated) leaves the queue; its op falls back to the interpreter.
+    DecodedOp* dropped = blocks[3];
+    clearJitBlock({dropped->pfnJitCode});
+    dropped->pfnJitCode = nullptr;
+    dropped->flags &= ~OP_FLAG_JIT;
+    dropped->pfn = NormalCPU::getFunctionForOp(dropped);
+    dropped->runCount = JIT_RUN_COUNT + 1;
+    if (wasmJitTestHotQueueSize() != blockCount - 1) {
+        testFail("a cleared slot must drop its hot queue entry");
+    }
+    wasmJitTestHotFlush(cpu); // what the end of a period does at a dispatcher exit
+    if (!runOnce()) testFail("hot-group blocks must run the chain after the flush");
+    if (wasmJitTestHotModules() != 1 || wasmJitTestHotBlocks() != blockCount - 1 || wasmJitTestHotQueueSize() != 0) {
+        testFail("queued hot blocks must be compiled into one hot group");
+    }
+    for (U32 i = 0; i < blockCount; ++i) {
+        if (i == 3) continue;
+        if (!blocks[i]->pfnJitCode || blocks[i]->pfnJitCode == tier1[i] || blocks[i]->pfn != context.process->startJITOp ||
+                (blocks[i]->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
+            testFail("a hot block must be published at its new hot-group slot");
+        }
+    }
+    // Hot-group code has no entry counter: running it many times never queues it again.
+    for (U32 i = 0; i < 2 * hotEntries; ++i) {
+        if (!runOnce()) testFail("hot-group blocks must run the chain");
+    }
+    if (wasmJitTestHotModules() != 1 || wasmJitTestHotQueueSize() != 0) {
+        testFail("hot-group blocks must not queue again");
+    }
+    if (wasmJitTestRuntimeGroupCount() != 1) {
+        testFail("the hot group must be one runtime group");
+    }
+    cpu->nextOp = nullptr;
+    for (U32 i = 0; i < blockCount; ++i) {
+        if (i != 3) context.memory->removeCodeBlock(TEST_CODE_ADDRESS + i * blockBytes, blocks[i], false);
+    }
+    if (wasmJitTestRuntimeGroupCount() != 0) {
+        testFail("the hot group must be released with its last block");
+    }
+    wasmJitTestResetRuntimeBatching();
 }
 #endif
 
@@ -1805,8 +1902,14 @@ void testWasmJitTinyAnonymousPromotion() {
     }
 
     DecodedOp* normal = compile(normalAddress);
-    if (!isStandaloneJit(normal) || wasmJitTestPendingCount() != 0 || wasmJitTestRuntimeGroupCount() != 0) {
-        testFail("four-op anonymous block installs immediately");
+    if (!normal || !(normal->flags2 & OP_FLAG2_WASM_JIT_PENDING) || normal->pfnJitCode || wasmJitTestPendingCount() != 1) {
+        testFail("four-op anonymous block waits in its address space's runtime batch");
+        return;
+    }
+    wasmJitHandlePendingHit(testContext().cpu, normal);
+    wasmJitHandlePendingHit(testContext().cpu, normal);
+    if (!isStandaloneJit(normal) || wasmJitTestPendingCount() != 0 || wasmJitTestRuntimeGroupCount() != 1) {
+        testFail("four-op anonymous block installs through a runtime batch group");
     }
 
     DecodedOp* invalidated = compile(invalidatedAddress);
@@ -1880,13 +1983,12 @@ void testWasmJitGroupedOomRecovery() {
     limits.maxProcessOpenBytes = 4 * 1024 * 1024;
     wasmJitTestSetBatchLimits(limits);
     wasmJitTestSetMappedFileKeyOverride(0);
+    wasmJitTestSetTinyAdditionalHits(1);
     wasmJitTestEnableRuntimeBatching(true);
 
+    // A tiny anonymous block promotes to a standalone slot (other anonymous blocks batch).
     U32 releasableAddress = testContext().codeIp;
     testPushCode8(0x40); // inc eax
-    testPushCode8(0x41); // inc ecx
-    testPushCode8(0x42); // inc edx
-    testPushCode8(0x43); // inc ebx
     testPushCode8(0xcd);
     testPushCode8(0x97);
 
@@ -1908,6 +2010,7 @@ void testWasmJitGroupedOomRecovery() {
     };
 
     DecodedOp* releasable = compile(releasableAddress);
+    wasmJitHandlePendingHit(testContext().cpu, releasable);
     if (!isInstalled(releasable)) {
         testFail("grouped OOM setup creates a releasable standalone slot");
         return;

@@ -696,7 +696,23 @@ bool StartUpArgs::apply() {
     } else if (!parent) {
         klog("-webgl WineD3D overrides were enabled but /home/username/.wine/drive_c/windows/system32 was not found in the file system");
     } else {
+#ifdef BOXEDWINE_HOST_WINED3D
+        // hostWined3d=0 (URL): no stub, the guest's wined3d for every game, as in a build without HOST_WINED3D.
+        bool hostWined3d = !EM_ASM_INT({ return typeof vnboxParam === "function" && vnboxParam("hostWined3d") === "0" ? 1 : 0; });
+        if (!hostWined3d) {
+            klog("[vnbox] host wined3d off (hostWined3d=0)");
+        }
+#endif
         for (const char* pName : { "ddraw.dll", "d3d8.dll", "d3d9.dll", "dxgi.dll", "wined3d.dll", "d3dxof.dll", "d3dx9_36.dll", "d3dx9_43.dll" }) {
+#ifdef BOXEDWINE_HOST_WINED3D
+            // The stub (source/wined3d/guest, embedded by vnbox-wined3d.mk): wined3d runs on the host.
+            // d3d9, d3d8 and ddraw keep the guest's wined3d under another name (wined3d_guest.c use_guest_wined3d).
+            if (hostWined3d && !strcmp(pName, "wined3d.dll")) {
+                Fs::addFileNode(parent->path + "/" + pName, B(""), B("/hostwd3d/wined3d.dll"), false, parent);
+                Fs::addFileNode(parent->path + "/wined3d-webgl.dll", webglParent->path + "/" + pName, webglParent->nativePath + "/" + pName, false, parent);
+                continue;
+            }
+#endif
             Fs::addFileNode(parent->path + "/" + pName, webglParent->path + "/" + pName, webglParent->nativePath + "/" + pName, false, parent);
         }
     }

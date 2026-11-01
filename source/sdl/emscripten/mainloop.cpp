@@ -327,7 +327,7 @@ bool doMainLoop() {
             if (delay >= 0) wait(delay);
             else if (!document.hidden && performance.now() - lastFrame > 12) raf = requestAnimationFrame(framed);
             else post();
-        }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", e); else console.error("tick failed: " + e); }); };
+        }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", String(e) + (e && e.stack ? "\n" + e.stack : "")); else console.error("tick failed: " + e); }); };
         channel.port1.onmessage = next;
         requestAnimationFrame(frame);
         next();

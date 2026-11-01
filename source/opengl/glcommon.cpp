@@ -630,9 +630,10 @@ static const char* addedExt[] = {
     "WGL_ARB_create_context_Invalid"
 };
 
-static const char* getFilteredExtensionString(KProcess* process) {
+// count: how many names the returned string holds. Shared by the guest path and host wined3d (glcommonHost*).
+static const char* getFilteredExtensionString(U32& count) {
 #ifdef DISABLE_GL_EXTENSIONS
-    process->numberOfExtensions = 1;
+    count = 1;
     return "GL_EXT_texture3D";
 #else
 #ifdef __EMSCRIPTEN__
@@ -648,7 +649,7 @@ static const char* getFilteredExtensionString(KProcess* process) {
         "GL_EXT_texture3D "
         "WGL_ARB_create_context_Invalid";
     if (!emscripten_webgl_get_current_context()) {
-        process->numberOfExtensions = 10;
+        count = 10;
         return webglFallbackExt;
     }
 #endif
@@ -734,7 +735,7 @@ static const char* getFilteredExtensionString(KProcess* process) {
         extensionCount++;
     }
 #endif
-    process->numberOfExtensions = extensionCount;
+    count = extensionCount;
     return ext;
 #endif
 }
@@ -742,8 +743,10 @@ static const char* getFilteredExtensionString(KProcess* process) {
 void glcommon_glGetIntegerv(CPU* cpu) {
     GLenum pname = ARG1;
     if (pname == GL_NUM_EXTENSIONS) {
-        getFilteredExtensionString(cpu->thread->process.get());
-        cpu->memory->writed(ARG2, cpu->thread->process->numberOfExtensions);
+        U32 count = 0;
+        getFilteredExtensionString(count);
+        cpu->thread->process->numberOfExtensions = count;
+        cpu->memory->writed(ARG2, count);
     } else {
         MarshalReadWrite<GLint> buffer(cpu, ARG2, getSize(ARG1));
         GL_FUNC(pglGetIntegerv)(pname, buffer.getPtr());
@@ -894,31 +897,35 @@ void printOpenGLInfo() {
     klog_fmt("GL Version: %s", (const char*)GL_FUNC(pglGetString)(GL_VERSION));
 }
 
+#ifdef __EMSCRIPTEN__
+// What glGetString reports for these names instead of the browser's WebGL strings, else null.
+static const char* webglFixedString(U32 name) {
+    switch (name) {
+    case GL_VENDOR:
+        return "BoxedWine";
+    case GL_RENDERER:
+        return "BoxedWine WebGL";
+    case GL_VERSION:
+        return "3.0 BoxedWine WebGL";
+    case 0x8B8C: /* GL_SHADING_LANGUAGE_VERSION */
+        return "3.00 BoxedWine WebGL";
+    }
+    return nullptr;
+}
+#endif
+
 // GLAPI const GLubyte* APIENTRY glGetString( GLenum name ) {
 void glcommon_glGetString(CPU* cpu) {
     U32 name = ARG1;
     const char* result;
 #ifdef __EMSCRIPTEN__
-    switch (name) {
-    case GL_VENDOR:
-        result = "BoxedWine";
-        break;
-    case GL_RENDERER:
-        result = "BoxedWine WebGL";
-        break;
-    case GL_VERSION:
-        result = "3.0 BoxedWine WebGL";
-        break;
-    case 0x8B8C: /* GL_SHADING_LANGUAGE_VERSION */
-        result = "3.00 BoxedWine WebGL";
-        break;
-    default:
+    result = webglFixedString(name);
+    if (!result) {
         if (!emscripten_webgl_get_current_context()) {
             EAX = 0;
             return;
         }
         result = (const char*)GL_FUNC(pglGetString)(name);
-        break;
     }
 #else
     result = (const char*)GL_FUNC(pglGetString)(name);
@@ -926,7 +933,9 @@ void glcommon_glGetString(CPU* cpu) {
     KProcess* process = cpu->thread->process.get();
 
     if (name == GL_EXTENSIONS) {
-        result = getFilteredExtensionString(process);
+        U32 count = 0;
+        result = getFilteredExtensionString(count);
+        process->numberOfExtensions = count;
         GL_LOG("glGetString GLenum name=GL_EXTENSIONS ret=%s", result);
     }
 
@@ -1145,17 +1154,9 @@ void glcommon_glGetMapiv(CPU* cpu) {
     }	
 }
 
-void glcommon_glTexSubImage2D(CPU* cpu) {
-    GLenum target = ARG1;
-    GLint level = ARG2;
-    GLint xoffset = ARG3;
-    GLint yoffset = ARG4;
-    GLsizei width = ARG5;
-    GLsizei height = ARG6;
-    GLenum format = ARG7;
-    GLenum type = ARG8;
-    const GLvoid* pixels = PIXEL_UNPACK_BUFFER() ? (GLvoid*)pARG9 : marshalPixels(cpu, target == GL_TEXTURE_3D ? 3 : 2, width, height, 1, format, type, ARG9, xoffset, yoffset, level);
-
+// glTexSubImage2D from client memory (or the bound unpack buffer). WebGL: rows described by UNPACK_ROW_LENGTH/SKIP_*
+// are copied tightly packed first. Also host wined3d's glTexSubImage2D (glcommonHost_glTexSubImage2D).
+static void texSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* pixels) {
 #ifdef __EMSCRIPTEN__
     std::vector<U8> tightlyPackedPixels;
     GLint unpackAlignment = 1;
@@ -1203,7 +1204,6 @@ void glcommon_glTexSubImage2D(CPU* cpu) {
     }
 #endif
 
-    GL_LOG("glTexSubImage2D GLenum target=%x, GLint level=%d, GLint xoffset=%d, GLint yoffset=%d, GLsizei width=%d, GLsizei height=%d, GLenum format=%x, GLenum type=%x, const GLvoid* pixels=%x", ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, ARG7, ARG8, ARG9);
     GL_FUNC(pglTexSubImage2D)(target, level, xoffset, yoffset, width, height, format, type, pixels);
 #ifdef __EMSCRIPTEN__
     if (restoreUnpackState) {
@@ -1214,6 +1214,92 @@ void glcommon_glTexSubImage2D(CPU* cpu) {
     }
 #endif
 }
+
+void glcommon_glTexSubImage2D(CPU* cpu) {
+    GLenum target = ARG1;
+    GLint level = ARG2;
+    GLint xoffset = ARG3;
+    GLint yoffset = ARG4;
+    GLsizei width = ARG5;
+    GLsizei height = ARG6;
+    GLenum format = ARG7;
+    GLenum type = ARG8;
+    const GLvoid* pixels = PIXEL_UNPACK_BUFFER() ? (GLvoid*)pARG9 : marshalPixels(cpu, target == GL_TEXTURE_3D ? 3 : 2, width, height, 1, format, type, ARG9, xoffset, yoffset, level);
+
+    GL_LOG("glTexSubImage2D GLenum target=%x, GLint level=%d, GLint xoffset=%d, GLint yoffset=%d, GLsizei width=%d, GLsizei height=%d, GLenum format=%x, GLenum type=%x, const GLvoid* pixels=%x", ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, ARG7, ARG8, ARG9);
+    texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+}
+
+#ifdef BOXEDWINE_HOST_WINED3D
+// Host wined3d (source/wined3d/glRoute.cpp) calls GL with host pointers, but must see the same GL as the guest's
+// wined3d does through the functions above: the same strings and filtered extension list, the same WebGL fixes.
+U32 getPixelsLen(bool read, U32 dimensions, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, int& bytes_per_comp, int& isSigned);
+
+const GLubyte* OPENGL_CALL_TYPE glcommonHost_glGetString(GLenum name) {
+#ifdef __EMSCRIPTEN__
+    if (const char* fixed = webglFixedString(name)) {
+        return (const GLubyte*)fixed;
+    }
+#endif
+    if (name == GL_EXTENSIONS) {
+        U32 count = 0;
+        return (const GLubyte*)getFilteredExtensionString(count);
+    }
+#ifdef __EMSCRIPTEN__
+    if (!emscripten_webgl_get_current_context()) {
+        return nullptr;
+    }
+#endif
+    return GL_FUNC(pglGetString)(name);
+}
+
+// The filtered list split into names: the index-th one, or null past the end (glGetStringi).
+const GLubyte* OPENGL_CALL_TYPE glcommonHost_glGetStringi(GLenum name, GLuint index) {
+    if (name != GL_EXTENSIONS) {
+        return glcommonHost_glGetString(name);
+    }
+    U32 count = 0;
+    const char* list = getFilteredExtensionString(count);
+    thread_local static const char* splitFrom = nullptr;
+    thread_local static std::vector<BString> names;
+    if (splitFrom != list) {
+        names.clear();
+        B(list).split(' ', names);
+        splitFrom = list;
+    }
+    return index < names.size() ? (const GLubyte*)names[index].c_str() : nullptr;
+}
+
+void OPENGL_CALL_TYPE glcommonHost_glGetIntegerv(GLenum pname, GLint* data) {
+    if (pname == GL_NUM_EXTENSIONS) {
+        U32 count = 0;
+        getFilteredExtensionString(count);
+        *data = (GLint)count;
+    } else {
+        GL_FUNC(pglGetIntegerv)(pname, data);
+    }
+}
+
+void OPENGL_CALL_TYPE glcommonHost_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* pixels) {
+    texSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+}
+
+void OPENGL_CALL_TYPE glcommonHost_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid* pixels) {
+#ifdef __EMSCRIPTEN__
+    // Same as glcommon_glReadPixels: read into the PACK span with a sized view (Emscripten's own view is wrong
+    // above 2 GB).
+    if (!PIXEL_PACK_BUFFER() && pixels) {
+        int bytesPerComp = 0, isSigned = 0;
+        U32 len = getPixelsLen(false, 2, width, height, 1, format, type, bytesPerComp, isSigned);
+        if (len) {
+            boxedwine_read_pixels_client(x, y, width, height, format, type, (int)(uintptr_t)pixels, (int)len);
+            return;
+        }
+    }
+#endif
+    GL_FUNC(pglReadPixels)(x, y, width, height, format, type, pixels);
+}
+#endif
 
 // GLAPI void APIENTRY glGetPointerv( GLenum pname, GLvoid **params ) {
 void glcommon_glGetPointerv(CPU* cpu) {
@@ -2573,7 +2659,28 @@ static bool glCanRunOnCurrentThread(U32 index) {
 }
 #endif
 
+// The guest wined3d.dll stub's calls (source/wined3d/thunkHost.h): host wined3d, or nothing in builds without it.
+#define WD3D_THUNK_CALL_BASE 0x00f00000u
+#define WD3D_THUNK_CALL_LIMIT 0x00f10000u
+#ifdef BOXEDWINE_HOST_WINED3D
+#include "../wined3d/thunkHost.h"
+static_assert(WD3D_THUNK_CALL_BASE == HOSTWD3D_CALL_BASE && WD3D_THUNK_CALL_LIMIT == HOSTWD3D_CALL_LIMIT, "thunkHost.h");
+#endif
+
 void callOpenGL(CPU* cpu, U32 index) {
+    if (index >= WD3D_THUNK_CALL_BASE && index < WD3D_THUNK_CALL_LIMIT) {
+#ifdef BOXEDWINE_HOST_WINED3D
+        hostWined3dCall(cpu, index);
+#else
+        static bool logged;
+        if (!logged) {
+            logged = true;
+            klog("guest wined3d.dll thunk called, but this build has no host wined3d (HOST_WINED3D=1): answering 0");
+        }
+        EAX = 0;
+#endif
+        return;
+    }
 #ifdef BOXEDWINE_OPENGL
     //KNativeWindow::getNativeWindow()->preOpenGLCall(index);
 #ifdef __EMSCRIPTEN__

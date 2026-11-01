@@ -21,6 +21,7 @@
 #ifdef BOXEDWINE_WASM_JIT
 
 #include "wasmEmitter.h"
+#include <algorithm>
 #include <cstring>
 
 // ---------------------------------------------------------------------------
@@ -166,6 +167,21 @@ void WasmEmitter::beginFunction(const std::vector<std::pair<U32, WasmType>>& loc
         appendULEB128(m_currentBody, lp.first);
         m_currentBody.push_back((U8)lp.second);
     }
+    m_bodyStart = m_currentBody.size();
+}
+
+void WasmEmitter::moveTailToBodyStart(size_t mark) {
+    size_t len = m_currentBody.size() - mark;
+    if (!len) return;
+    std::rotate(m_currentBody.begin() + m_bodyStart, m_currentBody.begin() + mark, m_currentBody.end());
+    for (BranchHintEntry& hint : m_branchHints) {
+        if (hint.funcIndex != m_currentFunctionIndex || hint.offset < m_bodyStart) continue;
+        if (hint.offset < mark) hint.offset += (U32)len;
+        else hint.offset -= (U32)(mark - m_bodyStart);
+    }
+    std::stable_sort(m_branchHints.begin(), m_branchHints.end(), [](const BranchHintEntry& a, const BranchHintEntry& b) {
+        return a.funcIndex != b.funcIndex ? a.funcIndex < b.funcIndex : a.offset < b.offset;
+    });
 }
 
 void WasmEmitter::endFunction() {

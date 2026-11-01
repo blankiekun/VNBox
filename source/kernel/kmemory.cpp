@@ -2184,9 +2184,30 @@ void KMemory::cloneLocked(KMemory* from, bool vfork) {
         }
     }
 
-    ::memcpy(data->mmu, from->data->mmu, sizeof(data->mmu));
+    bool zeroTables = false;
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+    zeroTables = kmemoryZeroPageTables();
+    if (zeroTables) {
+        // copy only the table pages that hold entries, so the child's table pages
+        // for unused guest addresses stay untouched (see KMemoryData)
+        const U32 chunk = K_PAGE_SIZE / sizeof(MMU);
+        for (U32 i = 0; i < K_NUMBER_OF_PAGES; i += chunk) {
+            if (!kmemoryIsZero(&from->data->mmu[i], K_PAGE_SIZE) || !kmemoryIsZero(&data->mmu[i], K_PAGE_SIZE)) {
+                ::memcpy(&data->mmu[i], &from->data->mmu[i], K_PAGE_SIZE);
+            }
+        }
+    }
+#endif
+    if (!zeroTables) {
+        ::memcpy(data->mmu, from->data->mmu, sizeof(data->mmu));
+    }
 
     for (int i = 0; i < 0x100000; i++) {
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+        if (zeroTables && data->isPageEntryZero(i)) {
+            continue;
+        }
+#endif
         MMU& mmu = data->mmu[i];
 
         RamPage ramPageIndex = mmu.getRamPageIndex();

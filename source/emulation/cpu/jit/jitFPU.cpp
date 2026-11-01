@@ -338,6 +338,7 @@ void JitFPU::cachedFpuBinary(U8 dst, U8 src, XmmXmmCallback callback, bool rever
 }
 
 void JitFPU::cachedFpuDiv(U8 dst, U8 src, bool reverse, bool pop) {
+    if (fastX87() >= 2) { cachedFpuBinary(dst, src, &JitFPU::fpuDiv, reverse, pop); return; }
     // Match the existing division guard, but use the virtual stack's tags.
     // A slow division executes the whole instruction, including any pop, so it
     // must leave the block instead of rejoining the fast arm's cached mapping.
@@ -370,13 +371,14 @@ void JitFPU::cachedFpuMemory(DecodedOp* op, XmmXmmCallback callback, JitWidth wi
             if (width == JitWidth::b32) fpuRegExtend32To64(tmp, tmp);
         }
         RegPtr isZero;
-        if (division && !reverse) {
+        const bool guarded = division && fastX87() < 2;
+        if (guarded && !reverse) {
             isZero = integer ? getFpuDivMemoryIntZero(address, width) : getFpuDivMemoryFloatZero(address, width);
         }
         // The operand and zero check are now loaded. Release the guarded MMU
         // address before importing tags: Win32 has only four byte registers.
         address = nullptr;
-        if (division) {
+        if (guarded) {
             RegPtr state = readCPU(JitWidth::b8, offsetof(CPU, fpu.divExceptionsUnmasked));
             if (isZero) {
                 orReg(JitWidth::b8, state, isZero);
@@ -398,7 +400,7 @@ void JitFPU::cachedFpuMemory(DecodedOp* op, XmmXmmCallback callback, JitWidth wi
 }
 
 void JitFPU::cachedFpuStore(U8 dst, bool pop) {
-    if (pop) {
+    if (pop && fastX87() < 2) {
         RegPtr empty = getTmpReg8();
         mov(JitWidth::b32, empty, cachedFpuTag(0));
         compareValue(JitWidth::b8, empty, TAG_Empty, JitEvaluate::EQUALS, empty);
@@ -1517,6 +1519,15 @@ void JitFPU::updateExceptionSummary() {
     andReg(JitWidth::b32, cw, sw);
     andValue(JitWidth::b32, cw, FPU_SW_EXCEPTION_MASK);
 
+    if (fastX87() >= 1) {
+        // Same result without a branch (a branch spills cached GP registers).
+        compareValue(JitWidth::b32, cw, 0, JitEvaluate::NOT_EQUALS, cw);
+        shlValue(JitWidth::b32, cw, 7);
+        andValue(JitWidth::b32, sw, ~FPU_SW_ES);
+        orReg(JitWidth::b32, sw, cw);
+        writeCPU(JitWidth::b32, offsetof(CPU, fpu.sw), sw);
+        return;
+    }
     If(JitWidth::b32, cw); {
         orValue(JitWidth::b32, sw, FPU_SW_ES);
     } StartElse(); {

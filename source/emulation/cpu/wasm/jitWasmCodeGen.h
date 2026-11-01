@@ -197,6 +197,7 @@
 #include "../jit/jitSSE.h"
 #include "wasmEmitter.h"
 #include <array>
+#include <chrono>
 
 // Number of WASM locals used as GP register slots (eax-edi = 8).
 static constexpr U32 WASM_GP_LOCAL_COUNT  = 8;
@@ -238,7 +239,15 @@ static constexpr U32 WASM_FLAG_RESULT_LOCAL = WASM_FPU_VALID_BASE + 8;
 static constexpr U32 WASM_LOOP_CARRY_LOCAL = WASM_FLAG_RESULT_LOCAL + 1;
 // v128 copies of mm0-mm7 (low 64 bits, high lane zero), valid per WasmEmitter::mmxCached.
 static constexpr U32 WASM_MMX_LOCAL_BASE = WASM_LOOP_CARRY_LOCAL + 1;
-static constexpr U32 WASM_LOCAL_COUNT = WASM_MMX_LOCAL_BASE + 8;
+// cpu->wasmReadPageBaseArray / wasmWritePageBaseArray, loaded once in the
+// block prologue (only when the block uses them). The CPU fields change only
+// in wasmPrepareBlockEnter, between block activations, so a guest store or a
+// helper call inside the block can never make these copies stale.
+static constexpr U32 WASM_READ_TABLE_LOCAL = WASM_MMX_LOCAL_BASE + 8;
+static constexpr U32 WASM_WRITE_TABLE_LOCAL = WASM_READ_TABLE_LOCAL + 1;
+// Next-op EIP handed to the shared bailout tail (see emitStoreBailoutCheck).
+static constexpr U32 WASM_BAIL_EIP_LOCAL = WASM_WRITE_TABLE_LOCAL + 1;
+static constexpr U32 WASM_LOCAL_COUNT = WASM_BAIL_EIP_LOCAL + 1;
 
 // ---------------------------------------------------------------------------
 // Mapping from emulated register index to WASM local index.
@@ -496,6 +505,11 @@ public:
     // --- JitFPU backend hooks ---
     bool supportsFpuStackCache() const override { return true; }
     bool supportsFpuLoopCache() const override { return true; }
+    int fastX87() const override;
+    void roundFpuResultToPrecision(FPURegPtr result) override;
+    void guardCachedFpuFallback(RegPtr state) override;
+    // Rounds f64 local src by cpu->fpu.round into local dst without a branch.
+    void emitFastX87RoundByMode(U32 src, U32 dst);
     void materializeFpuCache(U8 slotMask = 0xff) override;
     RegPtr getFpuCacheValidReg(U8 index) override;
     FPURegPtr getFpuCacheReg(U8 index) override;
@@ -955,6 +969,9 @@ public:
     bool shouldStopBlockBefore(U32 eip, DecodedOp* op) override;
     bool supportsConditionalSideExit(U32, U32) const override { return true; }
 
+    // Recompiling a hot block into a hot group (ST): no entry counter, joins the hot batch.
+    bool m_hotTier = false;
+    void emitHotEntryCounter(DecodedOp* op);
     // Per-block exit metadata recorded while compiling, exported with the
     // saved module as boxedwine-jit-manifest.json so the offline cache
     // pipeline can build the successor graph for grouping and direct-call
@@ -964,6 +981,7 @@ public:
     U32 m_manifestNext2Target = 0;
     U32 m_manifestJumpTarget = 0;
     U32 m_manifestNext1Count = 0;
+    U32 m_hopKind = 3; // hop-count builds (BOXEDWINE_WASM_JIT_HOPCOUNT): exit kind of the next chain
     U32 m_manifestNext2Count = 0;
     U32 m_manifestJumpCount = 0;
     struct ForwardTarget {
@@ -1125,7 +1143,12 @@ protected:
     // Return after cpu->nextOp is set; with m_chainBlocks, first tail-call the next block when the dispatcher would.
     void emitChainReturn();
     void emitChainToNextOp();
-    void emitBlockExitWithProfile(U32 profileHelperIdx);
+    void emitBlockExitWithProfile(U32 profileHelperIdx, bool chain = true);
+    void coldBlockExit();
+    // Bailout check after a slow-path store helper: branches to one shared
+    // exit at the end of the function instead of an inline exit per store.
+    void emitStoreBailoutCheck();
+    bool m_usesBailoutTail = false;
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     void emitProfileSampledCall(U32 helperIdx, U32 detail = InstructionCount);
 #endif
@@ -1133,6 +1156,16 @@ protected:
     U32 lastCompiledOpLen = 0;
     bool m_emulatedCurrentOp = false;
     bool m_needsWasmMemoryPageArrays = false;
+    // Which page-table locals the prologue must load (see WASM_READ_TABLE_LOCAL).
+    bool m_usesReadTable = false;
+    bool m_usesWriteTable = false;
+#ifdef __TEST
+    std::chrono::steady_clock::time_point m_testGenStart;
+#endif
+    // Push the read or write page-table base (from its prologue-loaded local).
+    void pushPageTable(bool store);
+    U32 emitPageLookup(RegPtr addressReg, U32 widthBytes, bool store, U32 entryLocal);
+    void pushHostAddress(U32 entryLocal, RegPtr addressReg, U32 offLocal);
     DecodedOp* m_wasmBlockStartOp = nullptr;
     DecodedOp* m_currentWasmOp = nullptr;
     // FNV-1a hash over the block's decoded ops, accumulated by preCompile and
@@ -1296,6 +1329,8 @@ bool wasmJitCompilationPaused();
 
 #ifdef __TEST
 extern "C" U32 wasmJitTestEmissionCount();
+extern "C" U32 wasmJitTestMemHelperCalls();
+void wasmJitTestPrintSizeStats();
 void wasmJitTestSetFailInvalidationPreparation(bool fail);
 #endif
 
@@ -1312,6 +1347,11 @@ void wasmJitTestSetTinyAdditionalHits(U32 hits);
 extern "C" void wasmJitTestFailBatchAfterSlots(S32 slotCount);
 void wasmJitTestResetRuntimeBatching();
 U32 wasmJitTestPendingCount();
+void wasmJitTestSetHotGroups(U32 entries, double waitMs);
+U32 wasmJitTestHotQueueSize();
+void wasmJitTestHotFlush(CPU* cpu);
+U64 wasmJitTestHotModules();
+U64 wasmJitTestHotBlocks();
 bool wasmJitTestRelocAllocationTransfer();
 U32 wasmJitTestSealedCount();
 extern "C" U32 wasmJitTestRuntimeGroupCount();

@@ -26,6 +26,7 @@ enum class WasmJitFlushReason : U8 {
     ByteCount,
     PendingHits,
     ProcessBytes,
+    HotGroup, // a hot group (jitWasmCodeGen.cpp), not produced by the policy
 };
 
 struct WasmJitBatchLimits {
