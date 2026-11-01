@@ -21,6 +21,9 @@
 #include "boxedwine.h"
 #include "vnboxstats.h"
 #include "vnboxwinereq.h"
+#ifdef BOXEDWINE_HOST_WINED3D
+#include "../wined3d/thunkHost.h"
+#endif
 #include <algorithm>
 #include <map>
 #include <tuple>
@@ -238,11 +241,17 @@ static void statsTickStart(int asked) {
         double guestInstr = s.instr > s.sysPadInstr ? (double)(s.instr - s.sysPadInstr) : 0;
         char js[512];
         statsJsPart(js, sizeof(js), sec);
+#ifdef BOXEDWINE_HOST_WINED3D
+        char wd3d[512];
+        hostWined3dStatsLine(wd3d, sizeof(wd3d), sec);
+#else
+        const char* wd3d = "";
+#endif
         klog_fmt("[stats] %.1fs mips=%u guestBusy=%.0f%% ticks busy=%u idle=%u | timeoutWaits=%u late avg=%.1f max=%.1fms | msg/rAF waits=%u gap avg=%.1f max=%.1fms"
             " | guestTimers=%u late avg=%.1f max=%.0fms | glPresents/s=%.1f ms/present=%.2f | xDraws/s=%.0f ms/draw=%.2f shown/s=%.1f skippedSame/s=%.1f busyDropped/s=%.1f composites/s=%.1f compositeMs/s=%.0f swPresentMs/s=%.0f"
             " | glCalls/s=%.0f glGetError/s=%.0f glMs/s=%.0f readbacks/s=%.1f readbackMs/s=%.0f readbackKB/s=%.0f readPixels/s=%.1f readPixelsMs/s=%.0f | input/s=%.1f motion/s=%.0f"
             " | sys ms/s=%.0f user ms/s=%.0f | threads/s:%s | topSys: %s | jit instr=%.0f%% (interp %.0f%%) entries/s=%.0f blocksCompiled/s=%.0f"
-            " | wineserver ms/s=%.0f req/s=%.0f | wineReq %s | signals/s=%.1f faults/s=%.1f | codePageWrites/s=%.0f codeRemovedByWrite/s=%.1f noJitDynamicOps/s=%.1f clock_nanosleep64/s=%.1f | audio underruns/s=%.1f queuedMin=%.0fms | zipMiss/s=%.1f zipMs/s=%.0f%s",
+            " | wineserver ms/s=%.0f req/s=%.0f | wineReq %s | signals/s=%.1f faults/s=%.1f | codePageWrites/s=%.0f codeRemovedByWrite/s=%.1f noJitDynamicOps/s=%.1f clock_nanosleep64/s=%.1f | audio underruns/s=%.1f queuedMin=%.0fms | zipMiss/s=%.1f zipMs/s=%.0f%s%s",
             sec, vnboxStatsMips, s.sliceMs / sec / 10.0, s.ticksBusy, s.ticksIdle,
             s.tickWaits, s.tickWaits ? s.tickLateMs / s.tickWaits : 0, s.tickLateMaxMs,
             s.msgWaits, s.msgWaits ? s.msgGapMs / s.msgWaits : 0, s.msgGapMaxMs,
@@ -254,7 +263,7 @@ static void statsTickStart(int asked) {
             guestInstr ? 100.0 * s.jitInstr / guestInstr : 0, guestInstr ? 100.0 - 100.0 * s.jitInstr / guestInstr : 0,
             s.jitEntries / sec, s.blocksCompiled / sec,
             s.wineserverMs / sec, s.wineserverRequests / sec, statsWineRequests(s, sec).c_str(), s.signals / sec, s.faults / sec,
-            s.codePageWrites / sec, s.codeRemovedByWrite / sec, s.opsNoJitDynamic / sec, s.sysCount[407] / sec, s.audioUnderruns / sec, s.audioQueuedMinMs, s.zipMisses / sec, s.zipMs / sec, js);
+            s.codePageWrites / sec, s.codeRemovedByWrite / sec, s.opsNoJitDynamic / sec, s.sysCount[407] / sec, s.audioUnderruns / sec, s.audioQueuedMinMs, s.zipMisses / sec, s.zipMs / sec, js, wd3d);
 #if defined(BOXEDWINE_WASM_JIT_HOPCOUNT) && !defined(BOXEDWINE_MULTI_THREADED)
         { extern void hopStatsPrint(double); hopStatsPrint(sec); } // HOPCOUNT
 #endif

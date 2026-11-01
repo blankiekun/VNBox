@@ -32,6 +32,8 @@
 #include "cpu/testHostLibc.h"
 #include "cpu/testHostAcm.h"
 #include "cpu/testHostVorbis.h"
+#include "cpu/testHostWined3d.h"
+#include "opengl/testHostWined3dWgl.h"
 #include "cpu/testCMov.h"
 #include "cpu/testCmp.h"
 #include "cpu/testCPU.h"
@@ -913,6 +915,15 @@ const TestEntry TEST_ENTRIES[] = {
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
+#endif
+#ifdef BOXEDWINE_HOST_WINED3D
+    {testHostWined3dNo3d, "Test host wined3d links and creates a no-3D wined3d", TEST_ENTRY_SERIAL},
+    {testHostWined3dThunk, "Test host wined3d thunk: guest calls reach host wined3d", TEST_ENTRY_SERIAL},
+#endif
+#if defined(BOXEDWINE_HOST_WINED3D) && defined(BOXEDWINE_OPENGL)
+    {testHostWined3dWgl, "Test host wined3d window/DC table and GL entry points"},
+    {testHostWined3dGlRoutes, "Test host wined3d sees glcommon's GL strings and extension list"},
+    {testHostWined3dCallbacks, "Test host wined3d queues its parent callbacks for the guest"},
 #endif
     {testCallJw_0x0e8, "Test Call Jw 0e8"},
     {testCallJd_0x2e8, "Test Call Jd 2e8"},
