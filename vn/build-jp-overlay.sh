@@ -8,7 +8,8 @@
 # MPEG-1 movies to the browser page (/dev/vnbox-movie, vnbox-movie.js), and dsound mixes 16-bit
 # and float sound without a function call per sample; and ntdll.so and
 # wineserver built with ntsync support (build-wine-ntsync.sh); and win32u.so with a rendered-glyph
-# cache (build-wine-win32u.sh); and the WebGL wined3d.dll with
+# cache (build-wine-win32u.sh); and winex11.so without the per-pixel alpha pass on window flushes
+# (build-wine-winex11.sh); and the WebGL wined3d.dll with
 # vn/webgl/*.patch (build-webgl-wined3d.sh).
 # Usage: vn/build-jp-overlay.sh <TinyCore15Wine11.0-web.zip> <out/jp.zip>
 set -euo pipefail
@@ -89,6 +90,12 @@ printf '\nntdll.so (i386-unix) and wineserver (bin) are Wine 11.0 with the root 
 "$here/build-wine-win32u.sh" "$work/opt/wine/lib/wine/i386-unix"
 printf '\nwin32u.so (i386-unix) is Wine 11.0 with the root fs patches in rootfs/ and win32u-*.patch,\nbuilt by vn/build-wine-win32u.sh in https://github.com/blankiekun/VNBox.\n' \
   >> "$work/opt/wine/share/wine/vnbox-patches/README"
+
+# Opaque window flushes: the root fs's winex11.so rebuilt with vn/wine/winex11-*.patch, so a window surface flush
+# no longer sets the alpha byte of every flushed pixel (VNBox's X server ignores it): GDI games that redraw
+# the whole window each frame spent ~11% of their guest time in that loop.
+"$here/build-wine-winex11.sh" "$work/opt/wine/lib/wine/i386-unix"
+printf '\nwinex11.so (i386-unix) is Wine 11.0 with the root fs patches in rootfs/ and winex11-*.patch,\nbuilt by vn/build-wine-winex11.sh in https://github.com/blankiekun/VNBox.\n' >> "$work/opt/wine/share/wine/vnbox-patches/README"
 
 # WebGL WineD3D: Direct3D 10/11 SM4 shaders run on GLSL ES 3.00, and draws with no vertex shader
 # bound are skipped instead of crashing (Muramasa EN).
