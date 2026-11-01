@@ -189,6 +189,19 @@ bool recoverRunSliceException() {
     runSliceExceptionThread = nullptr;
     return true;
 }
+#ifdef BOXEDWINE_HOST_WINED3D
+static KThread* runSliceSavedThread;
+
+// A trap in host wined3d unwound the slice without its destructors (source/wined3d/thunkHost.cpp
+// vnbox_wd3d_recover): what ChangeThread and the catch in mainloop would have done.
+bool recoverRunSliceTrap() {
+    if (!runSliceExceptionThread) {
+        return false;
+    }
+    KThread::setCurrentThread(runSliceSavedThread);
+    return recoverRunSliceException();
+}
+#endif
 #endif
 
 void runThreadSlice(KThread* thread) {
@@ -309,6 +322,9 @@ bool runSlice() {
 
 #ifdef __EMSCRIPTEN__
         runSliceExceptionThread = currentThread;
+#ifdef BOXEDWINE_HOST_WINED3D
+        runSliceSavedThread = KThread::currentThread();
+#endif
 #endif
         ChangeThread c(currentThread);
         static U64 rdtsc;

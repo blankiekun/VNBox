@@ -22,12 +22,18 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/stack.h>
+#endif
 
 static_assert(sizeof(hostwd3d_callback) == 16, "guest layout");
 static_assert(HOSTWD3D_CALL_BASE == WD3D_CALL_BASE && HOSTWD3D_CALL_LIMIT == WD3D_CALL_LIMIT, "thunkHost.h vs thunk_ids.h");
 
 extern "C" {
 uint32_t wd3d_dispatch(uint32_t id);
+int hostwd3d_dc_info(uint32_t dc, uint32_t out[5]);
+void wd3d_guest_fault(const char* what);
 extern const char* const wd3d_call_names[WD3D_ID_COUNT];
 int wd3d_dll_main(unsigned int reason);
 }
@@ -154,11 +160,24 @@ const char* wd3d_read_string(uint32_t guest) {
 }
 
 uint32_t wd3d_map_native(void* host, uint32_t len) {
-    return callCpu->memory->mapNativeMemory(host, len);
+    return callCpu ? callCpu->memory->mapNativeMemory(host, len) : 0;
 }
 
 void wd3d_unmap_native(uint32_t guest, uint32_t len) {
-    callCpu->memory->unmapNativeMemory(guest, len);
+    if (callCpu) callCpu->memory->unmapNativeMemory(guest, len);
+}
+
+const void* wd3d_call_memory(void) {
+    return callCpu ? callCpu->memory : nullptr;
+}
+
+// Host wined3d hit what would be an access violation in the guest wined3d (an assert, a wasm trap): the guest gets
+// that access violation at the stub's call (seg_mapper throws through the call, like a fault reading guest memory),
+// so a guest that survives it in the guest wined3d survives it here. Returns only when there is no guest to tell
+// (no call, or no SIGSEGV handler: testJit).
+void wd3d_guest_fault(const char* what) {
+    klog_fmt("[wined3d] host wined3d failed (%s): raising an access violation in the guest", what);
+    if (callCpu && callCpu->thread) callCpu->thread->seg_mapper(0, false, true, true);
 }
 
 uint32_t wd3d_not_forwarded(uint32_t id, uint32_t ret) {
@@ -197,6 +216,63 @@ void hostWined3dStatsLine(char* out, int len, double sec) {
 
 static void hostWined3dCallInner(CPU* cpu, U32 index);
 
+#ifdef __EMSCRIPTEN__
+// A NULL write doesn't trap in wasm: where the guest wined3d would fault, host wined3d writes near address 0. HOST_WINED3D
+// builds start static data at 64 KiB (vnbox-wined3d.mk GLOBAL_BASE), so a NULL + offset write below that lands in
+// memory nothing uses instead of in the emulator's data. Checked once per present: logged (once) and cleared, so NULL
+// reads keep reading zeros.
+constexpr U32 NULL_PAGE_BYTES = 65536;
+static volatile uintptr_t nullPageBase = 0; // opaque to the compiler: a plain NULL dereference would be undefined
+static bool nullPageLogged;
+
+static void checkNullPage() {
+    volatile U32* p = (volatile U32*)nullPageBase;
+    for (U32 i = 0; i < NULL_PAGE_BYTES / 4; i++) {
+        if (p[i]) {
+            if (!nullPageLogged) {
+                nullPageLogged = true;
+                klog_fmt("[wined3d] something wrote through a NULL pointer (wasm address %.4X = %.8X); cleared", i * 4, p[i]);
+            }
+            for (U32 j = i; j < NULL_PAGE_BYTES / 4; j++) p[j] = 0;
+            return;
+        }
+    }
+}
+#endif
+
+// What a trap in host wined3d leaves behind (vnbox_wd3d_recover): the call in flight and the GL context it switched.
+static U32 activeId;
+static uint32_t activeGlSaved[3];
+static int activeGlSwitched;
+
+#ifdef __EMSCRIPTEN__
+bool recoverRunSliceTrap(); // kscheduler.cpp
+extern "C" void _emscripten_stack_restore(uintptr_t sp);
+
+// A wasm trap (an assert's abort, a call through a NULL function pointer, an out-of-bounds access) or a JS error
+// (WebGL TypeError) in host wined3d: wasm can't catch either, so it unwinds the whole tick and rejects the tick's
+// promise (mainloop.cpp). The JS tick loop then asks here: when a forwarded call was in flight, the guest thread that
+// made it gets an access violation at the stub's call (what the guest wined3d's fault would have been), the state
+// the lost frames would have restored is put back (GL context, call scope, shadow stack, scheduler), and the loop
+// goes on. Host wined3d itself is left as the failed call left it, as the guest wined3d is after its fault.
+// Returns 0 (the emulator stops as before) when the failure wasn't in a host wined3d call.
+extern "C" EMSCRIPTEN_KEEPALIVE int vnbox_wd3d_recover(void) {
+    CPU* cpu = callCpu;
+    if (!cpu || !cpu->thread) return 0;
+    klog_fmt("[wined3d] host wined3d failed in %s (wasm trap or JS error): raising an access violation in the guest",
+            activeId < WD3D_ID_COUNT && wd3d_call_names[activeId] ? wd3d_call_names[activeId] : "?");
+    if (activeGlSwitched) {
+        hostwd3d_gl_leave(activeGlSaved);
+        activeGlSwitched = 0;
+    }
+    callCpu = nullptr; // the call's wd3d_tmp() memory is lost with its frames (a leak, once per failure)
+    callTmp = nullptr;
+    _emscripten_stack_restore(emscripten_stack_get_base()); // no wasm frame is live: the tick has ended
+    cpu->thread->seg_mapper(0, false, true, false);
+    return recoverRunSliceTrap() ? 1 : 0;
+}
+#endif
+
 void hostWined3dCall(CPU* cpu, U32 index) {
 #ifdef __EMSCRIPTEN__
     if (vnboxStats.on) {
@@ -230,14 +306,34 @@ static void hostWined3dCallInner(CPU* cpu, U32 index) {
         // A guest that skipped DllMain (or whose hello failed) still gets an attached wined3d or a 0.
         if (attach()) {
 #ifdef BOXEDWINE_OPENGL
-            struct GlScope { // RAII: a guest fault unwinds through here (CallScope)
+            struct GlScope { // RAII: a guest fault unwinds through here (CallScope); a trap doesn't (vnbox_wd3d_recover)
                 uint32_t saved[3];
                 int switched = hostwd3d_gl_enter(saved);
-                ~GlScope() { if (switched) hostwd3d_gl_leave(saved); }
+                GlScope() {
+                    if (switched) {
+                        memcpy(activeGlSaved, saved, sizeof(saved));
+                        activeGlSwitched = 1;
+                    }
+                }
+                ~GlScope() {
+                    if (switched) {
+                        hostwd3d_gl_leave(saved);
+                        activeGlSwitched = 0;
+                    }
+                }
             } gl;
 #endif
+            activeId = id;
             result = wd3d_dispatch(id);
+#ifdef __EMSCRIPTEN__
+            if (id == WD3D_ID_wined3d_swapchain_present) checkNullPage();
+#endif
         }
+    } else if (id == WD3D_ID_DC_INFO) {
+        // (host HDC, U32 out[5]) -> TRUE with {guest memory, format, width, height, pitch} (d3dkmt.c)
+        U32 info[5] = {};
+        result = hostwd3d_dc_info(wd3d_arg(1), info);
+        if (result && wd3d_arg(2)) wd3d_write(wd3d_arg(2), info, sizeof(info));
     } else if (id == WD3D_ID_DRAIN_CALLBACKS) {
         // (struct hostwd3d_callback *out, max) -> how many were moved; the stub repeats until it gets 0, making
         // each call before asking again (a callback may call wined3d and queue more).

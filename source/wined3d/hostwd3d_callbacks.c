@@ -127,6 +127,11 @@ static void push(uint32_t kind, uint32_t target, uint32_t arg, uint32_t value)
     ++queue_count;
 }
 
+void hostwd3d_dc_destroyed(uint32_t host_dc)
+{
+    push(HOSTWD3D_CB_DC_DESTROYED, 0, 0, host_dc);
+}
+
 uint32_t hostwd3d_callbacks_drain(struct hostwd3d_callback *out, uint32_t max)
 {
     uint32_t n = 0;

@@ -8,8 +8,32 @@
  * the screen, visible, client origin in the window rect and its size). Exports that pass wined3d a window register it
  * first (the generated prologues).
  *
- * Built with i686-w64-mingw32-gcc -nostdlib (no CRT): only user32 and kernel32 are imported. */
+ * GDI: wined3d_texture_get_dc's HDC is a host one; the guest makes its own DC over the same texture memory
+ * (wd3d_get_dc_post) and keeps the pair until the host says the host DC is gone (CB_DC_DESTROYED).
+ *
+ * Built with i686-w64-mingw32-gcc -nostdlib (no CRT): only user32, gdi32 and kernel32 are imported. */
 #include <windows.h>
+
+/* ddk/d3dkmthk.h (not in MinGW's headers) */
+typedef struct
+{
+    void *pMemory;
+    UINT Format; /* D3DDDIFORMAT */
+    UINT Width, Height, Pitch;
+    HDC hDeviceDc;
+    PALETTEENTRY *pColorTable;
+    HDC hDc;
+    HANDLE hBitmap;
+} D3DKMT_CREATEDCFROMMEMORY;
+
+typedef struct
+{
+    HDC hDc;
+    HANDLE hBitmap;
+} D3DKMT_DESTROYDCFROMMEMORY;
+
+LONG WINAPI D3DKMTCreateDCFromMemory(D3DKMT_CREATEDCFROMMEMORY *desc);
+LONG WINAPI D3DKMTDestroyDCFromMemory(const D3DKMT_DESTROYDCFROMMEMORY *desc);
 
 struct hostwd3d_callback
 {
@@ -24,10 +48,14 @@ enum
     CB_ACTIVATE,
     CB_WINDOWED_STATE_CHANGED,
     CB_SUB_RESOURCE_CREATED,
+    CB_DC_DESTROYED,
 };
 
 /* the host calls (wined3d_thunk.S) */
 UINT __cdecl wd3d_drain_call(struct hostwd3d_callback *out, UINT max);
+UINT __cdecl wd3d_dc_info_call(UINT host_dc, UINT info[5]); /* {guest memory, D3DDDIFORMAT, width, height, pitch} */
+static void dc_destroyed(UINT host_dc);
+HRESULT __cdecl wined3d_texture_release_dc(void *texture, UINT sub_resource_idx, HDC dc); /* the export */
 UINT __cdecl wd3d_register_window_call(HWND hwnd, UINT drawable, LONG x, LONG y, LONG width, LONG height, UINT visible,
         LONG frame_left, LONG frame_top, LONG window_width, LONG window_height);
 
@@ -66,6 +94,9 @@ void __cdecl wd3d_run_callbacks(void)
             break;
         case CB_WINDOWED_STATE_CHANGED:
             ((windowed_state_changed_fn)op(cb.target, 0))((void *)cb.target, cb.value);
+            break;
+        case CB_DC_DESTROYED:
+            dc_destroyed(cb.value);
             break;
         default: /* CB_SUB_RESOURCE_CREATED: answered on the host */
             break;
@@ -279,12 +310,12 @@ static BOOL CALLBACK find_monitor(HMONITOR monitor, HDC dc, RECT *rect, LPARAM l
 
 /* wined3d_output_get_desc: the host's HMONITOR means nothing here; take the guest monitor of the same device
  * (dxgi and d3d9 compare it with MonitorFromWindow / hand it to the game). */
-void __cdecl wd3d_output_desc_post(struct output_desc *desc, HRESULT hr)
+HRESULT __cdecl wd3d_output_desc_post(struct output_desc *desc, HRESULT hr)
 {
     POINT pt;
 
     if (FAILED(hr) || !desc)
-        return;
+        return hr;
     desc->monitor = NULL;
     EnumDisplayMonitors(NULL, NULL, find_monitor, (LPARAM)desc);
     if (!desc->monitor)
@@ -293,6 +324,97 @@ void __cdecl wd3d_output_desc_post(struct output_desc *desc, HRESULT hr)
         pt.y = desc->desktop_rect.top;
         desc->monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
     }
+    return hr;
+}
+
+/* ---- GDI over texture memory ---- */
+
+/* The guest DC made for each host DC wined3d handed out. A few at a time (each lives from get_dc to release_dc
+ * for d3d11/dxgi). */
+#define MAX_DCS 64
+static struct
+{
+    UINT host;
+    HDC dc;
+    HANDLE bitmap;
+} dcs[MAX_DCS];
+
+/* wined3d_texture_get_dc(texture, sub_resource_idx, HDC *dc): *dc is the host's DC; give the guest one over the
+ * same memory instead. */
+HRESULT __cdecl wd3d_get_dc_post(UINT *args, HRESULT hr)
+{
+    HDC *out = (HDC *)args[2];
+    D3DKMT_CREATEDCFROMMEMORY desc = {0};
+    UINT host, info[5];
+    unsigned int i, free_slot = MAX_DCS;
+
+    if (FAILED(hr) || !out)
+        return hr;
+    host = (UINT)(ULONG_PTR)*out;
+    for (i = 0; i < MAX_DCS; ++i)
+    {
+        if (dcs[i].host == host && dcs[i].dc)
+        {
+            *out = dcs[i].dc; /* an OWNDC texture's DC lives across get_dc / release_dc */
+            return hr;
+        }
+        if (!dcs[i].dc && free_slot == MAX_DCS)
+            free_slot = i;
+    }
+    if (free_slot < MAX_DCS && wd3d_dc_info_call(host, info))
+    {
+        desc.pMemory = (void *)info[0];
+        desc.Format = info[1];
+        desc.Width = info[2];
+        desc.Height = info[3];
+        desc.Pitch = info[4];
+        desc.hDeviceDc = CreateCompatibleDC(NULL);
+        if (desc.hDeviceDc && !D3DKMTCreateDCFromMemory(&desc))
+        {
+            DeleteDC(desc.hDeviceDc);
+            dcs[free_slot].host = host;
+            dcs[free_slot].dc = desc.hDc;
+            dcs[free_slot].bitmap = desc.hBitmap;
+            *out = desc.hDc;
+            return hr;
+        }
+        if (desc.hDeviceDc)
+            DeleteDC(desc.hDeviceDc);
+    }
+    /* no guest DC: give the host one back (release_dc passes a DC it doesn't know through as is) */
+    wined3d_texture_release_dc((void *)args[0], args[1], (HDC)(ULONG_PTR)host);
+    *out = NULL;
+    return 0x8876086c; /* WINED3DERR_INVALIDCALL */
+}
+
+/* wined3d_texture_release_dc's HDC argument (in place): the guest's DC back to the host's */
+void __cdecl wd3d_dc_arg(HDC *dc)
+{
+    unsigned int i;
+
+    for (i = 0; i < MAX_DCS; ++i)
+        if (dcs[i].dc && dcs[i].dc == *dc)
+        {
+            *dc = (HDC)(ULONG_PTR)dcs[i].host;
+            return;
+        }
+}
+
+static void dc_destroyed(UINT host_dc)
+{
+    D3DKMT_DESTROYDCFROMMEMORY desc;
+    unsigned int i;
+
+    for (i = 0; i < MAX_DCS; ++i)
+        if (dcs[i].dc && dcs[i].host == host_dc)
+        {
+            desc.hDc = dcs[i].dc;
+            desc.hBitmap = dcs[i].bitmap;
+            D3DKMTDestroyDCFromMemory(&desc);
+            dcs[i].dc = NULL;
+            dcs[i].host = 0;
+            return;
+        }
 }
 
 /* vkd3d-shader's signature API (vkd3d_shader.h), which wined3d.dll exports and d3d11's CreateInputLayout uses:
