@@ -34,6 +34,17 @@ public:
     U32 eip;
 };
 
+// Wasm: KMemoryData blocks (the flat 1M-entry mmu/wasmReadPageBase/
+// wasmWritePageBase tables, 12 MiB per guest process) come from a pool of
+// sbrk-fresh blocks whose tables are all zero, and table sweeps (fork, exec,
+// exit) skip all-zero entries, so only the 4 KB table pages that cover used
+// guest addresses are ever written. Untouched wasm memory pages are not
+// resident in the browser process. The JIT-visible layout is unchanged.
+// zeroPageTables=0 (URL) turns it off at runtime.
+#if defined(__EMSCRIPTEN__) && !defined(__SANITIZE_ADDRESS__)
+#define BOXEDWINE_ZERO_PAGE_TABLES
+#endif
+
 class KMemoryData {
 public:
     static void shutdown();
@@ -89,6 +100,10 @@ public:
     U32 wasmWritePageBase[K_NUMBER_OF_PAGES];
 #endif
     CodePage* getOrCreateCodePage(U32 address);
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+    // true when mmu[page] and its derived table entries are all zero
+    bool isPageEntryZero(U32 page) const;
+#endif
 
     DecodedOpCache opCache;
     BNativeHeap codeMemory;
@@ -100,6 +115,11 @@ public:
 };
 
 KMemoryData* getMemData(KMemory* memory);
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+bool kmemoryIsZero(const void* p, size_t len);
+// false when zeroPageTables=0 (URL): tables are allocated and swept in full as before
+bool kmemoryZeroPageTables();
+#endif
 
 inline U32 KMemory::readdInline(U32 address) {
     if ((address & 0xFFF) < 0xFFD) {
