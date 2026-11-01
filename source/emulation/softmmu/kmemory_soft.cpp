@@ -44,6 +44,25 @@ KMemoryData* getMemData(KMemory* memory) {
 #ifdef BOXEDWINE_ZERO_PAGE_TABLES
 #include <unistd.h>
 #include <mutex>
+#include <emscripten.h>
+
+// zeroPageTables=0 (URL; node tests: env ZERO_PAGE_TABLES=0) turns it off. Read once, at the first KMemoryData,
+// and never changed afterwards: destroy() relies on it to know where a block
+// came from.
+bool kmemoryZeroPageTables() {
+    static int state = -1;
+    if (state < 0) {
+        state = EM_ASM_INT({
+            var v = typeof vnboxParam === "function" ? vnboxParam("zeroPageTables") : null;
+            if (v == null && typeof process !== "undefined" && process.env) v = process.env.ZERO_PAGE_TABLES;
+            return v === "0" ? 0 : 1;
+        });
+        if (!state) {
+            klog_fmt("[vnbox] zero page tables off (zeroPageTables=0)");
+        }
+    }
+    return state != 0;
+}
 
 bool kmemoryIsZero(const void* p, size_t len) {
     const U32* w = (const U32*)p;
@@ -119,12 +138,14 @@ bool KMemoryData::isPageEntryZero(U32 page) const {
 
 KMemoryData* KMemoryData::create(KMemory* memory) {
 #ifdef BOXEDWINE_ZERO_PAGE_TABLES
-    void* storage = tablePoolAlloc();
-    try {
-        return new (storage) KMemoryData(memory, ramPageUseLinearMemory());
-    } catch (...) {
-        tablePoolFree(storage);
-        throw;
+    if (kmemoryZeroPageTables()) {
+        void* storage = tablePoolAlloc();
+        try {
+            return new (storage) KMemoryData(memory, ramPageUseLinearMemory());
+        } catch (...) {
+            tablePoolFree(storage);
+            throw;
+        }
     }
 #endif
     if (ramPageUseLinearMemoryAdjacent()) {
@@ -152,9 +173,11 @@ void KMemoryData::destroy(KMemoryData* data) {
         return;
     }
 #ifdef BOXEDWINE_ZERO_PAGE_TABLES
-    data->~KMemoryData();
-    tablePoolFree(data);
-    return;
+    if (kmemoryZeroPageTables()) {
+        data->~KMemoryData();
+        tablePoolFree(data);
+        return;
+    }
 #endif
     if (data->linearMemoryAdjacent) {
         U8* storage = (U8*)data;
@@ -173,16 +196,20 @@ KMemoryData::KMemoryData(KMemory* memory, bool enableLinearMemory, U8* adjacentL
         linearMemoryMappings.resize(K_NUMBER_OF_PAGES);
         linearMemoryBacking = backing;
     }
-#ifndef BOXEDWINE_ZERO_PAGE_TABLES // pool blocks arrive with zeroed tables
-    ::memset(mmu, 0, sizeof(mmu));
+    bool zeroTables = true;
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+    zeroTables = !kmemoryZeroPageTables(); // pool blocks arrive with zeroed tables
 #endif
+    if (zeroTables) {
+        ::memset(mmu, 0, sizeof(mmu));
+#ifdef BOXEDWINE_WASM_JIT
+        ::memset(wasmReadPageBase,  0, sizeof(wasmReadPageBase));
+        ::memset(wasmWritePageBase, 0, sizeof(wasmWritePageBase));
+#endif
+    }
 #ifdef BOXEDWINE_MEM_CACHE
     ::memset(readCache, 0, sizeof(readCache));
     ::memset(writeCache, 0, sizeof(writeCache));
-#endif
-#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_ZERO_PAGE_TABLES)
-    ::memset(wasmReadPageBase,  0, sizeof(wasmReadPageBase));
-    ::memset(wasmWritePageBase, 0, sizeof(wasmWritePageBase));
 #endif
     if(!callbackRam.value) {
         callbackRam = ramPageAlloc();
@@ -221,12 +248,14 @@ KMemoryData::~KMemoryData() {
     linearMemoryBase = nullptr;
     setPagesInvalid(0, K_NUMBER_OF_PAGES);
 #ifdef BOXEDWINE_ZERO_PAGE_TABLES
-    // the block goes back to the pool: leave its tables all zero
-    zeroTouchedPages(mmu, sizeof(mmu));
+    if (kmemoryZeroPageTables()) {
+        // the block goes back to the pool: leave its tables all zero
+        zeroTouchedPages(mmu, sizeof(mmu));
 #ifdef BOXEDWINE_WASM_JIT
-    zeroTouchedPages(wasmReadPageBase, sizeof(wasmReadPageBase));
-    zeroTouchedPages(wasmWritePageBase, sizeof(wasmWritePageBase));
+        zeroTouchedPages(wasmReadPageBase, sizeof(wasmReadPageBase));
+        zeroTouchedPages(wasmWritePageBase, sizeof(wasmWritePageBase));
 #endif
+    }
 #endif
 }
 
@@ -565,7 +594,7 @@ void KMemoryData::setPagesInvalid(U32 page, U32 pageCount, bool codeAlreadyPrepa
     }
     for (U32 i = page; i < page + pageCount; i++) {
 #ifdef BOXEDWINE_ZERO_PAGE_TABLES
-        if (isPageEntryZero(i)) {
+        if (kmemoryZeroPageTables() && isPageEntryZero(i)) {
             continue; // already invalid; don't touch its table page
         }
 #endif

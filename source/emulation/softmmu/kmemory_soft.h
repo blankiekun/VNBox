@@ -40,6 +40,7 @@ public:
 // exit) skip all-zero entries, so only the 4 KB table pages that cover used
 // guest addresses are ever written. Untouched wasm memory pages are not
 // resident in the browser process. The JIT-visible layout is unchanged.
+// zeroPageTables=0 (URL) turns it off at runtime.
 #if defined(__EMSCRIPTEN__) && !defined(__SANITIZE_ADDRESS__)
 #define BOXEDWINE_ZERO_PAGE_TABLES
 #endif
@@ -116,6 +117,8 @@ public:
 KMemoryData* getMemData(KMemory* memory);
 #ifdef BOXEDWINE_ZERO_PAGE_TABLES
 bool kmemoryIsZero(const void* p, size_t len);
+// false when zeroPageTables=0 (URL): tables are allocated and swept in full as before
+bool kmemoryZeroPageTables();
 #endif
 
 inline U32 KMemory::readdInline(U32 address) {
