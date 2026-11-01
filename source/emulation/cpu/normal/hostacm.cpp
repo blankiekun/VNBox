@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "vnboxparam.h"
 
 // Native Vorbis ACM: games that ship H. Mutsuki's vorbis.acm (Ogg Vorbis ACM codec, MSVC7 + libvorbis 1.0, all
 // x87) decode their BGM through it, emulated. Its DriverProc export gets a head op (hostLibcOp, the native libc
@@ -105,7 +106,7 @@ bool hostAcmMapped(KFile* file, U32& driverProc) {
     hostAcmSeen.push_back(path);
 #ifdef BOXEDWINE_HOST_VORBIS
 #ifdef __EMSCRIPTEN__
-    if (EM_ASM_INT({ return typeof vnboxParam === "function" && vnboxParam("nativeAcm") === "0" ? 1 : 0; })) {
+    if (vnboxUrlIs("nativeAcm", "0")) {
         klog_fmt("[vnbox] native acm off (nativeAcm=0)");
         return false;
     }

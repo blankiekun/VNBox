@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "vnboxparam.h"
 
 // Host-side hooks for the Frida-compat layer (project/emscripten/frida-compat.js).
 // The instruction at a hooked guest address is decoded as its own one-op block
@@ -312,7 +313,7 @@ void hostLibcMapped(KFile* file) {
     const BString& path = file->openFile->node->path;
     if (!path.endsWith("/libc.so.6")) return;
 #ifdef __EMSCRIPTEN__
-    if (EM_ASM_INT({ return typeof vnboxParam === "function" && vnboxParam("nativeLibc") === "0" ? 1 : 0; })) {
+    if (vnboxUrlIs("nativeLibc", "0")) {
         hostLibcState = -1;
         klog_fmt("[vnbox] native libc off (nativeLibc=0)");
         return;

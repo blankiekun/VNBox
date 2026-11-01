@@ -1,0 +1,131 @@
+{
+  "schema": 1,
+  "about": "VNBox tuning options: URL params of boxedwine.html. Leave a param out to get its default. bool options are sent as urlValues[true|false]; int and choice options as the number. All are read once at startup (restart: the game has to be restarted for a change to apply). See docs/VNBox-Options.md.",
+  "groups": ["Speed", "CPU/battery", "Display", "Audio", "Debug"],
+  "options": [
+    {
+      "name": "nativeLibc",
+      "label": "Native libc string functions",
+      "description": "Runs hot C string and memory functions as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeAcm",
+      "label": "Native vorbis.acm decoder",
+      "description": "Decodes vorbis.acm background music as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeVorbis",
+      "label": "Native libvorbis",
+      "description": "Decodes a game's own libvorbis.dll audio as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "hotGroup",
+      "label": "Hot code groups",
+      "description": "Compiles code that runs hot together into one module, so it runs faster.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "fastX87",
+      "label": "Fast x87 maths",
+      "description": "How the JIT keeps x87 floating point state: 1 is faster with the same results, 2 skips checks and may break games.",
+      "type": "choice", "default": 1,
+      "choices": [
+        { "value": 0, "label": "Exact (slowest)" },
+        { "value": 1, "label": "Fast, same results" },
+        { "value": 2, "label": "Fastest, skips checks", "experimental": true }
+      ],
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "zeroPageTables",
+      "label": "Zero page tables",
+      "description": "Memory page tables only touch the pages a game uses, which saves memory.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "hostWined3d",
+      "label": "Native Direct3D (wined3d)",
+      "description": "Runs Wine's Direct3D layer as browser code; only in builds made with HOST_WINED3D=1.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": true
+    },
+    {
+      "name": "idleWait",
+      "label": "Longest idle wait (ms)",
+      "description": "Longest the engine sleeps while the game waits and no timer is due sooner; higher saves CPU, lower reacts faster.",
+      "type": "int", "default": 16, "min": 1, "max": 1000,
+      "group": "CPU/battery", "restart": true, "experimental": false
+    },
+    {
+      "name": "fps",
+      "label": "Frame rate cap",
+      "description": "Most frames shown per second; lower saves CPU and battery, 0 shows every frame.",
+      "type": "int", "default": 60, "min": 0, "max": 240,
+      "group": "Display", "restart": true, "experimental": false
+    },
+    {
+      "name": "fitWindow",
+      "label": "Fit game window",
+      "description": "The game's main window fills the screen without a title bar.",
+      "type": "bool", "default": false, "urlValues": { "true": "true", "false": "false" },
+      "group": "Display", "restart": true, "experimental": false
+    },
+    {
+      "name": "movies",
+      "label": "Play movies",
+      "description": "Plays the game's MPEG-1 movies in the page; off leaves them to the game, which usually skips them.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Display", "restart": true, "experimental": false
+    },
+    {
+      "name": "audioPeriod",
+      "label": "Audio buffer (frames)",
+      "description": "Frames per audio callback when the audio worklet is not used, rounded down to a power of two; higher stutters less but lags more.",
+      "type": "int", "default": 4096, "min": 256, "max": 16384,
+      "group": "Audio", "restart": true, "experimental": false
+    },
+    {
+      "name": "stats",
+      "label": "Performance stats",
+      "description": "Logs frame pacing, drawing, timer and JIT counters to the console every 2 seconds.",
+      "type": "bool", "default": false, "urlValues": { "true": "1", "false": "0" },
+      "group": "Debug", "restart": true, "experimental": false
+    },
+    {
+      "name": "prof",
+      "label": "Guest code profiler",
+      "description": "Samples where guest time goes, per module and offset, and logs it.",
+      "type": "bool", "default": false, "urlValues": { "true": "1", "false": "0" },
+      "group": "Debug", "restart": true, "experimental": false
+    },
+    {
+      "name": "hotEntries",
+      "label": "Hot group threshold",
+      "description": "Entries per period that make a block hot for hot code groups (measurement only).",
+      "type": "int", "default": 2048, "min": 1, "max": 2147483647,
+      "group": "Debug", "restart": true, "experimental": true
+    },
+    {
+      "name": "hotWaitMs",
+      "label": "Hot group wait (ms)",
+      "description": "Length of one hot code group period, after which the hot blocks are compiled together (measurement only).",
+      "type": "int", "default": 1000, "min": 0, "max": 2147483647,
+      "group": "Debug", "restart": true, "experimental": true
+    },
+    {
+      "name": "hotMax",
+      "label": "Hot group size",
+      "description": "Most blocks queued for one hot code group (measurement only).",
+      "type": "int", "default": 1024, "min": 1, "max": 2147483647,
+      "group": "Debug", "restart": true, "experimental": true
+    }
+  ]
+}

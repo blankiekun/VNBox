@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "vnboxparam.h"
 #include "startupArgs.h"
 #include "../../platform/sdl/sdlStatusBar.h"
 #include "../emulation/cpu/wasm/wasmMemoryOrdering.h"
@@ -698,7 +699,7 @@ bool StartUpArgs::apply() {
     } else {
 #ifdef BOXEDWINE_HOST_WINED3D
         // hostWined3d=0 (URL): no stub, the guest's wined3d for every game, as in a build without HOST_WINED3D.
-        bool hostWined3d = !EM_ASM_INT({ return typeof vnboxParam === "function" && vnboxParam("hostWined3d") === "0" ? 1 : 0; });
+        bool hostWined3d = !vnboxUrlIs("hostWined3d", "0");
         if (!hostWined3d) {
             klog("[vnbox] host wined3d off (hostWined3d=0)");
         }

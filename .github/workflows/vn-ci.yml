@@ -16,7 +16,8 @@ concurrency:
 
 jobs:
   # Catches regressions in lazyfs.js ranged reads, frida-compat.js string/pattern/trans code,
-  # boxedwine-shell.js (URL options, CUE/BIN, zips) and source/io/readahead.h.
+  # boxedwine-shell.js (URL options, CUE/BIN, zips), source/io/readahead.h, and VNBox options read in
+  # code but missing from vnbox-options.json (or listed but read nowhere).
   checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 6
@@ -33,6 +34,9 @@ jobs:
 
       - name: frida-compat.check.mjs
         run: node project/emscripten/frida-compat.check.mjs
+
+      - name: vnbox-options.check.mjs
+        run: node project/emscripten/vnbox-options.check.mjs
 
       - name: boxedwine-shell.test.cjs
         run: node --test project/emscripten/boxedwine-shell.test.cjs
