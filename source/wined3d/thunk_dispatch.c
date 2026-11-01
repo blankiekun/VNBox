@@ -1628,7 +1628,17 @@ uint32_t wd3d_dispatch(uint32_t id)
         uint32_t r = (uint32_t)(uintptr_t)wined3d_texture_from_resource((struct wined3d_resource*)(uintptr_t)a1);
         return r;
     }
-    case WD3D_ID_wined3d_texture_get_dc: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
+    case WD3D_ID_wined3d_texture_get_dc:
+    {
+        uint32_t a1 = wd3d_arg(1);
+        uint32_t a2 = wd3d_arg(2);
+        uint32_t a3 = wd3d_arg(3);
+        uint32_t na3 = 1;
+        HDC* pa3 = a3 ? (HDC*)wd3d_read_array(a3, na3, sizeof(HDC)) : NULL;
+        uint32_t r = (uint32_t)wined3d_texture_get_dc((struct wined3d_texture*)(uintptr_t)a1, (unsigned int)(uintptr_t)a2, pa3);
+        if (pa3) wd3d_write(a3, pa3, na3 * sizeof(HDC));
+        return r;
+    }
     case WD3D_ID_wined3d_texture_get_level_count: return wd3d_not_forwarded(id, 0);
     case WD3D_ID_wined3d_texture_get_lod: return wd3d_not_forwarded(id, 0);
     case WD3D_ID_wined3d_texture_get_overlay_position: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
@@ -1659,7 +1669,14 @@ uint32_t wd3d_dispatch(uint32_t id)
         uint32_t r = (uint32_t)wined3d_texture_incref((struct wined3d_texture*)(uintptr_t)a1);
         return r;
     }
-    case WD3D_ID_wined3d_texture_release_dc: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
+    case WD3D_ID_wined3d_texture_release_dc:
+    {
+        uint32_t a1 = wd3d_arg(1);
+        uint32_t a2 = wd3d_arg(2);
+        uint32_t a3 = wd3d_arg(3);
+        uint32_t r = (uint32_t)wined3d_texture_release_dc((struct wined3d_texture*)(uintptr_t)a1, (unsigned int)(uintptr_t)a2, (HDC)(uintptr_t)a3);
+        return r;
+    }
     case WD3D_ID_wined3d_texture_set_color_key: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
     case WD3D_ID_wined3d_texture_set_lod: return wd3d_not_forwarded(id, 0);
     case WD3D_ID_wined3d_texture_set_overlay_position: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
@@ -1751,6 +1768,7 @@ const char *const wd3d_call_names[WD3D_ID_COUNT] =
     [WD3D_ID_HELLO] = "hello",
     [WD3D_ID_REGISTER_WINDOW] = "register_window",
     [WD3D_ID_DRAIN_CALLBACKS] = "drain_callbacks",
+    [WD3D_ID_DC_INFO] = "dc_info",
     [16] = "wined3d_adapter_get_identifier",
     [17] = "wined3d_adapter_get_output",
     [18] = "wined3d_adapter_get_output_count",

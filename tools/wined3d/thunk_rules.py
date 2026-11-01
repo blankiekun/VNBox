@@ -63,15 +63,14 @@ HAND = {
     'wined3d_query_get_data',
 }
 
-# In the phase-2 import set but not forwarded yet (video decoding, GDI interop, budget events): logged once and
-# answered with the default.
+# In the phase-2 import set but not forwarded yet (video decoding, budget events): logged once and answered with the
+# default.
 # The decoder's create and profile queries are forwarded: the GL adapter has the null decoder (no profiles,
 # wined3d_decoder_create answers E_INVALIDARG as the guest wined3d does), so no decoder object reaches the rest.
 NOT_YET = {
     'wined3d_decoder_begin_frame', 'wined3d_decoder_decode', 'wined3d_decoder_decref',
     'wined3d_decoder_end_frame', 'wined3d_decoder_extension', 'wined3d_decoder_get_buffer',
     'wined3d_decoder_output_view_create', 'wined3d_decoder_output_view_decref',
-    'wined3d_texture_get_dc', 'wined3d_texture_release_dc',
     'wined3d_adapter_register_budget_change_notification',
     'wined3d_adapter_unregister_budget_change_notification',
 }
@@ -114,12 +113,19 @@ GUEST_PRE = {
     'wined3d_swapchain_present': [('window', 4)],
     'wined3d_swapchain_resize_buffers': [('refresh',)],
     'wined3d_swapchain_state_resize_target': [('refresh',)],
+    'wined3d_texture_release_dc': [('dc', 3)],
 }
+# ('dc', n): argument n is an HDC the guest got from wined3d_texture_get_dc: the guest's own DC, swapped back for the
+# host's in place (wined3d_guest.c wd3d_dc_arg).
 # Guest stub: what an export does after the host call (and its callbacks), keyed by function: (fn, n) calls the
-# guest's fn(argument n, result) and returns the result. The output desc's HMONITOR is the host user32's handle:
-# dxgi matches it against the guest's MonitorFromWindow (dxgi_get_output_from_window), so the guest swaps in its own.
+# guest's fn(argument n, result) (n = 0: the address of the first argument) and returns what fn returns. The output
+# desc's HMONITOR is the host user32's handle: dxgi matches it against the guest's MonitorFromWindow
+# (dxgi_get_output_from_window), so the guest swaps in its own. get_dc's HDC is the host's: the guest makes its own DC
+# over the same texture memory (id 3 hands it the memory, mapped into the guest) and returns that.
 GUEST_POST = {
     'wined3d_output_get_desc': ('_wd3d_output_desc_post', 2),
+    'wined3d_texture_get_dc': ('_wd3d_get_dc_post', 0),
 }
 # Bumped when the guest/host contract changes beyond the signatures (hello's arguments, the call-id set, callbacks).
-PROTOCOL_REVISION = 'v3: hello(hash, &pending); drain one at a time; window registration with the window rect'
+PROTOCOL_REVISION = ('v4: hello(hash, &pending); drain one at a time; window registration with the window rect; '
+                     'id 3 dc_info, DC_DESTROYED callback, get_dc/release_dc forwarded')
