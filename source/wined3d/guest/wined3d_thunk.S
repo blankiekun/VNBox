@@ -12,7 +12,7 @@ _DllMain@12:
     cmpl $1, 8(%esp)          /* DLL_PROCESS_ATTACH: check the host speaks this protocol */
     jne 1f
     pushl $_wd3d_pending
-    pushl $0xa58b5be0
+    pushl $0xb17d0d55
     call wd3d_hello
     addl $8, %esp
     testl %eax, %eax
@@ -37,6 +37,11 @@ _wd3d_register_window_call:
 _wd3d_drain_call:
     int $0x99
     .long 0x00f00002
+    ret
+    .globl _wd3d_dc_info_call
+_wd3d_dc_info_call:
+    int $0x99
+    .long 0x00f00003
     ret
 wd3d_after:                   /* the host queued callbacks: run them, keeping the result */
     pushl %eax
@@ -1128,11 +1133,10 @@ _wined3d_output_get_desc:
     je 2f
     call wd3d_after
 2:  pushl %eax
-    pushl %eax
-    pushl 16(%esp)
+    movl 12(%esp), %ecx
+    pushl %ecx
     call _wd3d_output_desc_post
     addl $8, %esp
-    popl %eax
     ret
     .globl _wined3d_output_get_display_mode
 _wined3d_output_get_display_mode:
@@ -2191,7 +2195,13 @@ _wined3d_texture_get_dc:
     int $0x99
     .long 0x00f0013c
     cmpl $0, _wd3d_pending
-    jne wd3d_after
+    je 2f
+    call wd3d_after
+2:  pushl %eax
+    leal 8(%esp), %ecx
+    pushl %ecx
+    call _wd3d_get_dc_post
+    addl $8, %esp
     ret
     .globl _wined3d_texture_get_level_count
 _wined3d_texture_get_level_count:
@@ -2265,6 +2275,10 @@ _wined3d_texture_incref:
     ret
     .globl _wined3d_texture_release_dc
 _wined3d_texture_release_dc:
+    leal 12(%esp), %eax
+    pushl %eax
+    call _wd3d_dc_arg
+    addl $4, %esp
     int $0x99
     .long 0x00f00147
     cmpl $0, _wd3d_pending

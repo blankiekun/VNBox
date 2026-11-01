@@ -21,7 +21,7 @@ import thunk_rules as R
 
 REPO = os.path.normpath(os.path.join(HERE, '..', '..'))
 CALL_BASE = 0x00F00000  # int 0x99 index range for wined3d calls (GL uses small indices; JIT fast path <= 0xffffff)
-FIRST_ID = 16           # 0 = hello (protocol check), 1 = window registration, 2 = callback drain, ..15 reserved
+FIRST_ID = 16           # 0 = hello (protocol check), 1 = window registration, 2 = callback drain, 3 = DC info, ..15 reserved
 MAX_COUNT = 65536
 
 SCALAR_POINTEES = {'unsigned int', 'UINT', 'BOOL', 'DWORD', 'RECT', 'GUID', 'HDC', 'float', 'uint32_t', 'int', 'LONG'}
@@ -171,7 +171,7 @@ def main():
          f'#define WD3D_CALL_BASE 0x{CALL_BASE:08x}u', f'#define WD3D_CALL_LIMIT 0x{CALL_BASE + 0x10000:08x}u',
          f'#define WD3D_PROTOCOL_HASH 0x{proto_hash:08x}u', '#define WD3D_ID_HELLO 0',
          '#define WD3D_ID_REGISTER_WINDOW 1',
-         '#define WD3D_ID_DRAIN_CALLBACKS 2', f'#define WD3D_ID_COUNT {FIRST_ID + len(names)}']
+         '#define WD3D_ID_DRAIN_CALLBACKS 2', '#define WD3D_ID_DC_INFO 3', f'#define WD3D_ID_COUNT {FIRST_ID + len(names)}']
     h += [f'#define WD3D_ID_{n} {ids[n]}' for n in names]
     h += ['#endif', '']
     out['source/wined3d/thunk_ids.h'] = '\n'.join(h)
@@ -207,7 +207,8 @@ def main():
         stats['generated'] += 1
     d += ['    }', '    return wd3d_not_forwarded(id, 0);', '}', '',
           'const char *const wd3d_call_names[WD3D_ID_COUNT] =', '{', '    [WD3D_ID_HELLO] = "hello",',
-          '    [WD3D_ID_REGISTER_WINDOW] = "register_window",', '    [WD3D_ID_DRAIN_CALLBACKS] = "drain_callbacks",'] + names_tbl + ['};', '']
+          '    [WD3D_ID_REGISTER_WINDOW] = "register_window",', '    [WD3D_ID_DRAIN_CALLBACKS] = "drain_callbacks",',
+          '    [WD3D_ID_DC_INFO] = "dc_info",'] + names_tbl + ['};', '']
     out['source/wined3d/thunk_dispatch.c'] = '\n'.join(d)
 
     # guest stub
@@ -227,6 +228,8 @@ def main():
          '    int $0x99', f'    .long 0x{CALL_BASE + 1:08x}', '    ret',
          '    .globl _wd3d_drain_call', '_wd3d_drain_call:',
          '    int $0x99', f'    .long 0x{CALL_BASE + 2:08x}', '    ret',
+         '    .globl _wd3d_dc_info_call', '_wd3d_dc_info_call:',
+         '    int $0x99', f'    .long 0x{CALL_BASE + 3:08x}', '    ret',
          'wd3d_after:                   /* the host queued callbacks: run them, keeping the result */',
          '    pushl %eax', '    pushl %edx', '    call _wd3d_run_callbacks', '    popl %edx', '    popl %eax', '    ret']
     defs = ['LIBRARY wined3d.dll', 'EXPORTS']
@@ -238,15 +241,18 @@ def main():
             for pre in R.GUEST_PRE.get(n, []):
                 if pre[0] == 'refresh':
                     s += ['    call _wd3d_refresh_windows']
+                elif pre[0] == 'dc':  # the argument's address: rewritten in place
+                    s += [f'    leal {4 * pre[1]}(%esp), %eax', '    pushl %eax', '    call _wd3d_dc_arg', '    addl $4, %esp']
                 else:
                     fn = '_wd3d_window_arg' if pre[0] == 'window' else '_wd3d_window_desc'
                     s += [f'    movl {4 * pre[1]}(%esp), %eax', '    pushl %eax', f'    call {fn}', '    addl $4, %esp']
             s += ['    int $0x99', f'    .long 0x{CALL_BASE + ids[n]:08x}', '    cmpl $0, _wd3d_pending']
             if n in R.GUEST_POST:
                 fn, arg = R.GUEST_POST[n]
-                # wd3d_after keeps eax/edx and returns; then fn(arg, result) with the result saved under its args
-                s += ['    je 2f', '    call wd3d_after', '2:  pushl %eax', '    pushl %eax',
-                      f'    pushl {4 * arg + 8}(%esp)', f'    call {fn}', '    addl $8, %esp', '    popl %eax', '    ret']
+                # wd3d_after keeps eax/edx and returns; then eax = fn(arg, result); arg 0 = the first argument's address
+                load = f'    leal 8(%esp), %ecx' if arg == 0 else f'    movl {4 * arg + 4}(%esp), %ecx'
+                s += ['    je 2f', '    call wd3d_after', '2:  pushl %eax', load, '    pushl %ecx',
+                      f'    call {fn}', '    addl $8, %esp', '    ret']
             else:
                 s += ['    jne wd3d_after', '    ret']
         defs.append(f'    {n}')

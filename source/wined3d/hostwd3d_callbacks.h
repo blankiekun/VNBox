@@ -38,6 +38,9 @@ enum hostwd3d_callback_kind
     /* already answered on the host (no parent, null ops); target = guest device_parent, value = host texture,
      * arg = sub-resource index. Nothing to call for d3d11/dxgi. */
     HOSTWD3D_CB_SUB_RESOURCE_CREATED,
+    /* guest: the DC it made for host DC value (wined3d_texture_get_dc) is gone on the host (release_dc, texture
+     * destroyed): destroy the guest's own DC. */
+    HOSTWD3D_CB_DC_DESTROYED,
 };
 
 struct hostwd3d_callback
@@ -70,6 +73,9 @@ void hostwd3d_swapchain_state_parent_free(void *host_state_parent);
  * the wrappers of an owner that is gone (final device/swapchain decref, swapchain_state_destroy). */
 void hostwd3d_owned_parent_set(void *host_wrapper, uint32_t owner);
 void hostwd3d_owned_parent_release(uint32_t owner);
+
+/* Queues HOSTWD3D_CB_DC_DESTROYED (d3dkmt.c, for DCs a guest asked about with id 3). */
+void hostwd3d_dc_destroyed(uint32_t host_dc);
 
 /* Moves up to max queued callbacks, oldest first, into out; returns how many. */
 uint32_t hostwd3d_callbacks_drain(struct hostwd3d_callback *out, uint32_t max);

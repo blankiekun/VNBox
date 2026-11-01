@@ -3,10 +3,11 @@
 #define WD3D_THUNK_IDS_H
 #define WD3D_CALL_BASE 0x00f00000u
 #define WD3D_CALL_LIMIT 0x00f10000u
-#define WD3D_PROTOCOL_HASH 0xa58b5be0u
+#define WD3D_PROTOCOL_HASH 0xb17d0d55u
 #define WD3D_ID_HELLO 0
 #define WD3D_ID_REGISTER_WINDOW 1
 #define WD3D_ID_DRAIN_CALLBACKS 2
+#define WD3D_ID_DC_INFO 3
 #define WD3D_ID_COUNT 344
 #define WD3D_ID_wined3d_adapter_get_identifier 16
 #define WD3D_ID_wined3d_adapter_get_output 17
