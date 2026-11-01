@@ -68,7 +68,7 @@
       "name": "fps",
       "label": "Frame rate cap",
       "description": "Most frames shown per second; lower saves CPU and battery, 0 shows every frame.",
-      "type": "int", "default": 60, "min": 0, "max": 240,
+      "type": "choice", "default": 60, "choices": [{"value": 30, "label": "30"}, {"value": 60, "label": "60"}, {"value": 90, "label": "90"}, {"value": 120, "label": "120"}, {"value": 0, "label": "Unlocked"}],
       "group": "Display", "restart": true, "experimental": false
     },
     {
