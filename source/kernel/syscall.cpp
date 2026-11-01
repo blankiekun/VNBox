@@ -779,6 +779,48 @@ static U32 syscall_setrlimit(CPU* cpu, U32 eipCount) {
     return result;
 }
 
+// Clock poll back-off (clockBackoff= URL param, default on): a thread that reads the clock over and over
+// with almost no work between reads busy-waits for a deadline (a game's frame limiter polling
+// QueryPerformanceCounter). After CLOCK_POLL_SPINS such reads in a row it sleeps 1 ms on a timer, so
+// the browser and the other guest threads get that time. The read still happens after the sleep: the
+// time it returns is the real time.
+U32 vnboxClockBackoff = 1;
+static constexpr U32 CLOCK_POLL_SPINS = 16;      // reads in a row before a back-off sleep
+static constexpr U64 CLOCK_POLL_WORK = 2000;     // at most this many instructions between reads of a spin
+
+static U32 clockPollBackoff(CPU* cpu) {
+#if defined(__EMSCRIPTEN__) && !defined(BOXEDWINE_MULTI_THREADED)
+    KThread* thread = cpu->thread;
+    if (thread->clockPollSleeping) { // the syscall again, after (or during) the back-off sleep
+        U32 result = thread->sleep(1);
+        if (result == (U32)-K_WAIT) {
+            return result;
+        }
+        thread->clockPollSleeping = false;
+        thread->clockPollInstr = cpu->instructionCount + cpu->blockInstructionCount;
+        return 0;
+    }
+    if (!vnboxClockBackoff) {
+        return 0;
+    }
+    U64 now = cpu->instructionCount + cpu->blockInstructionCount; // the count is added up at the end of each thread turn
+    thread->clockPolls = now - thread->clockPollInstr < CLOCK_POLL_WORK ? thread->clockPolls + 1 : 0;
+    thread->clockPollInstr = now;
+    if (thread->clockPolls < CLOCK_POLL_SPINS) {
+        return 0;
+    }
+    thread->clockPolls = 0;
+    if (vnboxStats.on) vnboxStats.clockBackoffs++;
+    thread->clockPollSleeping = true;
+    U32 result = thread->sleep(1);
+    if (result == (U32)-K_WAIT) {
+        return result;
+    }
+    thread->clockPollSleeping = false;
+#endif
+    return 0;
+}
+
 static U32 syscall_getrusuage(CPU* cpu, U32 eipCount) {	
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "getrusage: who=%d usuage=%X", ARG1, ARG2);
     U32 result = cpu->thread->process->getrusuage(cpu->thread, ARG1, ARG2);
@@ -788,6 +830,7 @@ static U32 syscall_getrusuage(CPU* cpu, U32 eipCount) {
 
 static U32 syscall_gettimeofday(CPU* cpu, U32 eipCount) {	
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "gettimeofday: tv=%X tz=%X", ARG1, ARG2);
+    if (U32 wait = clockPollBackoff(cpu)) return wait;
     U32 result = KSystem::gettimeofday(cpu->thread, ARG1, ARG2);
     SYS_LOG(SYSCALL_SYSTEM, cpu, " result=%d(0x%X)\n", result, result);
     return result;
@@ -1821,6 +1864,7 @@ static U32 syscall_set_tid_address(CPU* cpu, U32 eipCount) {
 
 static U32 syscall_clock_gettime(CPU* cpu, U32 eipCount) {
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "clock_gettime: clock_id=%d tp=%X", ARG1, ARG2);
+    if (U32 wait = clockPollBackoff(cpu)) return wait;
     U32 result = KSystem::clock_gettime(cpu->thread, ARG1, ARG2);
     SYS_LOG(SYSCALL_SYSTEM, cpu, " result=%d(0x%X)\n", result, result);
     return result;
@@ -1828,6 +1872,7 @@ static U32 syscall_clock_gettime(CPU* cpu, U32 eipCount) {
 
 static U32 syscall_clock_gettime64(CPU* cpu, U32 eipCount) {
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "clock_gettime64: clock_id=%d tp=%X", ARG1, ARG2);
+    if (U32 wait = clockPollBackoff(cpu)) return wait;
     U32 result = KSystem::clock_gettime64(cpu->thread, ARG1, ARG2);
     SYS_LOG(SYSCALL_SYSTEM, cpu, " result=%d(0x%X)\n", result, result);
     return result;

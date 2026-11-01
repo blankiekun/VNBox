@@ -21,6 +21,10 @@ struct VnboxStats {
     double sysMs = 0, wineserverMs = 0, zipMs = 0;
     unsigned long long instr = 0, sysPadInstr = 0, jitInstr = 0;
     unsigned jitEntries = 0, blocksCompiled = 0, wineserverRequests = 0, signals = 0, faults = 0, zipMisses = 0;
+    unsigned clockBackoffs = 0; // clock poll back-off sleeps (syscall.cpp)
+    // idle/cpu cap (mainloop.cpp): ms the guest was held back, ticks that ended at the cap; wakes by reason
+    double capHeldMs = 0; unsigned capTicks = 0, capWakeInput = 0, capWakeFrame = 0, capWakeFile = 0, capWakeAudio = 0, capWakeGl = 0;
+    unsigned smallFrames = 0; // shown frames whose change counted as idle
     unsigned audioUnderruns = 0; double audioQueuedMinMs = -1; // SDL audio path: callbacks that ran dry, least queued at a callback
     unsigned sysCount[440] = {};
     double sysMsBy[440] = {};

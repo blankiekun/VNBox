@@ -101,6 +101,7 @@ static int mainLoopTimingValue = -1;
 #ifdef BOXEDWINE_JSPI
 static int jspiTickDelay = -1; // what boxedwine_tick returns: ms to wait before the next tick, -1 = next message
 #endif
+extern U32 vnboxClockBackoff; // syscall.cpp
 static U32 idleWaitMs = 16; // the idleWait= URL param: longest idle wait while no guest timer is due sooner
 
 static void updateMainLoopTiming(bool idle) {
@@ -281,6 +282,7 @@ bool doMainLoop() {
     // (the non-worklet audio path).
 #ifndef BOXEDWINE_MULTI_THREADED
     idleWaitMs = vnboxUrlInt("idleWait", idleWaitMs, 1, 1000);
+    vnboxClockBackoff = vnboxUrlInt("clockBackoff", 1, 0, 1); // syscall.cpp
 #endif
     XServer::drawFps = vnboxUrlInt("fps", XServer::drawFps, 0, 240); // frames shown per second at most, 0 = unlocked
     U32 period = vnboxUrlInt("audioPeriod", KDspAudioMath::sdlPeriodFrames, 256, 16384);

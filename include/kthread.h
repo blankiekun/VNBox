@@ -212,6 +212,11 @@ public:
 #endif
 
     U32 condStartWaitTime = 0;
+    // clock poll back-off (syscall.cpp clockPollBackoff): instruction count at the last clock read,
+    // reads in a row with little work between them, and whether the thread sleeps off a spin
+    U64 clockPollInstr = 0;
+    U32 clockPolls = 0;
+    bool clockPollSleeping = false;
 private:
     bool isOnAlternateSignalStack(U32 stackAddress) const;
     void internalCleanup();
