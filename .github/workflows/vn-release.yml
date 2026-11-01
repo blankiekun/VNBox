@@ -43,7 +43,7 @@ jobs:
 
       - name: Package
         run: |
-          name="vnbox-web-${GITHUB_REF_NAME}"
+          name="vnbox-web-${GITHUB_REF_NAME//\//-}"  # branch runs (workflow_dispatch): perf/x -> perf-x
           files="boxedwine.html boxedwine.js boxedwine.wasm boxedwine.css boxedwine-shell.js fsfs.js lazyfs.js lazyfs-worker.js frida-compat.js vnbox-movie.js vnbox-movie-decoder.js"
           mkdir "dist/$name"
           (cd project/emscripten/Build/JitJspi && cp $files "$GITHUB_WORKSPACE/dist/$name/")
