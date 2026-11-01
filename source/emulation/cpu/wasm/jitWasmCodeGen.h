@@ -1136,7 +1136,8 @@ protected:
     // Return after cpu->nextOp is set; with m_chainBlocks, first tail-call the next block when the dispatcher would.
     void emitChainReturn();
     void emitChainToNextOp();
-    void emitBlockExitWithProfile(U32 profileHelperIdx);
+    void emitBlockExitWithProfile(U32 profileHelperIdx, bool chain = true);
+    void coldBlockExit();
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     void emitProfileSampledCall(U32 helperIdx, U32 detail = InstructionCount);
 #endif

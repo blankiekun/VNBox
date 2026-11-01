@@ -7168,8 +7168,11 @@ void JitWasmCodeGen::syncDirtyRegsToHost() {
 // Inline memory-access code size, by part (logged with the batching stats
 // and by testJit). Codegen-time counters only; nothing runs in guest code.
 static std::atomic<U64> g_wasmJitMemAccesses{0}, g_wasmJitMemLookupBytes{0}, g_wasmJitMemSlowBytes{0}, g_wasmJitMemFastBytes{0};
+static std::atomic<U64> g_wasmJitMemKindCount[4], g_wasmJitMemKindSlow[4]; // read, write, rmw, custom
+static std::atomic<U64> g_wasmJitSyncCalls{0}, g_wasmJitSyncFpuBytes{0}, g_wasmJitSyncSpillBytes{0};
 static std::atomic<U64> g_wasmJitBodyBytes{0}, g_wasmJitBodies{0};
 #define TEST_MEM_MARK(v) size_t v = m_emitter.bodySize()
+#define TEST_MEM_ACCOUNT_KIND(k, a, b, c) do { g_wasmJitMemKindCount[k]++; g_wasmJitMemKindSlow[k] += (c) - (b); TEST_MEM_ACCOUNT(a, b, c); } while (0)
 #define TEST_MEM_ACCOUNT(a, b, c) do { size_t e_ = m_emitter.bodySize(); g_wasmJitMemAccesses++; \
     g_wasmJitMemLookupBytes += (b) - (a); g_wasmJitMemSlowBytes += (c) - (b); g_wasmJitMemFastBytes += e_ - (c); } while (0)
 static void wasmJitPrintMemCodeStats() {
@@ -7178,6 +7181,14 @@ static void wasmJitPrintMemCodeStats() {
     printf("[WASM JIT memcode] bodies=%llu bodyAvg=%llu memAccesses=%llu perBody=%.2f lookupAvg=%.1f slowAvg=%.1f fastAvg=%.1f\n",
         (unsigned long long)bodies, (unsigned long long)(g_wasmJitBodyBytes / bodies), (unsigned long long)ma,
         (double)ma / bodies, (double)g_wasmJitMemLookupBytes / ma, (double)g_wasmJitMemSlowBytes / ma, (double)g_wasmJitMemFastBytes / ma);
+    U64 sc = g_wasmJitSyncCalls;
+    if (sc) printf("[WASM JIT memcode] faultSyncs=%llu fpuAvg=%.1f spillAvg=%.1f\n", (unsigned long long)sc,
+        (double)g_wasmJitSyncFpuBytes / sc, (double)g_wasmJitSyncSpillBytes / sc);
+    static const char* kinds[4] = {"read", "write", "rmw", "custom"};
+    for (int k = 0; k < 4; ++k) {
+        U64 n = g_wasmJitMemKindCount[k];
+        if (n) printf("[WASM JIT memcode] %s=%llu slowAvg=%.1f\n", kinds[k], (unsigned long long)n, (double)g_wasmJitMemKindSlow[k] / n);
+    }
 }
 
 // Page lookup shared by the inline memory fast paths. Leaves the miss
@@ -7228,9 +7239,13 @@ void JitWasmCodeGen::pushPageTable(bool store) {
 }
 
 void JitWasmCodeGen::syncStateBeforeFaultingMemoryHelper() {
+    size_t a = m_emitter.bodySize();
     materializeFpuCache();
+    size_t b = m_emitter.bodySize();
     writeEip(this->currentEip - cpu->seg[CS].address);
+    size_t c = m_emitter.bodySize();
     syncDirtyRegsToHost();
+    g_wasmJitSyncCalls++; g_wasmJitSyncFpuBytes += b - a; g_wasmJitSyncSpillBytes += m_emitter.bodySize() - c;
 }
 
 void JitWasmCodeGen::pushRegValue(RegPtr reg) {
@@ -11051,7 +11066,7 @@ void JitWasmCodeGen::emitBailoutCheck() {
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Const(WASM_JIT_BAILOUT_NONE);
     m_emitter.emitI32Store((U32)offsetof(CPU, wasmJitBailout));
-    blockExit();
+    coldBlockExit();
     m_emitter.emitEnd();
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
@@ -11080,7 +11095,7 @@ void JitWasmCodeGen::emitBranchBailoutCheck() {
     m_emitter.emitI32Const(0);
     m_emitter.emitI32Store((U32)offsetof(CPU, wasmJitBailout));
     writeEip(this->currentEip - cpu->seg[CS].address);
-    blockExit();
+    coldBlockExit();
     m_emitter.emitEnd();
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
@@ -11148,7 +11163,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
         m_emitter.emitLocalSet(result->hardwareReg());
     }
     m_emitter.emitEnd();
-    TEST_MEM_ACCOUNT(tmA, tmB, tmC);
+    TEST_MEM_ACCOUNT_KIND(2, tmA, tmB, tmC);
 
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
@@ -11267,7 +11282,7 @@ void JitWasmCodeGen::accessMemoryCustom(U32 widthBytes, RegPtr addressReg, bool 
         customOp(createMemPtr(makeWasmReg((U8)hostLocal, 0xff), 0, false));
     }
     m_emitter.emitEnd();
-    TEST_MEM_ACCOUNT(tmA, tmB, tmC);
+    TEST_MEM_ACCOUNT_KIND(3, tmA, tmB, tmC);
 
     // Keep the inline arm's XMM state: the cold arm reloaded all locals.
     m_gpDirty   = savedGpDirty;
@@ -11430,7 +11445,7 @@ RegPtr JitWasmCodeGen::readMemoryValue(JitWidth w, RegPtr addressReg, RegPtr tmp
         m_emitter.emitLocalSet(tmp->hardwareReg());
     }
     m_emitter.emitEnd();
-    TEST_MEM_ACCOUNT(tmA, tmB, tmC);
+    TEST_MEM_ACCOUNT_KIND(0, tmA, tmB, tmC);
 
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
@@ -11515,7 +11530,7 @@ void JitWasmCodeGen::write(JitWidth w, RegPtr addressReg, RegPtr src,
         }
     }
     m_emitter.emitEnd();
-    TEST_MEM_ACCOUNT(tmA, tmB, tmC);
+    TEST_MEM_ACCOUNT_KIND(1, tmA, tmB, tmC);
 
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
@@ -13566,7 +13581,7 @@ void JitWasmCodeGen::emitChainToNextOp() {
 #endif
 }
 
-void JitWasmCodeGen::emitBlockExitWithProfile(U32 profileHelperIdx) {
+void JitWasmCodeGen::emitBlockExitWithProfile(U32 profileHelperIdx, bool chain) {
     WASM_JIT_HOP_KIND(3)
     materializeFpuCache();
     syncDirtyRegsToHost();
@@ -13577,8 +13592,20 @@ void JitWasmCodeGen::emitBlockExitWithProfile(U32 profileHelperIdx) {
 #endif
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitCall(m_helperGetNextOpIdx);
-    emitChainToNextOp();
+    if (chain) emitChainToNextOp();
     m_emitter.emitReturn();
+}
+
+// Exit for rare helper bailouts (SMC, interpreter control flow): return to
+// the dispatcher without the inline chain sequence, which is ~100 bytes and
+// would otherwise be copied into every slow-path store.
+void JitWasmCodeGen::coldBlockExit() {
+#ifdef BOXEDWINE_WASM_JIT_PROFILE
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Const((U32)(m_currentWasmOp ? m_currentWasmOp->inst : InstructionCount));
+    m_emitter.emitI32Store((U32)offsetof(CPU, tmpReg));
+#endif
+    emitBlockExitWithProfile(HELPER_PROFILE_EXIT_GENERIC, false);
 }
 void JitWasmCodeGen::blockExit() {
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
