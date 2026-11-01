@@ -783,7 +783,8 @@ static U32 syscall_setrlimit(CPU* cpu, U32 eipCount) {
 // with almost no work between reads busy-waits for a deadline (a game's frame limiter polling
 // QueryPerformanceCounter). After CLOCK_POLL_SPINS such reads in a row it sleeps 1 ms on a timer, so
 // the browser and the other guest threads get that time. The read still happens after the sleep: the
-// time it returns is the real time.
+// time it returns is the real time. sched_yield (Sleep(0), SwitchToThread) and getrusage (GetThreadTimes)
+// count as polls too: some limiters spin on those instead of the clock.
 U32 vnboxClockBackoff = 1;
 static constexpr U32 CLOCK_POLL_SPINS = 16;      // reads in a row before a back-off sleep
 static constexpr U64 CLOCK_POLL_WORK = 2000;     // at most this many instructions between reads of a spin
@@ -823,6 +824,7 @@ static U32 clockPollBackoff(CPU* cpu) {
 
 static U32 syscall_getrusuage(CPU* cpu, U32 eipCount) {	
     SYS_LOG1(SYSCALL_SYSTEM, cpu, "getrusage: who=%d usuage=%X", ARG1, ARG2);
+    if (U32 wait = clockPollBackoff(cpu)) return wait;
     U32 result = cpu->thread->process->getrusuage(cpu->thread, ARG1, ARG2);
     SYS_LOG(SYSCALL_SYSTEM, cpu, " result=%d(0x%X)\n", result, result);
     return result;
@@ -1242,6 +1244,7 @@ static U32 syscall_sched_getscheduler(CPU* cpu, U32 eipCount) {
 }
 
 static U32 syscall_sched_yield(CPU* cpu, U32 eipCount) {
+    if (U32 wait = clockPollBackoff(cpu)) return wait;
 #ifndef BOXEDWINE_MULTI_THREADED
     cpu->yield = true;
 #endif

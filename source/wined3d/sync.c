@@ -59,6 +59,7 @@ BOOL WINAPI InitializeCriticalSectionEx(CRITICAL_SECTION *cs, DWORD spin, DWORD 
 {
     memset(cs, 0, sizeof(*cs));
     cs->LockCount = -1;
+    cs->DebugInfo = (RTL_CRITICAL_SECTION_DEBUG *)-1; /* none (wined3d_lock_init writes a name through a real one) */
     return TRUE;
 }
 
