@@ -7098,7 +7098,7 @@ JitWasmCodeGen::JitWasmCodeGen(CPU* cpu) : JitSSE(cpu) {
         { 8, WasmType::F64 },  // persistent x87 values (locals 76-83)
         { 19, WasmType::I32 }, // x87 metadata (84-100), flag result (101), loop carry (102)
         { 8, WasmType::V128 }, // cached MMX registers (103-110)
-        { 2, WasmType::I32 },  // read/write page-table bases (111-112)
+        { 3, WasmType::I32 },  // read/write page-table bases (111-112), bailout EIP (113)
     });
 
     m_gpLoaded.fill(false);
@@ -11191,7 +11191,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
             m_emitter.emitLocalGet(WASM_CPU_LOCAL);
             emitArmSmcBailout();
             m_emitter.emitCall(writeCheckHelperForWidth(w), true);
-            emitBailoutCheck();
+            emitStoreBailoutCheck();
         }
         m_emitter.emitElse();
         {
@@ -11525,7 +11525,7 @@ void JitWasmCodeGen::write(JitWidth w, RegPtr addressReg, RegPtr src,
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         emitArmSmcBailout();
         m_emitter.emitCall(writeCheckHelperForWidth(w), true);
-        emitBailoutCheck();
+        emitStoreBailoutCheck();
     }
     TEST_MEM_MARK(tmC);
     m_emitter.emitElse();
@@ -13609,6 +13609,24 @@ void JitWasmCodeGen::emitBlockExitWithProfile(U32 profileHelperIdx, bool chain) 
     m_emitter.emitReturn();
 }
 
+// The store slow paths publish all state (syncStateBeforeFaultingMemoryHelper)
+// before calling the helper and change no locals after it, so their bailout
+// exit is the same for every store except the resume EIP. The function body
+// is wrapped in an outer block (inserted at commit); `br` to it lands on the
+// shared tail emitted by commitJIT.
+void JitWasmCodeGen::emitStoreBailoutCheck() {
+    m_usesBailoutTail = true;
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load((U32)offsetof(CPU, wasmJitBailout));
+    m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
+    m_emitter.emitIf();
+    m_emitter.emitI32Const((S32)(this->currentEip + this->lastCompiledOpLen - cpu->seg[CS].address));
+    m_emitter.emitLocalSet(WASM_BAIL_EIP_LOCAL);
+    // Relative depth of the outermost frame: the outer block once inserted.
+    m_emitter.emitBr(m_emitter.currentCtrlDepth());
+    m_emitter.emitEnd();
+}
+
 // Exit for rare helper bailouts (SMC, interpreter control flow): return to
 // the dispatcher without the inline chain sequence, which is ~100 bytes and
 // would otherwise be copied into every slow-path store.
@@ -15209,7 +15227,32 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
     for (auto target = m_forwardTargets.rbegin(); target != m_forwardTargets.rend(); ++target) {
         if (target->token) m_emitter.emitEnd();
     }
-    if (m_usesReadTable || m_usesWriteTable) {
+    if (m_usesBailoutTail) {
+        // End of the outer block opened in the prologue; normal paths never
+        // fall into the shared bailout tail that follows it.
+        m_emitter.emitByte(WASM_RETURN);
+        m_emitter.emitByte(WASM_END);
+        // Same effects as emitBailoutCheck's exit; state is already published.
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitI32Const(0);
+        m_emitter.emitI32Store((U32)offsetof(CPU, wasmJitActiveBlock));
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitI32Load((U32)offsetof(CPU, wasmJitBailout));
+        m_emitter.emitI32Const(WASM_JIT_BAILOUT_SMC);
+        m_emitter.emitOp(WASM_I32_EQ);
+        m_emitter.emitIf();
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitLocalGet(WASM_BAIL_EIP_LOCAL);
+        m_emitter.emitI32Store((U32)offsetof(CPU, eip.u32));
+        m_emitter.emitEnd();
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitI32Const(WASM_JIT_BAILOUT_NONE);
+        m_emitter.emitI32Store((U32)offsetof(CPU, wasmJitBailout));
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitCall(m_helperGetNextOpIdx);
+        m_emitter.emitReturn();
+    }
+    if (m_usesReadTable || m_usesWriteTable || m_usesBailoutTail) {
         size_t mark = m_emitter.bodySize();
         if (m_usesReadTable) {
             m_emitter.emitLocalGet(WASM_CPU_LOCAL);
@@ -15220,6 +15263,10 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
             m_emitter.emitLocalGet(WASM_CPU_LOCAL);
             m_emitter.emitI32Load((U32)offsetof(CPU, wasmWritePageBaseArray));
             m_emitter.emitLocalSet(WASM_WRITE_TABLE_LOCAL);
+        }
+        if (m_usesBailoutTail) {
+            m_emitter.emitByte(WASM_BLOCK);
+            m_emitter.emitByte((U8)WasmType::Void);
         }
         m_emitter.moveTailToBodyStart(mark);
     }

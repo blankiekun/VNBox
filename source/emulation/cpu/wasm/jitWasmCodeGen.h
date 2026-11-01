@@ -245,7 +245,9 @@ static constexpr U32 WASM_MMX_LOCAL_BASE = WASM_LOOP_CARRY_LOCAL + 1;
 // helper call inside the block can never make these copies stale.
 static constexpr U32 WASM_READ_TABLE_LOCAL = WASM_MMX_LOCAL_BASE + 8;
 static constexpr U32 WASM_WRITE_TABLE_LOCAL = WASM_READ_TABLE_LOCAL + 1;
-static constexpr U32 WASM_LOCAL_COUNT = WASM_WRITE_TABLE_LOCAL + 1;
+// Next-op EIP handed to the shared bailout tail (see emitStoreBailoutCheck).
+static constexpr U32 WASM_BAIL_EIP_LOCAL = WASM_WRITE_TABLE_LOCAL + 1;
+static constexpr U32 WASM_LOCAL_COUNT = WASM_BAIL_EIP_LOCAL + 1;
 
 // ---------------------------------------------------------------------------
 // Mapping from emulated register index to WASM local index.
@@ -1138,6 +1140,10 @@ protected:
     void emitChainToNextOp();
     void emitBlockExitWithProfile(U32 profileHelperIdx, bool chain = true);
     void coldBlockExit();
+    // Bailout check after a slow-path store helper: branches to one shared
+    // exit at the end of the function instead of an inline exit per store.
+    void emitStoreBailoutCheck();
+    bool m_usesBailoutTail = false;
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     void emitProfileSampledCall(U32 helperIdx, U32 detail = InstructionCount);
 #endif
