@@ -4851,10 +4851,12 @@ static const void* g_wasmHelperTable[] = {
 };
 static constexpr int WASM_HELPER_COUNT = (int)(sizeof(g_wasmHelperTable) / sizeof(g_wasmHelperTable[0]));
 
+static void wasmJitPrintMemCodeStats();
 #ifndef BOXEDWINE_MULTI_THREADED
 static void wasmJitLogRuntimeStats() {
     const WasmJitRuntimeStats& stats = g_wasmJitRuntimeStats;
     U64 functionsPerGroupX10 = stats.groupedModules ? stats.groupedFunctions * 10 / stats.groupedModules : 0;
+    wasmJitPrintMemCodeStats();
     boxedwine_wasm_log_runtime_stats(stats.translatedFileBacked + stats.translatedAnonymous, stats.standaloneModules + stats.groupedModules, stats.translatedFileBacked, stats.translatedAnonymous, stats.standaloneModules, stats.groupedModules, stats.groupedFunctions, stats.rawInputBytes, stats.mergedBytes, stats.countFlushes, stats.byteFlushes, stats.urgentFlushes, stats.processCapFlushes, stats.cancelledEntries, stats.permanentFailures, stats.tinyDeferred, stats.tinyPromoted, stats.oomPauses, stats.blockedAttempts, stats.oomRetries, stats.oomResumptions, functionsPerGroupX10 / 10, functionsPerGroupX10 % 10);
 }
 
@@ -7087,6 +7089,7 @@ JitWasmCodeGen::JitWasmCodeGen(CPU* cpu) : JitSSE(cpu) {
         { 8, WasmType::F64 },  // persistent x87 values (locals 76-83)
         { 19, WasmType::I32 }, // x87 metadata (84-100), flag result (101), loop carry (102)
         { 8, WasmType::V128 }, // cached MMX registers (103-110)
+        { 2, WasmType::I32 },  // read/write page-table bases (111-112)
     });
 
     m_gpLoaded.fill(false);
@@ -7151,6 +7154,68 @@ void JitWasmCodeGen::syncDirtyRegsToHost() {
             }
         }
     }
+}
+
+// Inline memory-access code size, by part (logged with the batching stats
+// and by testJit). Codegen-time counters only; nothing runs in guest code.
+static std::atomic<U64> g_wasmJitMemAccesses{0}, g_wasmJitMemLookupBytes{0}, g_wasmJitMemSlowBytes{0}, g_wasmJitMemFastBytes{0};
+static std::atomic<U64> g_wasmJitBodyBytes{0}, g_wasmJitBodies{0};
+#define TEST_MEM_MARK(v) size_t v = m_emitter.bodySize()
+#define TEST_MEM_ACCOUNT(a, b, c) do { size_t e_ = m_emitter.bodySize(); g_wasmJitMemAccesses++; \
+    g_wasmJitMemLookupBytes += (b) - (a); g_wasmJitMemSlowBytes += (c) - (b); g_wasmJitMemFastBytes += e_ - (c); } while (0)
+static void wasmJitPrintMemCodeStats() {
+    U64 ma = g_wasmJitMemAccesses, bodies = g_wasmJitBodies;
+    if (!ma || !bodies) return;
+    printf("[WASM JIT memcode] bodies=%llu bodyAvg=%llu memAccesses=%llu perBody=%.2f lookupAvg=%.1f slowAvg=%.1f fastAvg=%.1f\n",
+        (unsigned long long)bodies, (unsigned long long)(g_wasmJitBodyBytes / bodies), (unsigned long long)ma,
+        (double)ma / bodies, (double)g_wasmJitMemLookupBytes / ma, (double)g_wasmJitMemSlowBytes / ma, (double)g_wasmJitMemFastBytes / ma);
+}
+
+// Page lookup shared by the inline memory fast paths. Leaves the miss
+// condition (no direct page, or the access crosses the page end) on the stack
+// and the page's host base in entryLocal. For multi-byte accesses the in-page
+// offset is computed once and returned in a scratch local (0 for one byte):
+// pass it to pushHostAddress, and free it with freeScratch.
+U32 JitWasmCodeGen::emitPageLookup(RegPtr addressReg, U32 widthBytes, bool store, U32 entryLocal) {
+    pushPageTable(store);
+    pushRegValue(addressReg);
+    m_emitter.emitI32Const(K_PAGE_SHIFT);
+    m_emitter.emitOp(WASM_I32_SHR_U);
+    m_emitter.emitI32Const(2);                  // sizeof(U32)
+    m_emitter.emitOp(WASM_I32_SHL);
+    m_emitter.emitOp(WASM_I32_ADD);
+    m_emitter.emitI32Load(0);                   // entry = pageBase[page]
+    m_emitter.emitLocalTee(entryLocal);
+    m_emitter.emitOp(WASM_I32_EQZ);
+    if (widthBytes == 1) return 0;
+    U32 offLocal = allocScratch();
+    pushRegValue(addressReg);
+    m_emitter.emitI32Const(K_PAGE_MASK);
+    m_emitter.emitOp(WASM_I32_AND);
+    m_emitter.emitLocalTee(offLocal);
+    m_emitter.emitI32Const((S32)(K_PAGE_SIZE - widthBytes));
+    m_emitter.emitOp(WASM_I32_GT_U);
+    m_emitter.emitOp(WASM_I32_OR);
+    return offLocal;
+}
+
+// Push entry + (address & K_PAGE_MASK), the host address of a fast access.
+void JitWasmCodeGen::pushHostAddress(U32 entryLocal, RegPtr addressReg, U32 offLocal) {
+    m_emitter.emitLocalGet(entryLocal);
+    if (offLocal) {
+        m_emitter.emitLocalGet(offLocal);
+    } else {
+        pushRegValue(addressReg);
+        m_emitter.emitI32Const(K_PAGE_MASK);
+        m_emitter.emitOp(WASM_I32_AND);
+    }
+    m_emitter.emitOp(WASM_I32_ADD);
+}
+
+void JitWasmCodeGen::pushPageTable(bool store) {
+    if (store) m_usesWriteTable = true;
+    else m_usesReadTable = true;
+    m_emitter.emitLocalGet(store ? WASM_WRITE_TABLE_LOCAL : WASM_READ_TABLE_LOCAL);
 }
 
 void JitWasmCodeGen::syncStateBeforeFaultingMemoryHelper() {
@@ -11045,28 +11110,10 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
     // A writable-page entry is also readable and points directly at the
     // page's bytes. Mark cross-page accesses as slow by clearing the entry
     // in that arm; the same test can then select the write path below.
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Load((U32)offsetof(CPU, wasmWritePageBaseArray));
-    pushRegValue(addressReg);
-    m_emitter.emitI32Const(K_PAGE_SHIFT);
-    m_emitter.emitOp(WASM_I32_SHR_U);
-    m_emitter.emitI32Const(2);
-    m_emitter.emitOp(WASM_I32_SHL);
-    m_emitter.emitOp(WASM_I32_ADD);
-    m_emitter.emitI32Load(0);
-    m_emitter.emitLocalTee(entryLocal);
-    m_emitter.emitOp(WASM_I32_EQZ);
+    TEST_MEM_MARK(tmA);
+    U32 offLocal = emitPageLookup(addressReg, wasmJitWidthBytes(w), true, entryLocal);
 
-    if (w != JitWidth::b8) {
-        U32 widthBytes = wasmJitWidthBytes(w);
-        pushRegValue(addressReg);
-        m_emitter.emitI32Const(K_PAGE_MASK);
-        m_emitter.emitOp(WASM_I32_AND);
-        m_emitter.emitI32Const((S32)(K_PAGE_SIZE - widthBytes));
-        m_emitter.emitOp(WASM_I32_GT_U);
-        m_emitter.emitOp(WASM_I32_OR);
-    }
-
+    TEST_MEM_MARK(tmB);
     m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
     m_emitter.emitIf();
     {
@@ -11080,13 +11127,10 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
         m_emitter.emitI32Load((U32)offsetof(CPU, memHelperValue));
         m_emitter.emitLocalSet(result->hardwareReg());
     }
+    TEST_MEM_MARK(tmC);
     m_emitter.emitElse();
     {
-        m_emitter.emitLocalGet(entryLocal);
-        pushRegValue(addressReg);
-        m_emitter.emitI32Const(K_PAGE_MASK);
-        m_emitter.emitOp(WASM_I32_AND);
-        m_emitter.emitOp(WASM_I32_ADD);
+        pushHostAddress(entryLocal, addressReg, offLocal);
         switch (w) {
         case JitWidth::b8:  m_emitter.emitI32Load8U(0);  break;
         case JitWidth::b16: m_emitter.emitI32Load16U(0); break;
@@ -11095,6 +11139,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
         m_emitter.emitLocalSet(result->hardwareReg());
     }
     m_emitter.emitEnd();
+    TEST_MEM_ACCOUNT(tmA, tmB, tmC);
 
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
@@ -11126,11 +11171,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
         }
         m_emitter.emitElse();
         {
-            m_emitter.emitLocalGet(entryLocal);
-            pushRegValue(addressReg);
-            m_emitter.emitI32Const(K_PAGE_MASK);
-            m_emitter.emitOp(WASM_I32_AND);
-            m_emitter.emitOp(WASM_I32_ADD);
+            pushHostAddress(entryLocal, addressReg, offLocal);
             pushRegValue(result);
             switch (w) {
             case JitWidth::b8:  m_emitter.emitI32Store8(0);  break;
@@ -11146,6 +11187,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
         m_gpLoaded  = savedGpLoaded;
         m_segLoaded = savedSegLoaded;
     }
+    if (offLocal) freeScratch(offLocal);
     freeScratch(entryLocal);
     if (canReleaseScratchReg(addressReg))
         freeScratch(addressReg->hardwareReg());
@@ -11178,27 +11220,10 @@ void JitWasmCodeGen::accessMemoryCustom(U32 widthBytes, RegPtr addressReg, bool 
     auto savedGpLoaded  = m_gpLoaded;
     auto savedSegLoaded = m_segLoaded;
 
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Load((U32)(store ? offsetof(CPU, wasmWritePageBaseArray) : offsetof(CPU, wasmReadPageBaseArray)));
-    pushRegValue(addressReg);
-    m_emitter.emitI32Const(K_PAGE_SHIFT);
-    m_emitter.emitOp(WASM_I32_SHR_U);
-    m_emitter.emitI32Const(2);
-    m_emitter.emitOp(WASM_I32_SHL);
-    m_emitter.emitOp(WASM_I32_ADD);
-    m_emitter.emitI32Load(0);
-    m_emitter.emitLocalTee(entryLocal);
-    m_emitter.emitOp(WASM_I32_EQZ);
+    TEST_MEM_MARK(tmA);
+    U32 offLocal = emitPageLookup(addressReg, widthBytes, store, entryLocal);
 
-    if (widthBytes != 1) {
-        pushRegValue(addressReg);
-        m_emitter.emitI32Const(K_PAGE_MASK);
-        m_emitter.emitOp(WASM_I32_AND);
-        m_emitter.emitI32Const((S32)(K_PAGE_SIZE - widthBytes));
-        m_emitter.emitOp(WASM_I32_GT_U);
-        m_emitter.emitOp(WASM_I32_OR);
-    }
-
+    TEST_MEM_MARK(tmB);
     m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
     m_emitter.emitIf();
     {
@@ -11217,6 +11242,7 @@ void JitWasmCodeGen::accessMemoryCustom(U32 widthBytes, RegPtr addressReg, bool 
         m_xmmLoaded.fill(false);
         for (U8 i = 0; i < WASM_XMM_LOCAL_COUNT; ++i) loadCpuXMMReg(i);
     }
+    TEST_MEM_MARK(tmC);
     m_emitter.emitElse();
     {
         // Generating the failure arm may invalidate the cache trackers, but
@@ -11227,21 +11253,19 @@ void JitWasmCodeGen::accessMemoryCustom(U32 widthBytes, RegPtr addressReg, bool 
         fpuStackCache = savedFpuCache;
         m_xmmLoaded = savedXmmLoaded;
         m_xmmDirty = savedXmmDirty;
-        m_emitter.emitLocalGet(entryLocal);
-        pushRegValue(addressReg);
-        m_emitter.emitI32Const(K_PAGE_MASK);
-        m_emitter.emitOp(WASM_I32_AND);
-        m_emitter.emitOp(WASM_I32_ADD);
+        pushHostAddress(entryLocal, addressReg, offLocal);
         m_emitter.emitLocalSet(hostLocal);
         customOp(createMemPtr(makeWasmReg((U8)hostLocal, 0xff), 0, false));
     }
     m_emitter.emitEnd();
+    TEST_MEM_ACCOUNT(tmA, tmB, tmC);
 
     // Keep the inline arm's XMM state: the cold arm reloaded all locals.
     m_gpDirty   = savedGpDirty;
     m_gpLoaded  = savedGpLoaded;
     m_segLoaded = savedSegLoaded;
     freeScratch(hostLocal);
+    if (offLocal) freeScratch(offLocal);
     freeScratch(entryLocal);
     if (!store && canReleaseScratchReg(addressReg))
         freeScratch(addressReg->hardwareReg());
@@ -11296,8 +11320,7 @@ void JitWasmCodeGen::prepareReadGroupAddress(RegPtr address) {
         m_emitter.emitOp(WASM_I32_ADD);
     }
     m_emitter.emitLocalSet(minimum);
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Load((U32)offsetof(CPU, wasmReadPageBaseArray));
+    pushPageTable(false);
     m_emitter.emitLocalGet(minimum);
     m_emitter.emitI32Const(K_PAGE_SHIFT);
     m_emitter.emitOp(WASM_I32_SHR_U);
@@ -11355,28 +11378,10 @@ RegPtr JitWasmCodeGen::readMemoryValue(JitWidth w, RegPtr addressReg, RegPtr tmp
     auto savedSegLoaded = m_segLoaded;
 
     // Push: missCondition (entry == 0 [|| boundary])
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Load((U32)offsetof(CPU, wasmReadPageBaseArray));
-    pushRegValue(addressReg);
-    m_emitter.emitI32Const(K_PAGE_SHIFT);
-    m_emitter.emitOp(WASM_I32_SHR_U);
-    m_emitter.emitI32Const(2);                  // sizeof(U32)
-    m_emitter.emitOp(WASM_I32_SHL);
-    m_emitter.emitOp(WASM_I32_ADD);
-    m_emitter.emitI32Load(0);                   // entry = wasmReadPageBase[page]
-    m_emitter.emitLocalTee(entryLocal);
-    m_emitter.emitOp(WASM_I32_EQZ);
+    TEST_MEM_MARK(tmA);
+    U32 offLocal = emitPageLookup(addressReg, wasmJitWidthBytes(w), false, entryLocal);
 
-    if (w != JitWidth::b8) {
-        U32 widthBytes = wasmJitWidthBytes(w);
-        pushRegValue(addressReg);
-        m_emitter.emitI32Const(K_PAGE_MASK);
-        m_emitter.emitOp(WASM_I32_AND);
-        m_emitter.emitI32Const((S32)(K_PAGE_SIZE - widthBytes));
-        m_emitter.emitOp(WASM_I32_GT_U);
-        m_emitter.emitOp(WASM_I32_OR);
-    }
-
+    TEST_MEM_MARK(tmB);
     m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
     m_emitter.emitIf();
     {
@@ -11392,6 +11397,7 @@ RegPtr JitWasmCodeGen::readMemoryValue(JitWidth w, RegPtr addressReg, RegPtr tmp
         }
         m_emitter.emitLocalSet(tmp->hardwareReg());
     }
+    TEST_MEM_MARK(tmC);
     m_emitter.emitElse();
     {
         // Fast path: tmp = i32.load{8u,16u,_}(entry + (addr & K_PAGE_MASK))
@@ -11400,11 +11406,7 @@ RegPtr JitWasmCodeGen::readMemoryValue(JitWidth w, RegPtr addressReg, RegPtr tmp
         // (host_base - virt_page_base) trick the host-exception readCache
         // does because under WASM the no-access sentinel can't be a low
         // address that traps).
-        m_emitter.emitLocalGet(entryLocal);
-        pushRegValue(addressReg);
-        m_emitter.emitI32Const(K_PAGE_MASK);
-        m_emitter.emitOp(WASM_I32_AND);
-        m_emitter.emitOp(WASM_I32_ADD);
+        pushHostAddress(entryLocal, addressReg, offLocal);
         switch (w) {
         case JitWidth::b8:
             if (signExtend) m_emitter.emitI32Load8S(0);
@@ -11419,12 +11421,14 @@ RegPtr JitWasmCodeGen::readMemoryValue(JitWidth w, RegPtr addressReg, RegPtr tmp
         m_emitter.emitLocalSet(tmp->hardwareReg());
     }
     m_emitter.emitEnd();
+    TEST_MEM_ACCOUNT(tmA, tmB, tmC);
 
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
     m_xmmLoaded = savedXmmLoaded;
     m_gpLoaded  = savedGpLoaded;
     m_segLoaded = savedSegLoaded;
+    if (offLocal) freeScratch(offLocal);
     freeScratch(entryLocal);
     if (canReleaseScratchReg(addressReg))
         freeScratch(addressReg->hardwareReg());
@@ -11469,28 +11473,10 @@ void JitWasmCodeGen::write(JitWidth w, RegPtr addressReg, RegPtr src,
     auto savedSegLoaded = m_segLoaded;
 
     // missCondition = (entry == 0) [|| boundary]
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Load((U32)offsetof(CPU, wasmWritePageBaseArray));
-    pushRegValue(addressReg);
-    m_emitter.emitI32Const(K_PAGE_SHIFT);
-    m_emitter.emitOp(WASM_I32_SHR_U);
-    m_emitter.emitI32Const(2);
-    m_emitter.emitOp(WASM_I32_SHL);
-    m_emitter.emitOp(WASM_I32_ADD);
-    m_emitter.emitI32Load(0);
-    m_emitter.emitLocalTee(entryLocal);
-    m_emitter.emitOp(WASM_I32_EQZ);
+    TEST_MEM_MARK(tmA);
+    U32 offLocal = emitPageLookup(addressReg, wasmJitWidthBytes(w), true, entryLocal);
 
-    if (w != JitWidth::b8) {
-        U32 widthBytes = wasmJitWidthBytes(w);
-        pushRegValue(addressReg);
-        m_emitter.emitI32Const(K_PAGE_MASK);
-        m_emitter.emitOp(WASM_I32_AND);
-        m_emitter.emitI32Const((S32)(K_PAGE_SIZE - widthBytes));
-        m_emitter.emitOp(WASM_I32_GT_U);
-        m_emitter.emitOp(WASM_I32_OR);
-    }
-
+    TEST_MEM_MARK(tmB);
     m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
     m_emitter.emitIf();
     {
@@ -11504,17 +11490,14 @@ void JitWasmCodeGen::write(JitWidth w, RegPtr addressReg, RegPtr src,
         m_emitter.emitCall(writeCheckHelperForWidth(w), true);
         emitBailoutCheck();
     }
+    TEST_MEM_MARK(tmC);
     m_emitter.emitElse();
     {
         // Fast path: i32.store{8,16,}(entry + (addr & K_PAGE_MASK), src)
         // No bailout check needed: by construction, fast-pathed writes
         // can't land on the active block (which lives on a CodePage,
         // and CodePage::canWriteRam() == false → wasmWritePageBase == 0).
-        m_emitter.emitLocalGet(entryLocal);
-        pushRegValue(addressReg);
-        m_emitter.emitI32Const(K_PAGE_MASK);
-        m_emitter.emitOp(WASM_I32_AND);
-        m_emitter.emitOp(WASM_I32_ADD);
+        pushHostAddress(entryLocal, addressReg, offLocal);
         pushRegValue(src);
         switch (w) {
         case JitWidth::b8:  m_emitter.emitI32Store8(0);  break;
@@ -11523,12 +11506,14 @@ void JitWasmCodeGen::write(JitWidth w, RegPtr addressReg, RegPtr src,
         }
     }
     m_emitter.emitEnd();
+    TEST_MEM_ACCOUNT(tmA, tmB, tmC);
 
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
     m_xmmLoaded = savedXmmLoaded;
     m_gpLoaded  = savedGpLoaded;
     m_segLoaded = savedSegLoaded;
+    if (offLocal) freeScratch(offLocal);
     freeScratch(entryLocal);
 }
 
@@ -15150,12 +15135,15 @@ extern "C" U32 wasmJitTestEmissionCount() {
     return g_wasmJitTestEmissionCount.load(std::memory_order_relaxed);
 }
 // Module size / codegen time totals, printed at the end of testJit.
-static std::atomic<U64> g_wasmJitTestBytes{0}, g_wasmJitTestOneOpModules{0}, g_wasmJitTestOneOpBytes{0}, g_wasmJitTestGenNs{0};
+static std::atomic<U64> g_wasmJitTestBytes{0}, g_wasmJitTestOneOpModules{0}, g_wasmJitTestOneOpBytes{0}, g_wasmJitTestGenNs{0}, g_wasmJitTestBodyBytes{0}, g_wasmJitTestOneOpBodyBytes{0};
 void wasmJitTestPrintSizeStats() {
     U32 n = g_wasmJitTestEmissionCount.load();
     U64 b = g_wasmJitTestBytes.load(), n1 = g_wasmJitTestOneOpModules.load(), b1 = g_wasmJitTestOneOpBytes.load();
-    printf("[JITSIZE] modules=%u bytes=%llu avg=%llu oneOpModules=%llu oneOpAvg=%llu genMs=%llu\n", n, (unsigned long long)b,
-        (unsigned long long)(n ? b / n : 0), (unsigned long long)n1, (unsigned long long)(n1 ? b1 / n1 : 0),
+    U64 bb = g_wasmJitTestBodyBytes.load(), bb1 = g_wasmJitTestOneOpBodyBytes.load();
+    wasmJitPrintMemCodeStats();
+    printf("[JITSIZE] modules=%u bytes=%llu avg=%llu bodyAvg=%llu oneOpModules=%llu oneOpAvg=%llu oneOpBodyAvg=%llu genMs=%llu\n", n, (unsigned long long)b,
+        (unsigned long long)(n ? b / n : 0), (unsigned long long)(n ? bb / n : 0), (unsigned long long)n1, (unsigned long long)(n1 ? b1 / n1 : 0),
+        (unsigned long long)(n1 ? bb1 / n1 : 0),
         (unsigned long long)(g_wasmJitTestGenNs.load() / 1000000));
 }
 #endif
@@ -15172,6 +15160,26 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
     for (auto target = m_forwardTargets.rbegin(); target != m_forwardTargets.rend(); ++target) {
         if (target->token) m_emitter.emitEnd();
     }
+    if (m_usesReadTable || m_usesWriteTable) {
+        size_t mark = m_emitter.bodySize();
+        if (m_usesReadTable) {
+            m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+            m_emitter.emitI32Load((U32)offsetof(CPU, wasmReadPageBaseArray));
+            m_emitter.emitLocalSet(WASM_READ_TABLE_LOCAL);
+        }
+        if (m_usesWriteTable) {
+            m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+            m_emitter.emitI32Load((U32)offsetof(CPU, wasmWritePageBaseArray));
+            m_emitter.emitLocalSet(WASM_WRITE_TABLE_LOCAL);
+        }
+        m_emitter.moveTailToBodyStart(mark);
+    }
+    g_wasmJitBodies++;
+    g_wasmJitBodyBytes += m_emitter.bodySize();
+#ifdef __TEST
+    g_wasmJitTestBodyBytes += m_emitter.bodySize();
+    if (this->blockOpCount == 1) g_wasmJitTestOneOpBodyBytes += m_emitter.bodySize();
+#endif
     m_emitter.endFunction();
 #ifdef BOXEDWINE_WASM_JIT_NAMES
     // Names are metadata only. Keep guest address attribution out of normal

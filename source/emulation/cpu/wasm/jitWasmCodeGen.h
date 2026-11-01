@@ -239,7 +239,13 @@ static constexpr U32 WASM_FLAG_RESULT_LOCAL = WASM_FPU_VALID_BASE + 8;
 static constexpr U32 WASM_LOOP_CARRY_LOCAL = WASM_FLAG_RESULT_LOCAL + 1;
 // v128 copies of mm0-mm7 (low 64 bits, high lane zero), valid per WasmEmitter::mmxCached.
 static constexpr U32 WASM_MMX_LOCAL_BASE = WASM_LOOP_CARRY_LOCAL + 1;
-static constexpr U32 WASM_LOCAL_COUNT = WASM_MMX_LOCAL_BASE + 8;
+// cpu->wasmReadPageBaseArray / wasmWritePageBaseArray, loaded once in the
+// block prologue (only when the block uses them). The CPU fields change only
+// in wasmPrepareBlockEnter, between block activations, so a guest store or a
+// helper call inside the block can never make these copies stale.
+static constexpr U32 WASM_READ_TABLE_LOCAL = WASM_MMX_LOCAL_BASE + 8;
+static constexpr U32 WASM_WRITE_TABLE_LOCAL = WASM_READ_TABLE_LOCAL + 1;
+static constexpr U32 WASM_LOCAL_COUNT = WASM_WRITE_TABLE_LOCAL + 1;
 
 // ---------------------------------------------------------------------------
 // Mapping from emulated register index to WASM local index.
@@ -1138,9 +1144,16 @@ protected:
     U32 lastCompiledOpLen = 0;
     bool m_emulatedCurrentOp = false;
     bool m_needsWasmMemoryPageArrays = false;
+    // Which page-table locals the prologue must load (see WASM_READ_TABLE_LOCAL).
+    bool m_usesReadTable = false;
+    bool m_usesWriteTable = false;
 #ifdef __TEST
     std::chrono::steady_clock::time_point m_testGenStart;
 #endif
+    // Push the read or write page-table base (from its prologue-loaded local).
+    void pushPageTable(bool store);
+    U32 emitPageLookup(RegPtr addressReg, U32 widthBytes, bool store, U32 entryLocal);
+    void pushHostAddress(U32 entryLocal, RegPtr addressReg, U32 offLocal);
     DecodedOp* m_wasmBlockStartOp = nullptr;
     DecodedOp* m_currentWasmOp = nullptr;
     // FNV-1a hash over the block's decoded ops, accumulated by preCompile and
