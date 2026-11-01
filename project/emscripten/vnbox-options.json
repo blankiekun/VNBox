@@ -126,6 +126,48 @@
       "description": "Most blocks queued for one hot code group (measurement only).",
       "type": "int", "default": 1024, "min": 1, "max": 2147483647,
       "group": "Debug", "restart": true, "experimental": true
+    },
+    {
+      "name": "idleCap",
+      "label": "Idle CPU cap",
+      "description": "Share of the CPU a game may use while the screen barely changes; input, big changes, 3D, file loading or low audio lift it at once. 0 turns it off.",
+      "type": "int", "default": 20, "min": 0, "max": 100,
+      "group": "CPU/battery", "restart": true, "experimental": false
+    },
+    {
+      "name": "idleCapArea",
+      "label": "Idle change size",
+      "description": "Screen changes smaller than this percent of the screen still count as idle for the idle cap.",
+      "type": "int", "default": 2, "min": 0, "max": 100,
+      "group": "CPU/battery", "restart": true, "experimental": true
+    },
+    {
+      "name": "idleCapHold",
+      "label": "Idle hold",
+      "description": "Longest wait in ms after each shown frame while the idle cap is on.",
+      "type": "int", "default": 50, "min": 1, "max": 1000,
+      "group": "CPU/battery", "restart": true, "experimental": true
+    },
+    {
+      "name": "cpuCap",
+      "label": "Fixed CPU cap",
+      "description": "Share of the CPU a game may use at all times. 0 = no cap.",
+      "type": "int", "default": 0, "min": 0, "max": 100,
+      "group": "CPU/battery", "restart": true, "experimental": true
+    },
+    {
+      "name": "clockBackoff",
+      "label": "Poll back-off",
+      "description": "A thread that only polls the clock or Sleep(0) while the screen is idle sleeps 1 ms between polls.",
+      "type": "bool", "default": true, "urlValues": {"true": "1", "false": "0"},
+      "group": "CPU/battery", "restart": true, "experimental": false
+    },
+    {
+      "name": "hotThrottle",
+      "label": "Busy-loop throttle",
+      "description": "Longest sleep in ms after each frame for a thread that keeps redrawing an idle screen. 0 turns it off.",
+      "type": "int", "default": 16, "min": 0, "max": 100,
+      "group": "CPU/battery", "restart": true, "experimental": false
     }
   ]
 }
