@@ -2057,7 +2057,7 @@
                 params.push("" + Config.audioFreq);
             }
             // the game fills the screen without a title bar (XWindow::fitToScreen)
-            if (getParameter("fitWindow") == "true") {
+            if (vnboxParam("fitWindow") === "true") {
                 params.push("-fitWindow");
             }
             if (Config.disableHideCursor) {

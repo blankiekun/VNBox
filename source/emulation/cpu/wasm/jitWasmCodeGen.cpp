@@ -26,6 +26,7 @@
 #include "wasmMemoryOrdering.h"
 #include "wasmModuleMerger.h"
 #include "vnboxstats.h"
+#include "vnboxparam.h"
 #include "../jit/jitCodeGen.h"
 #include "../jit/jitCodeLifecycle.h"
 #ifdef __TEST
@@ -515,12 +516,12 @@ static U32 g_wasmJitHotMaxBlocks = WASM_JIT_HOT_MAX_BLOCKS;
 static bool wasmJitHotEnabled() {
     if (g_wasmJitHotEnabled < 0) {
 #if defined(__EMSCRIPTEN__) && !defined(__TEST)
-        g_wasmJitHotEnabled = EM_ASM_INT({ return typeof vnboxParam === "function" && vnboxParam("hotGroup") === "0" ? 0 : 1; });
+        g_wasmJitHotEnabled = vnboxUrlIs("hotGroup", "0") ? 0 : 1;
         if (!g_wasmJitHotEnabled) klog_fmt("[vnbox] hot groups off (hotGroup=0)");
         // Tuning (measurement): hotEntries, hotWaitMs, hotMax URL params.
-        int entries = EM_ASM_INT({ var v = typeof vnboxParam === "function" ? parseInt(vnboxParam("hotEntries")) : NaN; return v > 0 ? v : 0; });
-        int waitMs = EM_ASM_INT({ var v = typeof vnboxParam === "function" ? parseInt(vnboxParam("hotWaitMs")) : NaN; return v >= 0 ? v : -1; });
-        int maxBlocks = EM_ASM_INT({ var v = typeof vnboxParam === "function" ? parseInt(vnboxParam("hotMax")) : NaN; return v > 0 ? v : 0; });
+        int entries = vnboxUrlInt("hotEntries", 0, 0, INT_MAX);
+        int waitMs = vnboxUrlInt("hotWaitMs", -1, -1, INT_MAX);
+        int maxBlocks = vnboxUrlInt("hotMax", 0, 0, INT_MAX);
         if (entries) g_wasmJitHotEntries = (U32)entries;
         if (waitMs >= 0) g_wasmJitHotWaitMs = waitMs;
         if (maxBlocks) g_wasmJitHotMaxBlocks = (U32)maxBlocks;
@@ -10274,12 +10275,8 @@ void JitWasmCodeGen::regToFpuReg64(FPURegPtr dst, RegPtr src) {
 static int g_wasmFastX87 = -1;
 int JitWasmCodeGen::fastX87() const {
     if (g_wasmFastX87 < 0) {
-        g_wasmFastX87 = EM_ASM_INT({
-            var v = typeof vnboxParam === "function" ? vnboxParam("fastX87") : null;
-            if (v == null && typeof process !== "undefined" && process.env) v = process.env.FASTX87;
-            v = (v == null || v === "") ? 1 : parseInt(v, 10);
-            return v >= 0 && v <= 2 ? v : 1;
-        });
+        g_wasmFastX87 = vnboxUrlInt("fastX87", 1, -1, 3, "FASTX87");
+        if (g_wasmFastX87 < 0 || g_wasmFastX87 > 2) g_wasmFastX87 = 1;
         klog_fmt("[vnbox] fast x87 level %d (fastX87)", g_wasmFastX87);
     }
     return g_wasmFastX87;

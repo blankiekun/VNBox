@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "vnboxparam.h"
 
 #include "soft_invalid_page.h"
 #include "kmemory_soft.h"
@@ -52,11 +53,7 @@ KMemoryData* getMemData(KMemory* memory) {
 bool kmemoryZeroPageTables() {
     static int state = -1;
     if (state < 0) {
-        state = EM_ASM_INT({
-            var v = typeof vnboxParam === "function" ? vnboxParam("zeroPageTables") : null;
-            if (v == null && typeof process !== "undefined" && process.env) v = process.env.ZERO_PAGE_TABLES;
-            return v === "0" ? 0 : 1;
-        });
+        state = vnboxUrlIs("zeroPageTables", "0", "ZERO_PAGE_TABLES") ? 0 : 1;
         if (!state) {
             klog_fmt("[vnbox] zero page tables off (zeroPageTables=0)");
         }

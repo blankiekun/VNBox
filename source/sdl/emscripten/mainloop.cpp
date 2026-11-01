@@ -23,6 +23,7 @@
 #include "kbrowsersocket.h"
 #include "knativesystem.h"
 #include "vnboxstats.h"
+#include "vnboxparam.h"
 #include "../../x11/x11.h"
 #include <algorithm>
 #include "kdspaudio_math.h"
@@ -270,11 +271,23 @@ void mainloop() {
 
 #endif
 
-// A whole-number URL param of the player page (vnboxParam, lazyfs.js), clamped to [lo, hi]; dflt when absent.
-EM_JS(int, vnboxUrlInt, (const char* name, int dflt, int lo, int hi), {
-    var v = parseInt(vnboxParam(UTF8ToString(name)), 10);
-    return isNaN(v) ? dflt : Math.min(hi, Math.max(lo, v));
-});
+// The one reading path for VNBox URL options (vnboxparam.h).
+int vnboxUrlInt(const char* name, int dflt, int lo, int hi, const char* env) {
+    return EM_ASM_INT({
+        var v = typeof vnboxParam === "function" ? vnboxParam(UTF8ToString($0)) : null;
+        if (v == null && $4 && typeof process !== "undefined" && process.env) v = process.env[UTF8ToString($4)];
+        v = parseInt(v, 10);
+        return isNaN(v) ? $1 : Math.min($3, Math.max($2, v));
+    }, name, dflt, lo, hi, env);
+}
+
+bool vnboxUrlIs(const char* name, const char* value, const char* env) {
+    return EM_ASM_INT({
+        var v = typeof vnboxParam === "function" ? vnboxParam(UTF8ToString($0)) : null;
+        if (v == null && $2 && typeof process !== "undefined" && process.env) v = process.env[UTF8ToString($2)];
+        return v === UTF8ToString($1) ? 1 : 0;
+    }, name, value, env) != 0;
+}
 
 bool doMainLoop() {
     // Smoothness knobs, read before the guest runs. audioPeriod: frames per SDL audio callback

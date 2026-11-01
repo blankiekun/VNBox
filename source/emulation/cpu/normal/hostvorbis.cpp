@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "vnboxparam.h"
 
 // Native libvorbis: games that ship libvorbis.dll (イマ, Muramasa, ...) decode their Ogg audio through it, emulated, in
 // x87 code the JIT runs ~40x slower than native. The decode-side exports get a head op (hostLibcOp, the native libc
@@ -164,7 +165,7 @@ U32 hostVorbisAt(CPU* cpu, U32 eip) {
     if (!hostVorbisState) {
         hostVorbisState = 1;
 #ifdef __EMSCRIPTEN__
-        if (EM_ASM_INT({ return typeof vnboxParam === "function" && vnboxParam("nativeVorbis") === "0" ? 1 : 0; })) {
+        if (vnboxUrlIs("nativeVorbis", "0")) {
             hostVorbisState = -1;
             klog_fmt("[vnbox] native vorbis off (nativeVorbis=0)");
             return 0;

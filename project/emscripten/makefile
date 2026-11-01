@@ -276,7 +276,7 @@ WEBGL_COUNTER_ASSETS := webgl-counters.mjs
 endif
 
 # VNBox: its page assets for every target, and its own build rules.
-ASSET_FILES += lazyfs.js lazyfs-worker.js vnbox-movie.js frida-compat.js
+ASSET_FILES += lazyfs.js lazyfs-worker.js vnbox-movie.js frida-compat.js vnbox-options.json
 include vnbox-build.mk
 ASSET_OUTPUTS := $(addprefix $(BUILD_DIR)/,$(ASSET_FILES) $(WEBGL_COUNTER_ASSETS))
 
