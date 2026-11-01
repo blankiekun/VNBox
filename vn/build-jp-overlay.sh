@@ -7,8 +7,9 @@
 # and wineboot imports jp-fonts.reg (below) into prefixes older than this jp.zip's, and quartz hands
 # MPEG-1 movies to the browser page (/dev/vnbox-movie, vnbox-movie.js), and dsound mixes 16-bit
 # and float sound without a function call per sample; and ntdll.so and
-# wineserver built with ntsync support (build-wine-ntsync.sh); and winex11.so without the per-pixel
-# alpha pass on window flushes (build-wine-winex11.sh); and the WebGL wined3d.dll with
+# wineserver built with ntsync support (build-wine-ntsync.sh); and win32u.so with a rendered-glyph
+# cache (build-wine-win32u.sh); and winex11.so without the per-pixel alpha pass on window flushes
+# (build-wine-winex11.sh); and the WebGL wined3d.dll with
 # vn/webgl/*.patch (build-webgl-wined3d.sh).
 # Usage: vn/build-jp-overlay.sh <TinyCore15Wine11.0-web.zip> <out/jp.zip>
 set -euo pipefail
@@ -82,6 +83,12 @@ mv "$work/ntsync/wineserver" "$work/opt/wine/bin/"
 mv "$work/ntsync/patches" "$work/opt/wine/share/wine/vnbox-patches/rootfs"
 rm -r "$work/ntsync"
 printf '\nntdll.so (i386-unix) and wineserver (bin) are Wine 11.0 with the root fs patches in rootfs/\n(tools/buildWine/wine_builds.json), configured with Linux 6.14'"'"'s include/uapi/linux/ntsync.h,\nbuilt by vn/build-wine-ntsync.sh in https://github.com/blankiekun/VNBox.\n' \
+  >> "$work/opt/wine/share/wine/vnbox-patches/README"
+
+# Glyph cache: the root fs's win32u.so rebuilt with vn/wine/win32u-*.patch, so GetGlyphOutline bitmaps
+# of GDI text redrawn every frame come from a cache instead of FreeType loading and hinting them again.
+"$here/build-wine-win32u.sh" "$work/opt/wine/lib/wine/i386-unix"
+printf '\nwin32u.so (i386-unix) is Wine 11.0 with the root fs patches in rootfs/ and win32u-*.patch,\nbuilt by vn/build-wine-win32u.sh in https://github.com/blankiekun/VNBox.\n' \
   >> "$work/opt/wine/share/wine/vnbox-patches/README"
 
 # Opaque window flushes: the root fs's winex11.so rebuilt with vn/wine/winex11-*.patch, so a window surface flush

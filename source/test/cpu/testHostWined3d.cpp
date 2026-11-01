@@ -279,6 +279,40 @@ void testHostWined3dThunk() {
             if (call(WD3D_ID_wined3d_texture_decref, { tex })) testFail("data texture still referenced");
             drain(CB_OBJECT_DESTROYED, 0x8181, 0x7171);
         }
+        // GDI over a texture: get_dc answers the host's DC, id 3 maps its memory into the guest (what the stub makes
+        // its own DC over), a guest write lands in the texture, release_dc queues DC_DESTROYED
+        const U32 GET_DC = 0x8, CB_DC_DESTROYED = 7, A8R8G8B8 = 21;
+        U32 t3[11] = { TEXTURE_2D, B8G8R8A8_UNORM, 0, 0, 0, 0, 0x2 | 0x4 | 0x8, 4, 4, 1, 0 };
+        memory->memcpy(DESC, t3, sizeof(t3));
+        memory->writed(OUTP, 0);
+        hr = call(WD3D_ID_wined3d_texture_create, { device, DESC, 1, 1, GET_DC, 0, 0x7474, 0x8484, OUTP });
+        tex = memory->readd(OUTP);
+        if (hr || !tex) testFail("GET_DC texture_create: hr %.8X", hr);
+        if (tex) {
+            memory->writed(OUTP, 0);
+            if ((hr = call(WD3D_ID_wined3d_texture_get_dc, { tex, 0, OUTP }))) testFail("get_dc: hr %.8X", hr);
+            U32 dc = memory->readd(OUTP);
+            if (!dc) testFail("get_dc gave no DC");
+            else if (call(WD3D_ID_DC_INFO, { dc, MAP }) != 1) testFail("dc_info doesn't know the DC");
+            else {
+                U32 mem = memory->readd(MAP), pitch = memory->readd(MAP + 16);
+                if (!mem || memory->readd(MAP + 4) != A8R8G8B8 || memory->readd(MAP + 8) != 4 || memory->readd(MAP + 12) != 4 || pitch < 16)
+                    testFail("dc_info: memory %.8X format %u %ux%u pitch %u", mem, memory->readd(MAP + 4), memory->readd(MAP + 8), memory->readd(MAP + 12), pitch);
+                else memory->writed(mem + pitch * 2 + 8, 0x3C3C3C3C);
+                if ((hr = call(WD3D_ID_wined3d_texture_release_dc, { tex, 0, dc }))) testFail("release_dc: hr %.8X", hr);
+                drain(CB_DC_DESTROYED, 0, 0);
+                if (call(WD3D_ID_DC_INFO, { dc, MAP }) != 0) testFail("dc_info still knows a released DC");
+                U32 resource = call(WD3D_ID_wined3d_texture_get_resource, { tex });
+                if (call(WD3D_ID_wined3d_resource_map, { resource, 0, MAP, 0, 0x80000000 })) testFail("GET_DC texture map failed");
+                else {
+                    pitch = memory->readd(MAP);
+                    if (!memory->readd(MAP + 8) || memory->readd(memory->readd(MAP + 8) + pitch * 2 + 8) != 0x3C3C3C3C) testFail("write through the DC memory was lost");
+                    call(WD3D_ID_wined3d_resource_unmap, { resource, 0 });
+                }
+            }
+            if (call(WD3D_ID_wined3d_texture_decref, { tex })) testFail("GET_DC texture still referenced");
+            drain(CB_OBJECT_DESTROYED, 0x8484, 0x7474);
+        }
         if (call(WD3D_ID_wined3d_swapchain_decref, { swapchain })) testFail("swapchain still referenced");
         drain(CB_OBJECT_DESTROYED, 0xAAAA, 0x9999);
     }

@@ -327,7 +327,16 @@ bool doMainLoop() {
             if (delay >= 0) wait(delay);
             else if (!document.hidden && performance.now() - lastFrame > 12) raf = requestAnimationFrame(framed);
             else post();
-        }, function(e) { if (typeof vnboxReport === "function") vnboxReport("tick", String(e) + (e && e.stack ? "\n" + e.stack : "")); else console.error("tick failed: " + e); }); };
+        }, function(e) {
+#ifdef BOXEDWINE_HOST_WINED3D
+            /* a trap or JS error in a host wined3d call: the guest gets an access violation (thunkHost.cpp) */
+            if (!(e instanceof WebAssembly.Exception) && wasmExports["vnbox_wd3d_recover"]()) {
+                console.log("[wined3d] recovered from: " + String(e) + (e && e.stack ? "\n" + e.stack : ""));
+                post();
+                return;
+            }
+#endif
+            if (typeof vnboxReport === "function") vnboxReport("tick", String(e) + (e && e.stack ? "\n" + e.stack : "")); else console.error("tick failed: " + e); }); };
         channel.port1.onmessage = next;
         requestAnimationFrame(frame);
         next();

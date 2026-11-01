@@ -12,6 +12,7 @@
 #include <malloc.h>
 
 void wd3d_log_fmt(const char* format, ...);
+extern "C" void wd3d_guest_fault(const char* what); // thunkHost.cpp
 
 extern "C" {
 
@@ -61,8 +62,11 @@ int __stdio_common_vsscanf(uint64_t options, const char* input, size_t length, c
     return ret;
 }
 
+// A failed assert is a guest access violation (thunkHost.cpp): where host wined3d asserts, the guest wined3d mostly
+// goes on and faults (a NULL map). abort() only without a guest to tell.
 [[noreturn]] void _assert(const char* expr, const char* file, unsigned int line) {
     wd3d_log_fmt("assertion failed: %s, %s:%u", expr, file, line);
+    wd3d_guest_fault("assertion failed");
     abort();
 }
 

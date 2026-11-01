@@ -24,6 +24,9 @@ ALL += $(WD3D_OBJS) $(WD3D_SHIM_OBJS) $(WD3D_HOST_OBJS)
 CPPFLAGS += -DBOXEDWINE_HOST_WINED3D
 # Keeps the export table, and through it all of wined3d, in the link (source/wined3d/exports.c).
 LDFLAGS += -Wl,--export=wd3d_link_root -Wl,--export=wd3d_dll_main
+# Static data from 64 KiB (Emscripten's default: 1 KiB): a NULL + offset write in host wined3d (no trap in wasm, an
+# access violation in the guest wined3d) hits unused memory instead of the emulator's globals (thunkHost.cpp).
+LDFLAGS += -sGLOBAL_BASE=65536
 # The guest side: the stub wined3d.dll (PE32, MinGW), embedded at /hostwd3d/wined3d.dll; startupArgs.cpp puts it in
 # system32 in place of the guest's wined3d.
 WD3D_GUEST_DIR := $(PROJDIR)/source/wined3d/guest
@@ -32,7 +35,7 @@ MINGW_CC ?= i686-w64-mingw32-gcc
 $(WD3D_STUB): $(WD3D_GUEST_DIR)/wined3d_thunk.S $(WD3D_GUEST_DIR)/wined3d_guest.c $(WD3D_GUEST_DIR)/wined3d.def
 	@$(MKDIR_P) $(dir $@)
 	@$(MINGW_CC) -shared -nostdlib -O2 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector -Wall $^ \
-		-Wl,--kill-at -e _DllMain@12 -luser32 -lkernel32 -o $@
+		-Wl,--kill-at -e _DllMain@12 -luser32 -lgdi32 -lkernel32 -o $@
 $(BUILD_DIR)/$(TARGET_EXEC): $(WD3D_STUB)
 LDFLAGS += --embed-file $(WD3D_STUB)@/hostwd3d/wined3d.dll
 -include $(WD3D_OBJS:.o=.d) $(WD3D_SHIM_OBJS:.o=.d) $(WD3D_HOST_OBJS:.o=.d)
