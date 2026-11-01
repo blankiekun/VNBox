@@ -215,6 +215,7 @@ void hostWined3dStatsLine(char* out, int len, double sec) {
 }
 
 static void hostWined3dCallInner(CPU* cpu, U32 index);
+static void hostWined3dCallTimed(CPU* cpu, U32 index);
 
 #ifdef __EMSCRIPTEN__
 // A NULL write doesn't trap in wasm: where the guest wined3d would fault, host wined3d writes near address 0. HOST_WINED3D
@@ -240,7 +241,9 @@ static void checkNullPage() {
 }
 #endif
 
-// What a trap in host wined3d leaves behind (vnbox_wd3d_recover): the call in flight and the GL context it switched.
+// What a trap in host wined3d leaves behind (vnbox_wd3d_recover): the call in flight (its CPU: cleared when the call
+// returns or a C++ exception leaves it, not by a trap or a JS exception) and the GL context it switched.
+static CPU* activeCpu;
 static U32 activeId;
 static uint32_t activeGlSaved[3];
 static int activeGlSwitched;
@@ -256,8 +259,11 @@ extern "C" void _emscripten_stack_restore(uintptr_t sp);
 // the lost frames would have restored is put back (GL context, call scope, shadow stack, scheduler), and the loop
 // goes on. Host wined3d itself is left as the failed call left it, as the guest wined3d is after its fault.
 // Returns 0 (the emulator stops as before) when the failure wasn't in a host wined3d call.
+// A JS exception (a WebGL TypeError) is foreign to C++: catch (...) doesn't take it, but the cleanups run (call scope,
+// GL context, ChangeThread), so only the guest fault and the scheduler are left to do.
 extern "C" EMSCRIPTEN_KEEPALIVE int vnbox_wd3d_recover(void) {
-    CPU* cpu = callCpu;
+    CPU* cpu = activeCpu;
+    activeCpu = nullptr;
     if (!cpu || !cpu->thread) return 0;
     klog_fmt("[wined3d] host wined3d failed in %s (wasm trap or JS error): raising an access violation in the guest",
             activeId < WD3D_ID_COUNT && wd3d_call_names[activeId] ? wd3d_call_names[activeId] : "?");
@@ -274,6 +280,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE int vnbox_wd3d_recover(void) {
 #endif
 
 void hostWined3dCall(CPU* cpu, U32 index) {
+    bool outer = !activeCpu;
+    if (outer) activeCpu = cpu;
+    try {
+        hostWined3dCallTimed(cpu, index);
+    } catch (...) { // C++ only (a guest fault, an exit): not a host wined3d failure
+        if (outer) activeCpu = nullptr;
+        throw;
+    }
+    if (outer) activeCpu = nullptr;
+}
+
+static void hostWined3dCallTimed(CPU* cpu, U32 index) {
 #ifdef __EMSCRIPTEN__
     if (vnboxStats.on) {
         U32 id = index - WD3D_CALL_BASE;
