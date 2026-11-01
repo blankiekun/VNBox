@@ -1459,6 +1459,10 @@ int runTestTests(size_t startEntry = 0, size_t requestedCount = 0, U32 workerCou
     stopNativeSocketsThread();
 #endif
     U32 stopTime = KSystem::getMilliesSinceStart();
+#ifdef BOXEDWINE_WASM_JIT
+    extern void wasmJitTestPrintSizeStats();
+    wasmJitTestPrintSizeStats();
+#endif
     printf("%d tests FAILED in %ds\n", totalFails, (stopTime - startTime) / 1000);
     return totalFails != 0;
 }

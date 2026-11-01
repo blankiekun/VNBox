@@ -398,6 +398,12 @@ public:
     // Begin writing the body for a local function.
     // locals: list of (count, type) pairs for WASM local declarations.
     void beginFunction(const std::vector<std::pair<U32, WasmType>>& locals);
+    // Current body size; pass it to moveTailToBodyStart to turn the code
+    // emitted after this point into the function's prologue.
+    size_t bodySize() const { return m_currentBody.size(); }
+    // Move the bytes emitted since `mark` to the start of the function body
+    // (right after the locals), shifting this function's branch hints.
+    void moveTailToBodyStart(size_t mark);
 
     // Core instruction emitters. These append bytes to m_currentBody.
     void emitByte(U8 b);
@@ -506,6 +512,7 @@ private:
     U32              m_codeFuncCount = 0;
 
     std::vector<U8>  m_currentBody;      // being built by begin/endFunction
+    size_t           m_bodyStart = 0;    // first byte after the locals declaration
     bool             m_inFunction = false;
     U32              m_ctrlDepth = 0;    // open structural blocks (if/block/loop)
     struct MmxCtrl {
