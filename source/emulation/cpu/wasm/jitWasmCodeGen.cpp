@@ -11247,10 +11247,31 @@ void JitWasmCodeGen::accessMemoryCustom(U32 widthBytes, RegPtr addressReg, bool 
     TEST_MEM_MARK(tmA);
     U32 offLocal = emitPageLookup(addressReg, widthBytes, store, entryLocal);
 
-    TEST_MEM_MARK(tmB);
-    m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
+    // Fast arm first, so the cold arm knows which XMM locals the join
+    // expects to be loaded and reloads only those.
+    TEST_MEM_MARK(tmL);
+    m_emitter.emitOp(WASM_I32_EQZ);
+    m_emitter.setNextBranchHint(WasmBranchHint::Likely);
     m_emitter.emitIf();
     {
+        pushHostAddress(entryLocal, addressReg, offLocal);
+        m_emitter.emitLocalSet(hostLocal);
+        customOp(createMemPtr(makeWasmReg((U8)hostLocal, 0xff), 0, false));
+    }
+    auto fastFpuCache = fpuStackCache;
+    auto fastXmmDirty = m_xmmDirty;
+    auto fastXmmLoaded = m_xmmLoaded;
+    TEST_MEM_MARK(tmB);
+    m_emitter.emitElse();
+    {
+        // The cold arm starts from the state before the access; the fast
+        // arm's GP locals, including dirty ones, are untouched by it.
+        m_gpDirty = savedGpDirty;
+        m_gpLoaded = savedGpLoaded;
+        m_segLoaded = savedSegLoaded;
+        fpuStackCache = savedFpuCache;
+        m_xmmLoaded = savedXmmLoaded;
+        m_xmmDirty = savedXmmDirty;
         if (failedOp) {
             failedOp();
         } else {
@@ -11258,31 +11279,23 @@ void JitWasmCodeGen::accessMemoryCustom(U32 widthBytes, RegPtr addressReg, bool 
         }
         // The cold arm executed the entire instruction in CPU state. It
         // cannot join the inline arm's virtual x87 stack mapping.
-        if (savedFpuCache.entryTop) blockExit();
-        // The interpreter may change any XMM register. Populate every
-        // local so the inline arm's lazy-cache state is valid at the join.
+        if (savedFpuCache.entryTop) coldBlockExit();
+        // The interpreter may change any XMM register. Reload every local
+        // the fast arm leaves marked loaded, so the join state is valid.
         // This work is confined to the cold memory path.
         syncDirtyRegsToHost();
         m_xmmLoaded.fill(false);
-        for (U8 i = 0; i < WASM_XMM_LOCAL_COUNT; ++i) loadCpuXMMReg(i);
+        for (U8 i = 0; i < WASM_XMM_LOCAL_COUNT; ++i) {
+            if (fastXmmLoaded[i]) loadCpuXMMReg(i);
+        }
     }
     TEST_MEM_MARK(tmC);
-    m_emitter.emitElse();
-    {
-        // Generating the failure arm may invalidate the cache trackers, but
-        // the fast arm still has its original GP locals, including dirty ones.
-        m_gpDirty = savedGpDirty;
-        m_gpLoaded = savedGpLoaded;
-        m_segLoaded = savedSegLoaded;
-        fpuStackCache = savedFpuCache;
-        m_xmmLoaded = savedXmmLoaded;
-        m_xmmDirty = savedXmmDirty;
-        pushHostAddress(entryLocal, addressReg, offLocal);
-        m_emitter.emitLocalSet(hostLocal);
-        customOp(createMemPtr(makeWasmReg((U8)hostLocal, 0xff), 0, false));
-    }
     m_emitter.emitEnd();
-    TEST_MEM_ACCOUNT_KIND(3, tmA, tmB, tmC);
+    fpuStackCache = fastFpuCache;
+    m_xmmDirty = fastXmmDirty;
+    m_xmmLoaded = fastXmmLoaded;
+    // Account as lookup / cold arm / fast arm like the other access kinds.
+    TEST_MEM_ACCOUNT_KIND(3, tmA, tmL, tmL + (tmC - tmB));
 
     // Keep the inline arm's XMM state: the cold arm reloaded all locals.
     m_gpDirty   = savedGpDirty;
@@ -14109,7 +14122,7 @@ void JitWasmCodeGen::emulateSingleOp() {
     m_emitter.emitI32Load8U((U32)offsetof(CPU, debugTrapActive));
     m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
     m_emitter.emitIf();
-    blockExit();
+    coldBlockExit();
     m_emitter.emitEnd();
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
