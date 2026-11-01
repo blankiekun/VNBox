@@ -1,0 +1,298 @@
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -206,6 +206,8 @@
+ {
+     FT_Face ft_face;
+     struct font_mapping *mapping;
++    UINT glyph_cache_entries;  /* rendered glyphs of this font in glyph_cache_lru */
++    UINT *char_index[256];     /* VNBox: FT_Get_Char_Index results + 1 for chars < 0x10000, by 256 */
+ };
+ 
+ static inline FT_Face get_ft_face( struct gdi_font *font )
+@@ -1667,6 +1669,15 @@
+ }
+ 
+ static int load_VDMX(struct gdi_font *font, int height);
++static void glyph_cache_remove_font( struct gdi_font *font );
++static SIZE_T glyph_cache_bytes;
++/* VNBox: glyph cache counters, printed to stderr every 2 s when VNBOX_GLYPHSTATS is set. */
++static struct
++{
++    UINT hit[0x20], miss[0x20], other[0x20];  /* by format & 0x1f; other = formats the cache skips */
++    UINT with_mat, fonts_loaded, fonts_destroyed, char_calls, char_misses, evicted;
++    DWORD last;
++} glyph_stats;
+ 
+ /*************************************************************
+  * freetype_destroy_font
+@@ -1675,6 +1686,11 @@
+ {
+     struct font_private_data *data = font->private;
+ 
++    UINT i;
++
++    glyph_stats.fonts_destroyed++;
++    if (data->glyph_cache_entries) glyph_cache_remove_font( font );
++    for (i = 0; i < ARRAY_SIZE(data->char_index); i++) free( data->char_index[i] );
+     if (data->ft_face) pFT_Done_Face( data->ft_face );
+     if (data->mapping) unmap_font_file( data->mapping );
+     free( data );
+@@ -2058,6 +2074,7 @@
+ 
+     if (!(data = calloc( 1, sizeof(*data) ))) return FALSE;
+     font->private = data;
++    glyph_stats.fonts_loaded++;
+ 
+     if (font->file[0])
+     {
+@@ -2164,16 +2181,61 @@
+     pt->y.fract |= ((pt->y.fract >> 6) | (pt->y.fract >> 12));
+ }
+ 
++static void glyph_stats_print(void)
++{
++    static int enabled = -1;
++    DWORD now;
++    char buf[1024];
++    int i, n;
++
++    if (enabled == -1) enabled = getenv( "VNBOX_GLYPHSTATS" ) != NULL;
++    if (!enabled) return;
++    now = NtGetTickCount();
++    if (now - glyph_stats.last < 2000) return;
++    n = snprintf( buf, sizeof(buf), "[glyphstats] %u ms:", (unsigned)(now - glyph_stats.last) );
++    for (i = 0; i < 0x20; i++)
++        if (glyph_stats.hit[i] || glyph_stats.miss[i] || glyph_stats.other[i])
++            n += snprintf( buf + n, sizeof(buf) - n, " fmt%x=%u/%u/%u", i, glyph_stats.hit[i], glyph_stats.miss[i],
++                           glyph_stats.other[i] );
++    snprintf( buf + n, sizeof(buf) - n, " (hit/miss/uncached) mat=%u fonts+%u-%u chars=%u charmiss=%u evicted=%u "
++              "cache=%uKB\n", glyph_stats.with_mat, glyph_stats.fonts_loaded, glyph_stats.fonts_destroyed,
++              glyph_stats.char_calls, glyph_stats.char_misses, glyph_stats.evicted,
++              (unsigned)(glyph_cache_bytes / 1024) );
++    fputs( buf, stderr );
++    memset( &glyph_stats, 0, sizeof(glyph_stats) );
++    glyph_stats.last = now;
++}
++
++/* VNBox: GDI text games map every char of their text to a glyph every frame (GetTextExtentPoint,
++ * GetGlyphOutline), and FT_Get_Char_Index searches the cmap each time. The charmap is fixed once
++ * the font is loaded. */
++static FT_UInt get_char_index( struct gdi_font *font, FT_ULong ch )
++{
++    struct font_private_data *data = font->private;
++    UINT *block;
++
++    glyph_stats_print();
++    glyph_stats.char_calls++;
++    if (ch > 0xffff) return pFT_Get_Char_Index( data->ft_face, ch );
++    if (!(block = data->char_index[ch >> 8]) && !(block = data->char_index[ch >> 8] = calloc( 256, sizeof(UINT) )))
++        return pFT_Get_Char_Index( data->ft_face, ch );
++    if (!block[ch & 0xff])
++    {
++        glyph_stats.char_misses++;
++        block[ch & 0xff] = pFT_Get_Char_Index( data->ft_face, ch ) + 1;
++    }
++    return block[ch & 0xff] - 1;
++}
++
+ static FT_UInt get_glyph_index_symbol( struct gdi_font *font, UINT glyph )
+ {
+-    FT_Face ft_face = get_ft_face( font );
+     FT_UInt ret;
+ 
+     if (glyph < 0x100) glyph += 0xf000;
+     /* there are a number of old pre-Unicode "broken" TTFs, which
+        do have symbols at U+00XX instead of U+f0XX */
+-    if (!(ret = pFT_Get_Char_Index(ft_face, glyph)))
+-        ret = pFT_Get_Char_Index(ft_face, glyph - 0xf000);
++    if (!(ret = get_char_index(font, glyph)))
++        ret = get_char_index(font, glyph - 0xf000);
+ 
+     return ret;
+ }
+@@ -2200,7 +2262,7 @@
+         }
+         return TRUE;
+     }
+-    *glyph = pFT_Get_Char_Index( ft_face, *glyph );
++    *glyph = get_char_index( font, *glyph );
+     return TRUE;
+ }
+ 
+@@ -3093,9 +3155,9 @@
+ }
+ 
+ /*************************************************************
+- * freetype_get_glyph_outline
++ * get_glyph_outline_uncached
+  */
+-static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT format,
++static UINT get_glyph_outline_uncached( struct gdi_font *font, UINT glyph, UINT format,
+                                         GLYPHMETRICS *lpgm, ABC *abc, UINT buflen, void *buf,
+                                         const MAT2 *lpmat, BOOL tategaki )
+ {
+@@ -3229,6 +3291,164 @@
+     }
+ }
+ 
++/* VNBox: rendered-glyph cache. GDI text games (BGI/Ethornell) call GetGlyphOutline for every glyph
++ * of their text every frame, and each call loaded, hinted and rasterized the glyph again. Entries
++ * hold the metrics, the return value and (once asked with a buffer) the bitmap of GGO_BITMAP and
++ * GGO_GRAY*_BITMAP glyphs, keyed by font, glyph index, format, matrix and tategaki; LRU, bounded by
++ * bytes. The font's entries go with the font (freetype_destroy_font). Callers hold font_lock. */
++struct glyph_cache_entry
++{
++    struct list         lru;
++    struct list         bucket;
++    struct gdi_font    *font;
++    UINT                glyph;
++    UINT                format;
++    BOOL                tategaki;
++    BOOL                has_mat;
++    MAT2                mat;  /* zero when no matrix */
++    GLYPHMETRICS        gm;
++    ABC                 abc;
++    UINT                needed;  /* return value */
++    BYTE               *bits;    /* needed bytes, NULL until asked with a buffer */
++};
++
++#define GLYPH_CACHE_BUCKETS 4096
++#define GLYPH_CACHE_MAX_BYTES (4 * 1024 * 1024)
++static struct list glyph_cache_lru = LIST_INIT( glyph_cache_lru );
++static struct list glyph_cache_buckets[GLYPH_CACHE_BUCKETS];
++
++static SIZE_T glyph_cache_entry_size( const struct glyph_cache_entry *entry )
++{
++    return sizeof(*entry) + (entry->bits ? entry->needed : 0);
++}
++
++static void glyph_cache_free( struct glyph_cache_entry *entry )
++{
++    glyph_cache_bytes -= glyph_cache_entry_size( entry );
++    ((struct font_private_data *)entry->font->private)->glyph_cache_entries--;
++    list_remove( &entry->lru );
++    list_remove( &entry->bucket );
++    free( entry->bits );
++    free( entry );
++}
++
++static void glyph_cache_remove_font( struct gdi_font *font )
++{
++    struct glyph_cache_entry *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &glyph_cache_lru, struct glyph_cache_entry, lru )
++        if (entry->font == font) glyph_cache_free( entry );
++}
++
++static BOOL glyph_cache_format( UINT format )
++{
++    switch (format & ~GGO_UNHINTED)
++    {
++    case GGO_BITMAP:
++    case GGO_GRAY2_BITMAP:
++    case GGO_GRAY4_BITMAP:
++    case GGO_GRAY8_BITMAP:
++    case WINE_GGO_GRAY16_BITMAP:
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/*************************************************************
++ * freetype_get_glyph_outline
++ */
++static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT format,
++                                        GLYPHMETRICS *lpgm, ABC *abc, UINT buflen, void *buf,
++                                        const MAT2 *lpmat, BOOL tategaki )
++{
++    struct font_private_data *data = font->private;
++    struct glyph_cache_entry *entry;
++    struct list *bucket;
++    MAT2 mat;
++    UINT ret, hash;
++
++    glyph_stats_print();
++    if (lpmat) glyph_stats.with_mat++;
++    if (!glyph_cache_format( format ))
++    {
++        glyph_stats.other[format & 0x1f]++;
++        return get_glyph_outline_uncached( font, glyph, format, lpgm, abc, buflen, buf, lpmat, tategaki );
++    }
++
++    if (lpmat) mat = *lpmat;
++    else memset( &mat, 0, sizeof(mat) );
++    hash = ((UINT)(UINT_PTR)font >> 4) * 0x9e3779b1 ^ glyph * 0x85ebca6b ^ format ^ tategaki << 12;
++    bucket = &glyph_cache_buckets[(hash ^ hash >> 16) % GLYPH_CACHE_BUCKETS];
++    if (!bucket->next) list_init( bucket );
++
++    LIST_FOR_EACH_ENTRY( entry, bucket, struct glyph_cache_entry, bucket )
++    {
++        if (entry->font != font || entry->glyph != glyph || entry->format != format ||
++            entry->tategaki != tategaki || entry->has_mat != !!lpmat ||
++            memcmp( &entry->mat, &mat, sizeof(mat) )) continue;
++
++        /* same results as get_glyph_outline_uncached: metrics first, then the bitmap helpers' checks */
++        if (buf && buflen && !entry->bits && entry->needed && entry->needed <= buflen) break;  /* bitmap not cached yet */
++        list_remove( &entry->lru );
++        list_add_head( &glyph_cache_lru, &entry->lru );
++        glyph_stats.hit[format & 0x1f]++;
++        *lpgm = entry->gm;
++        *abc = entry->abc;
++        if (!buf || !buflen) return entry->needed;
++        if (!entry->needed || entry->needed > buflen) return GDI_ERROR;
++        memcpy( buf, entry->bits, entry->needed );
++        memset( (BYTE *)buf + entry->needed, 0, buflen - entry->needed );
++        return entry->needed;
++    }
++    if (&entry->bucket == bucket) entry = NULL;
++    glyph_stats.miss[format & 0x1f]++;
++
++    ret = get_glyph_outline_uncached( font, glyph, format, lpgm, abc, buflen, buf, lpmat, tategaki );
++    if (ret == GDI_ERROR) return ret;
++
++    if (!entry)
++    {
++        if (!(entry = calloc( 1, sizeof(*entry) ))) return ret;
++        entry->font = font;
++        entry->glyph = glyph;
++        entry->format = format;
++        entry->tategaki = tategaki;
++        entry->has_mat = !!lpmat;
++        entry->mat = mat;
++        entry->gm = *lpgm;
++        entry->abc = *abc;
++        entry->needed = ret;
++        list_add_head( bucket, &entry->bucket );
++        list_add_head( &glyph_cache_lru, &entry->lru );
++        glyph_cache_bytes += glyph_cache_entry_size( entry );
++        data->glyph_cache_entries++;
++    }
++    else
++    {
++        list_remove( &entry->lru );
++        list_add_head( &glyph_cache_lru, &entry->lru );
++    }
++
++    /* A GGO_BITMAP glyph loaded as a bitmap (no outline) leaves bytes of the buffer untouched, so
++     * only bitmaps the helpers fully wrote (outlines, or gray levels, which clear the buffer) are kept. */
++    if (buf && buflen && !entry->bits && ret == entry->needed &&
++        ((format & ~GGO_UNHINTED) != GGO_BITMAP || data->ft_face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) &&
++        (entry->bits = malloc( ret )))
++    {
++        memcpy( entry->bits, buf, ret );
++        glyph_cache_bytes += ret;
++    }
++
++    while (glyph_cache_bytes > GLYPH_CACHE_MAX_BYTES)
++    {
++        struct glyph_cache_entry *old = LIST_ENTRY( list_tail( &glyph_cache_lru ), struct glyph_cache_entry, lru );
++        if (old == entry) break;
++        glyph_cache_free( old );
++        glyph_stats.evicted++;
++    }
++    return ret;
++}
++
+ /*************************************************************
+  * freetype_set_bitmap_text_metrics
+  */
