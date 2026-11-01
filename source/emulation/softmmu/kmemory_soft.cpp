@@ -41,7 +41,92 @@ KMemoryData* getMemData(KMemory* memory) {
     return memory->data;
 }
 
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+#include <unistd.h>
+#include <mutex>
+
+bool kmemoryIsZero(const void* p, size_t len) {
+    const U32* w = (const U32*)p;
+    for (size_t i = 0, n = len / sizeof(U32); i < n; i++) {
+        if (w[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Zero [p, p+len) one host page at a time, writing only pages that hold
+// something: reading an untouched page keeps it non-resident.
+static void zeroTouchedPages(void* p, size_t len) {
+    U8* b = (U8*)p;
+    U8* end = b + len;
+    while (b < end) {
+        U8* next = (U8*)(((uintptr_t)b + K_PAGE_SIZE) & ~(uintptr_t)K_PAGE_MASK);
+        if (next > end) {
+            next = end;
+        }
+        if (!kmemoryIsZero(b, next - b)) {
+            ::memset(b, 0, next - b);
+        }
+        b = next;
+    }
+}
+
+// Freed blocks keep their tables all zero (see ~KMemoryData), so a reused
+// block needs no memset either.
+static std::mutex tablePoolMutex;
+static std::vector<void*> tablePool;
+
+static void* tablePoolAlloc() {
+    {
+        std::lock_guard<std::mutex> lock(tablePoolMutex);
+        if (!tablePool.empty()) {
+            void* p = tablePool.back();
+            tablePool.pop_back();
+            return p;
+        }
+    }
+    // Memory above the break has never been touched (dlmalloc never trims
+    // on Emscripten), so it is zero and not yet resident.
+    size_t size = sizeof(KMemoryData) + K_PAGE_SIZE;
+    void* raw = sbrk((intptr_t)size);
+    if (raw == (void*)-1) {
+        raw = ::malloc(size);
+        if (!raw) {
+            kpanic("KMemoryData: out of memory");
+        }
+        ::memset(raw, 0, size);
+    }
+    return (void*)(((uintptr_t)raw + K_PAGE_MASK) & ~(uintptr_t)K_PAGE_MASK);
+}
+
+static void tablePoolFree(void* p) {
+    std::lock_guard<std::mutex> lock(tablePoolMutex);
+    tablePool.push_back(p);
+}
+
+bool KMemoryData::isPageEntryZero(U32 page) const {
+    static_assert(sizeof(MMU) == sizeof(U32), "MMU entry is one word on wasm");
+    U32 entry;
+    ::memcpy(&entry, &mmu[page], sizeof(entry));
+    return !entry
+#ifdef BOXEDWINE_WASM_JIT
+        && !wasmReadPageBase[page] && !wasmWritePageBase[page]
+#endif
+        ;
+}
+#endif
+
 KMemoryData* KMemoryData::create(KMemory* memory) {
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+    void* storage = tablePoolAlloc();
+    try {
+        return new (storage) KMemoryData(memory, ramPageUseLinearMemory());
+    } catch (...) {
+        tablePoolFree(storage);
+        throw;
+    }
+#endif
     if (ramPageUseLinearMemoryAdjacent()) {
         U8* linearMemoryBase = nullptr;
         U8* storage = ramPageReserveLinearMemoryData(sizeof(KMemoryData), &linearMemoryBase);
@@ -66,6 +151,11 @@ void KMemoryData::destroy(KMemoryData* data) {
     if (!data) {
         return;
     }
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+    data->~KMemoryData();
+    tablePoolFree(data);
+    return;
+#endif
     if (data->linearMemoryAdjacent) {
         U8* storage = (U8*)data;
         data->~KMemoryData();
@@ -83,12 +173,14 @@ KMemoryData::KMemoryData(KMemory* memory, bool enableLinearMemory, U8* adjacentL
         linearMemoryMappings.resize(K_NUMBER_OF_PAGES);
         linearMemoryBacking = backing;
     }
+#ifndef BOXEDWINE_ZERO_PAGE_TABLES // pool blocks arrive with zeroed tables
     ::memset(mmu, 0, sizeof(mmu));
+#endif
 #ifdef BOXEDWINE_MEM_CACHE
     ::memset(readCache, 0, sizeof(readCache));
     ::memset(writeCache, 0, sizeof(writeCache));
 #endif
-#ifdef BOXEDWINE_WASM_JIT
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_ZERO_PAGE_TABLES)
     ::memset(wasmReadPageBase,  0, sizeof(wasmReadPageBase));
     ::memset(wasmWritePageBase, 0, sizeof(wasmWritePageBase));
 #endif
@@ -128,6 +220,14 @@ KMemoryData::~KMemoryData() {
     }
     linearMemoryBase = nullptr;
     setPagesInvalid(0, K_NUMBER_OF_PAGES);
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+    // the block goes back to the pool: leave its tables all zero
+    zeroTouchedPages(mmu, sizeof(mmu));
+#ifdef BOXEDWINE_WASM_JIT
+    zeroTouchedPages(wasmReadPageBase, sizeof(wasmReadPageBase));
+    zeroTouchedPages(wasmWritePageBase, sizeof(wasmWritePageBase));
+#endif
+#endif
 }
 
 bool KMemoryData::isPageValid(U32 page) {
@@ -152,10 +252,19 @@ void KMemoryData::onPageChanged(U32 index) {
     // falls to the existing helper. ramPageGet returns a U8* into the
     // Emscripten heap, which under wasm32 is just a 32-bit linear-mem
     // offset; the truncation is identity.
-    wasmReadPageBase[index]  = mmu[index].canReadRam
+    U32 readBase  = mmu[index].canReadRam
         ? (U32)(uintptr_t)ramPageGet((RamPage)mmu[index].ramIndex) : 0;
-    wasmWritePageBase[index] = mmu[index].canWriteRam
+    U32 writeBase = mmu[index].canWriteRam
         ? (U32)(uintptr_t)ramPageGet((RamPage)mmu[index].ramIndex) : 0;
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+    // writing an unchanged 0 would make an untouched table page resident
+    if (wasmReadPageBase[index] != readBase)
+#endif
+        wasmReadPageBase[index] = readBase;
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+    if (wasmWritePageBase[index] != writeBase)
+#endif
+        wasmWritePageBase[index] = writeBase;
 #endif
     if (linearMemoryBase && !resettingLinearMemory) {
         U32 pageCount = ramPageLinearMemoryPageCount();
@@ -455,6 +564,11 @@ void KMemoryData::setPagesInvalid(U32 page, U32 pageCount, bool codeAlreadyPrepa
         resettingLinearMemory = true;
     }
     for (U32 i = page; i < page + pageCount; i++) {
+#ifdef BOXEDWINE_ZERO_PAGE_TABLES
+        if (isPageEntryZero(i)) {
+            continue; // already invalid; don't touch its table page
+        }
+#endif
         if (codeAlreadyPrepared && mmu[i].getPageType() == PageType::Code) {
             opCache.clearPageWriteCounts(i);
         }
