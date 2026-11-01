@@ -297,7 +297,7 @@ static void profReport(double now) {
             const char* c = path.c_str();
             const char* slash = strrchr(c, '/');
             mod = slash ? slash + 1 : c;
-            off = p->getModuleEip(eip);
+            off = path == "Unknown" ? eip : p->getModuleEip(eip); // unmapped code (a PE image Wine read into memory): its address
         }
         auto key = std::make_tuple(pname, mod, off & ~0xFu);
         for (auto* m : {&win, &cum}) {
