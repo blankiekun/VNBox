@@ -12,6 +12,8 @@ What changed:
 
 Build (Emscripten 5.0.7): `make -C project/emscripten jitJspi`; output in `project/emscripten/Build/JitJspi`. `vn/build-jp-overlay.sh <root fs zip> jp.zip` builds the overlay (needs Docker for `vn/build-wine-boot.sh` and `vn/build-wine-ntsync.sh`).
 
+Tuning options (URL params such as `fps=30`) are listed in `vnbox-options.json` next to the engine, for wrappers to build menus from: [docs/VNBox-Options.md](docs/VNBox-Options.md).
+
 Releases: pushing a `v*` tag runs `.github/workflows/vn-release.yml`, which publishes the web build, an unmodified mirror of the root fs `TinyCore15Wine11.0-web.zip` it was tested with (from boxedwine.org; build scripts in `tools/buildWine`), `jp.zip` and `SHA256SUMS`.
 
 Merging upstream: keep our ntsync (`vn/build-wine-ntsync.sh`, the ntsync device) over upstream's `feat/ntsync`. In JSPI builds a call from the page into wasm that touches files may only run inside `boxedwine_tick`, so queue it for the next tick the way `boxedwineCDRomInsert` does (`devcdrom.cpp`).

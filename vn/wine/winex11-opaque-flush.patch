@@ -1,0 +1,16 @@
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -1819,8 +1819,12 @@
+         copy_image_byteswap( color_info, src, dst, width_bytes, width_bytes, dirty->bottom - dirty->top,
+                              surface->byteswap, mapping, ~0u, alpha_bits );
+     }
+-    else if (alpha_bits)
++    else if (alpha_bits && window_surface->alpha_bits != -1)
+     {
++        /* VNBox: a window without layered alpha (alpha_bits -1) is opaque: the X server VNBox
++         * emulates never reads the alpha byte of such a window, so setting it in every pixel of
++         * every flush (the hottest loop of GDI games that redraw the whole window each frame)
++         * is skipped. Layered windows still get their alpha. */
+         int x, y, stride = ximage->bytes_per_line / sizeof(ULONG);
+         ULONG *ptr = (ULONG *)dst + dirty->top * stride;
+ 

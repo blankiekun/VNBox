@@ -18,6 +18,9 @@
 
 #include "boxedwine.h"
 #include "x11.h"
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#endif
 
 XDrawable::XDrawable(U32 width, U32 height, U32 depth, const VisualPtr& visual, bool isWindow, bool isPBuffer) : id(XServer::getNextId()), isWindow(isWindow), isPBuffer(isPBuffer), depth(depth), visual(visual), w(width), h(height) {
 	data = nullptr;
@@ -122,6 +125,42 @@ int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage*
 	return copyImageData(thread, gc, image->data, image->bytes_per_line, image->bits_per_pixel, src_x, src_y, dest_x, dest_y, width, height);
 }
 
+// n bytes equal? 64 at a time with wasm SIMD (emscripten's memcmp is a byte loop, and a U64 loop
+// made the compare of an 800x600 frame cost more than the copy it saves)
+static bool sameBytes(const U8* a, const U8* b, U32 n) {
+	U32 i = 0;
+#ifdef __wasm_simd128__
+	for (; i + 64 <= n; i += 64) {
+		v128_t d = wasm_v128_or(wasm_v128_xor(wasm_v128_load(a + i), wasm_v128_load(b + i)),
+			wasm_v128_xor(wasm_v128_load(a + i + 16), wasm_v128_load(b + i + 16)));
+		d = wasm_v128_or(d, wasm_v128_or(wasm_v128_xor(wasm_v128_load(a + i + 32), wasm_v128_load(b + i + 32)),
+			wasm_v128_xor(wasm_v128_load(a + i + 48), wasm_v128_load(b + i + 48))));
+		if (wasm_v128_any_true(d)) return false;
+	}
+#endif
+	for (; i + 8 <= n; i += 8) {
+		U64 x, y;
+		memcpy(&x, a + i, 8);
+		memcpy(&y, b + i, 8);
+		if (x != y) return false;
+	}
+	for (; i < n; i++) {
+		if (a[i] != b[i]) return false;
+	}
+	return true;
+}
+
+// guest bytes at src equal to the host bytes at dst
+static bool sameAsGuest(KMemory* memory, U32 src, const U8* dst, U32 len) {
+	bool same = true;
+	memory->performOnMemory(src, len, true, [&same, &dst](U8* ram, U32 n) {
+		same = sameBytes(ram, dst, n);
+		dst += n;
+		return same;
+	});
+	return same;
+}
+
 int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U32 data, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height) {
 	if (bits_per_pixel != this->visual->bits_per_rgb) {
 		return BadMatch;
@@ -148,14 +187,24 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 	U32 copyPerLine = (bits_per_pixel * width + 7) / 8;
 
 	if (!gc || gc->values.function == GXcopy) {
+		// Games that redraw every frame put the same picture again and again: rows equal to what the
+		// drawable holds are not copied, and an image that changed nothing does not mark it dirty (no
+		// composite, no present compare).
+		bool changed = false;
 		for (U32 y = 0; y < height; y++) {
 			if (!memory->canRead(src, copyPerLine)) {
+				if (changed) setDirty();
 				return BadValue;
 			}
-			memory->memcpy(dst, src, copyPerLine);
+			if (!sameAsGuest(memory, src, dst, copyPerLine)) {
+				memory->memcpy(dst, src, copyPerLine);
+				changed = true;
+			}
 			src += bytes_per_line;
 			dst += this->bytes_per_line;
 		}
+		if (changed) setDirty();
+		return Success;
 	} else if (gc->values.function == GXxor && bits_per_pixel == 32) {
 		for (U32 y = 0; y < height; y++) {
 			if (!memory->canRead(src, copyPerLine)) {

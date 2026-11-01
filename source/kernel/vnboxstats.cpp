@@ -19,6 +19,7 @@
 // stats=1 / prof=1 (vnboxstats.h): the counters, what fills them from the scheduler, syscalls and GL calls,
 // and (emscripten) the main loop's per-tick accounting and the [stats] / [prof] console lines.
 #include "boxedwine.h"
+#include "vnboxparam.h"
 #include "vnboxstats.h"
 #include "vnboxwinereq.h"
 #ifdef BOXEDWINE_HOST_WINED3D
@@ -300,7 +301,7 @@ static void profReport(double now) {
             const char* c = path.c_str();
             const char* slash = strrchr(c, '/');
             mod = slash ? slash + 1 : c;
-            off = p->getModuleEip(eip);
+            off = path == "Unknown" ? eip : p->getModuleEip(eip); // unmapped code (a PE image Wine read into memory): its address
         }
         auto key = std::make_tuple(pname, mod, off & ~0xFu);
         for (auto* m : {&win, &cum}) {
@@ -346,8 +347,8 @@ void vnboxStatsTick(int askedMs) {
     static bool statsChecked = false;
     if (!statsChecked) {
         statsChecked = true;
-        vnboxProfOn = EM_ASM_INT({ return vnboxParam("prof") === "1" ? 1 : 0; }) != 0;
-        vnboxStats.on = EM_ASM_INT({ return vnboxParam("stats") === "1" ? 1 : 0; }) != 0;
+        vnboxProfOn = vnboxUrlIs("prof", "1");
+        vnboxStats.on = vnboxUrlIs("stats", "1");
         if (vnboxStats.on) {
             char js[512];
             statsJsPart(js, sizeof(js), 1); // starts the JS side's counting

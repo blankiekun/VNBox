@@ -1,0 +1,14 @@
+diff --git a/dlls/wineoss.drv/oss.c b/dlls/wineoss.drv/oss.c
+index bcdcc72..94562a2 100644
+--- a/dlls/wineoss.drv/oss.c
++++ b/dlls/wineoss.drv/oss.c
+@@ -69,7 +69,8 @@ struct oss_stream
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(oss);
+ 
+-static const REFERENCE_TIME def_period = 100000;
++/* VNBox: a 20 ms period (Wine: 10 ms) halves the audio thread wake-ups; every guest wake costs the single browser thread */
++static const REFERENCE_TIME def_period = 200000;
+ static const REFERENCE_TIME min_period = 50000;
+ 
+ static ULONG_PTR zero_bits = 0;
