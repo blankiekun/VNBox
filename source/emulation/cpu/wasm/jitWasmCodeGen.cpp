@@ -10337,8 +10337,9 @@ void JitWasmCodeGen::emitFastX87RoundByMode(U32 src, U32 dst) {
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Load((U32)offsetof(CPU, fpu.round));
     m_emitter.emitLocalSet(mode);
-    m_emitter.emitLocalGet(src); m_emitter.emitOp(WASM_F64_TRUNC);
+    // select(a, b, c) = c ? a : b
     m_emitter.emitLocalGet(src); m_emitter.emitOp(WASM_F64_CEIL);
+    m_emitter.emitLocalGet(src); m_emitter.emitOp(WASM_F64_TRUNC);
     m_emitter.emitLocalGet(mode); m_emitter.emitI32Const(ROUND_Up); m_emitter.emitOp(WASM_I32_EQ);
     m_emitter.emitOp(WASM_SELECT);
     m_emitter.emitLocalSet(dst);
