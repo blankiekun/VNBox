@@ -10214,6 +10214,11 @@ RegPtr JitWasmCodeGen::fpuRegToInt32(FPURegPtr fpuRegSrc, bool truncate) {
     auto result = getTmpReg();
     if (truncate) {
         m_emitter.emitLocalGet(fpuRegSrc->hardwareReg());
+    } else if (fastX87()) {
+        U32 rounded = allocF64Scratch();
+        emitFastX87RoundByMode(fpuRegSrc->hardwareReg(), rounded);
+        m_emitter.emitLocalGet(rounded);
+        freeF64Scratch(rounded);
     } else {
         U32 rounded = allocF64Scratch();
         RegPtr round = readCPU(JitWidth::b32, (U32)offsetof(CPU, fpu.round));
@@ -10263,6 +10268,95 @@ void JitWasmCodeGen::regToFpuReg64(FPURegPtr dst, RegPtr src) {
 }
 #endif
 
+// Fast x87 switch (URL fastX87=0|1|2, default 1; node tests: env FASTX87).
+// 1 gives the same results as 0 without branches; 2 drops checks (opt-in only,
+// fails testJit). Read once at the first compile. See JitFPU::fastX87.
+static int g_wasmFastX87 = -1;
+int JitWasmCodeGen::fastX87() const {
+    if (g_wasmFastX87 < 0) {
+        g_wasmFastX87 = EM_ASM_INT({
+            var v = typeof vnboxParam === "function" ? vnboxParam("fastX87") : null;
+            if (v == null && typeof process !== "undefined" && process.env) v = process.env.FASTX87;
+            v = (v == null || v === "") ? 1 : parseInt(v, 10);
+            return v >= 0 && v <= 2 ? v : 1;
+        });
+        klog_fmt("[vnbox] fast x87 level %d (fastX87)", g_wasmFastX87);
+    }
+    return g_wasmFastX87;
+}
+
+void JitWasmCodeGen::roundFpuResultToPrecision(FPURegPtr result) {
+    int level = fastX87();
+    if (level >= 2) return;
+    if (level == 0) { JitFPU::roundFpuResultToPrecision(result); return; }
+    // result = (cw & 0x300) == 0 ? (double)(float)result : result, as a select.
+    U32 r = result->hardwareReg();
+    m_emitter.emitLocalGet(r);
+    m_emitter.emitOp(WASM_F32_DEMOTE_F64);
+    m_emitter.emitOp(WASM_F64_PROMOTE_F32);
+    m_emitter.emitLocalGet(r);
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load((U32)offsetof(CPU, fpu.cw));
+    m_emitter.emitI32Const(0x0300);
+    m_emitter.emitOp(WASM_I32_AND);
+    m_emitter.emitOp(WASM_I32_EQZ);
+    m_emitter.emitOp(WASM_SELECT);
+    m_emitter.emitLocalSet(r);
+}
+
+void JitWasmCodeGen::guardCachedFpuFallback(RegPtr state) {
+    if (fastX87() == 0) { JitFPU::guardCachedFpuFallback(state); return; }
+    // Cold exit arm like dynamic_wait: the fast path keeps its register and
+    // x87 cache mappings instead of spilling at a shared branch boundary.
+    auto savedGpDirty = m_gpDirty;
+    auto savedXmmDirty = m_xmmDirty;
+    auto savedXmmLoaded = m_xmmLoaded;
+    auto savedGpLoaded = m_gpLoaded;
+    auto savedSegLoaded = m_segLoaded;
+    auto savedFpu = fpuStackCache;
+    LazyFlagType savedLazyFlags = currentLazyFlags;
+    pushRegValue(state);
+    m_emitter.emitI32Const(0xff);
+    m_emitter.emitOp(WASM_I32_AND);
+    m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
+    m_emitter.emitIf();
+    emulateSingleOp();
+    blockExit();
+    m_emitter.emitEnd();
+    m_gpDirty = savedGpDirty;
+    m_xmmDirty = savedXmmDirty;
+    m_xmmLoaded = savedXmmLoaded;
+    m_gpLoaded = savedGpLoaded;
+    m_segLoaded = savedSegLoaded;
+    fpuStackCache = savedFpu;
+    currentLazyFlags = savedLazyFlags;
+}
+
+void JitWasmCodeGen::emitFastX87RoundByMode(U32 src, U32 dst) {
+    // round: 0 nearest, 1 down, 2 up, 3 chop. Pick with selects, no branches.
+    U32 mode = allocScratch();
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load((U32)offsetof(CPU, fpu.round));
+    m_emitter.emitLocalSet(mode);
+    // select(a, b, c) = c ? a : b
+    m_emitter.emitLocalGet(src); m_emitter.emitOp(WASM_F64_CEIL);
+    m_emitter.emitLocalGet(src); m_emitter.emitOp(WASM_F64_TRUNC);
+    m_emitter.emitLocalGet(mode); m_emitter.emitI32Const(ROUND_Up); m_emitter.emitOp(WASM_I32_EQ);
+    m_emitter.emitOp(WASM_SELECT);
+    m_emitter.emitLocalSet(dst);
+    m_emitter.emitLocalGet(src); m_emitter.emitOp(WASM_F64_FLOOR);
+    m_emitter.emitLocalGet(dst);
+    m_emitter.emitLocalGet(mode); m_emitter.emitI32Const(ROUND_Down); m_emitter.emitOp(WASM_I32_EQ);
+    m_emitter.emitOp(WASM_SELECT);
+    m_emitter.emitLocalSet(dst);
+    m_emitter.emitLocalGet(src); m_emitter.emitOp(WASM_F64_NEAREST);
+    m_emitter.emitLocalGet(dst);
+    m_emitter.emitLocalGet(mode); m_emitter.emitOp(WASM_I32_EQZ);
+    m_emitter.emitOp(WASM_SELECT);
+    m_emitter.emitLocalSet(dst);
+    freeScratch(mode);
+}
+
 void JitWasmCodeGen::updateFPURounding() {
 }
 
@@ -10270,6 +10364,14 @@ void JitWasmCodeGen::restoreFPURounding() {
 }
 
 void JitWasmCodeGen::roundFPUToInt64(FPURegPtr src) {
+    if (fastX87()) {
+        U32 rounded = allocF64Scratch();
+        emitFastX87RoundByMode(src->hardwareReg(), rounded);
+        m_emitter.emitLocalGet(rounded);
+        m_emitter.emitLocalSet(src->hardwareReg());
+        freeF64Scratch(rounded);
+        return;
+    }
     RegPtr round = readCPU(JitWidth::b32, (U32)offsetof(CPU, fpu.round));
     IfNot(JitWidth::b32, round); {
         m_emitter.emitLocalGet(src->hardwareReg());
