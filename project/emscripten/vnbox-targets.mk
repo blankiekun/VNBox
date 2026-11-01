@@ -13,3 +13,14 @@ jitJspi: export ASSET_FILES := boxedwine.css fsfs.js boxedwine-shell.js $(ZIP_AS
 
 jitJspi:
 	@$(MAKE) $(BUILD_PHASE)
+
+# jitJspi plus chained-hop counters ([hops] lines with stats=1: same/cross-module hops per exit kind). Measurement only.
+.PHONY: jitJspiHops
+jitJspiHops: export BUILD_DIR := Build/JitJspiHops
+jitJspiHops: export EXTRA_CPP_FLAGS := -DBOXEDWINE_WASM_JIT -DBOXEDWINE_JSPI -DBOXEDWINE_WASM_JIT_HOPCOUNT $(WASM_JIT_SIMD_FLAG)
+jitJspiHops: export SHELL_FILE := shell.html
+jitJspiHops: export EXTRA_LD_FLAGS := -sJSPI --js-library=lazyfs-jspi-lib.js $(WASM_JIT_SIMD_FLAG) -sALLOW_TABLE_GROWTH $(RUNTIME_MEMORY_FLAGS) -sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,wasmTable,HEAPU32$(JIT_CCALL_EXPORTS) -sEXPORTED_FUNCTIONS=_main,_wasm_jit_import_from_file,_wasm_jit_set_persistence_active,_wasm_jit_set_record_active,_malloc,_free,_boxedwine_tick
+jitJspiHops: export ASSET_FILES := boxedwine.css fsfs.js boxedwine-shell.js $(ZIP_ASSET_FILES)
+
+jitJspiHops:
+	@$(MAKE) $(BUILD_PHASE)

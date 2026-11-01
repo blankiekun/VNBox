@@ -967,6 +967,7 @@ public:
     U32 m_manifestNext2Target = 0;
     U32 m_manifestJumpTarget = 0;
     U32 m_manifestNext1Count = 0;
+    U32 m_hopKind = 3; // hop-count builds (BOXEDWINE_WASM_JIT_HOPCOUNT): exit kind of the next chain
     U32 m_manifestNext2Count = 0;
     U32 m_manifestJumpCount = 0;
     struct ForwardTarget {
