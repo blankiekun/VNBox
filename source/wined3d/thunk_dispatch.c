@@ -145,7 +145,18 @@ uint32_t wd3d_dispatch(uint32_t id)
         return r;
     }
     case WD3D_ID_wined3d_decoder_begin_frame: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
-    case WD3D_ID_wined3d_decoder_create: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
+    case WD3D_ID_wined3d_decoder_create:
+    {
+        uint32_t a1 = wd3d_arg(1);
+        uint32_t a2 = wd3d_arg(2);
+        uint32_t a3 = wd3d_arg(3);
+        uint32_t na2 = 1;
+        struct wined3d_decoder_desc* pa2 = a2 ? (struct wined3d_decoder_desc*)wd3d_read_array(a2, na2, sizeof(struct wined3d_decoder_desc)) : NULL;
+        struct wined3d_decoder* ha3 = a3 ? (struct wined3d_decoder*)(uintptr_t)wd3d_read32(a3) : NULL;
+        uint32_t r = (uint32_t)wined3d_decoder_create((struct wined3d_device*)(uintptr_t)a1, pa2, a3 ? &ha3 : NULL);
+        if (a3) wd3d_write32(a3, (uint32_t)(uintptr_t)ha3);
+        return r;
+    }
     case WD3D_ID_wined3d_decoder_decode: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
     case WD3D_ID_wined3d_decoder_decref: return wd3d_not_forwarded(id, 0);
     case WD3D_ID_wined3d_decoder_end_frame: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
@@ -835,8 +846,23 @@ uint32_t wd3d_dispatch(uint32_t id)
     }
     case WD3D_ID_wined3d_device_get_swapchain: return wd3d_not_forwarded(id, 0);
     case WD3D_ID_wined3d_device_get_swapchain_count: return wd3d_not_forwarded(id, 0);
-    case WD3D_ID_wined3d_device_get_video_decode_profile: return wd3d_not_forwarded(id, 0x80004001u /* E_NOTIMPL */);
-    case WD3D_ID_wined3d_device_get_video_decode_profile_count: return wd3d_not_forwarded(id, 0);
+    case WD3D_ID_wined3d_device_get_video_decode_profile:
+    {
+        uint32_t a1 = wd3d_arg(1);
+        uint32_t a2 = wd3d_arg(2);
+        uint32_t a3 = wd3d_arg(3);
+        uint32_t na3 = 1;
+        GUID* pa3 = a3 ? (GUID*)wd3d_read_array(a3, na3, sizeof(GUID)) : NULL;
+        uint32_t r = (uint32_t)wined3d_device_get_video_decode_profile((struct wined3d_device*)(uintptr_t)a1, (unsigned int)(uintptr_t)a2, pa3);
+        if (pa3) wd3d_write(a3, pa3, na3 * sizeof(GUID));
+        return r;
+    }
+    case WD3D_ID_wined3d_device_get_video_decode_profile_count:
+    {
+        uint32_t a1 = wd3d_arg(1);
+        uint32_t r = (uint32_t)wined3d_device_get_video_decode_profile_count((struct wined3d_device*)(uintptr_t)a1);
+        return r;
+    }
     case WD3D_ID_wined3d_device_get_wined3d:
     {
         uint32_t a1 = wd3d_arg(1);

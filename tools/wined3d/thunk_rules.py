@@ -65,11 +65,12 @@ HAND = {
 
 # In the phase-2 import set but not forwarded yet (video decoding, GDI interop, budget events): logged once and
 # answered with the default.
+# The decoder's create and profile queries are forwarded: the GL adapter has the null decoder (no profiles,
+# wined3d_decoder_create answers E_INVALIDARG as the guest wined3d does), so no decoder object reaches the rest.
 NOT_YET = {
-    'wined3d_decoder_begin_frame', 'wined3d_decoder_create', 'wined3d_decoder_decode', 'wined3d_decoder_decref',
+    'wined3d_decoder_begin_frame', 'wined3d_decoder_decode', 'wined3d_decoder_decref',
     'wined3d_decoder_end_frame', 'wined3d_decoder_extension', 'wined3d_decoder_get_buffer',
     'wined3d_decoder_output_view_create', 'wined3d_decoder_output_view_decref',
-    'wined3d_device_get_video_decode_profile', 'wined3d_device_get_video_decode_profile_count',
     'wined3d_texture_get_dc', 'wined3d_texture_release_dc',
     'wined3d_adapter_register_budget_change_notification',
     'wined3d_adapter_unregister_budget_change_notification',
