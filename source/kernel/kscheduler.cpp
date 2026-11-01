@@ -265,6 +265,8 @@ extern U64 sysCallTime;
 U64 elapsedTimeMIPS;
 U64 elapsedInstructionsMIPS;
 
+U64 vnboxSliceLimitUs = 9000; // guest time one runSlice may use (the main loop lowers it under a CPU cap)
+
 bool runSlice() {    
     runTimers();
 
@@ -285,7 +287,7 @@ bool runSlice() {
     U64 now = sliceStart; // one clock read per thread turn: each turn starts where the last ended
     U64 nextTimerCheck = 1000;
 
-    while (!scheduledThreads.isEmpty() && elapsedTime<9000) {
+    while (!scheduledThreads.isEmpty() && elapsedTime<vnboxSliceLimitUs) {
         // Yielding threads can stay runnable while waiting for a sleeping
         // worker. Service its timer during the slice, not just every 9 ms.
         if (elapsedTime >= nextTimerCheck) {
@@ -343,7 +345,7 @@ bool runSlice() {
             scheduledThreads.addToBack(node);
         }
     }
-    if (!scheduledThreads.isEmpty()) {
+    if (!scheduledThreads.isEmpty() && vnboxSliceLimitUs >= 9000) { // a capped slice is short on purpose
         if (elapsedTime>11000) {
             contextTime = decreaseContextTime(contextTime);
         } else if (elapsedTime<9500) {

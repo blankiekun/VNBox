@@ -18,6 +18,13 @@
 
 #include "boxedwine.h"
 #include "kinotify.h"
+#include "vnboxidle.h"
+
+// a guest read of game or system files (not devices, pipes, /proc): loading, which a CPU cap must not slow
+static inline void fileWake(FsOpenNode* openFile) {
+    FsNode::Type type = openFile->node->type;
+    if (type == FsNode::Type::File || type == FsNode::Type::Zip) vnboxIdleWake(VNBOX_WAKE_FILE);
+}
 
 void KWritebackResult::recordIo(U64 bytes, S32 error) {
     if (bytes > std::numeric_limits<U64>::max() - bytesWritten) {
@@ -143,6 +150,7 @@ U32 KFile::writeNative(U8* buffer, U32 len) {
 
 U32 KFile::read(KThread* thread, U32 buffer, U32 len) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(filePosMutex);
+    fileWake(this->openFile);
     return this->openFile->read(thread, buffer, len);
 }
 
@@ -169,6 +177,7 @@ U32 KFile::stat(KProcess* process, U32 address, bool is64) {
 }
 
 U32 KFile::map(KThread* thread, U32 address, U32 len, S32 prot, S32 flags, U64 off) {
+    fileWake(this->openFile);
     return this->openFile->map(thread, address, len, prot, flags, off);
 }
 
@@ -204,6 +213,7 @@ S64 KFile::length() {
 }
 
 U32 KFile::pread(KThread* thread, U32 buffer, S64 offset, U32 len) {
+    fileWake(this->openFile);
     if (offset < 0) {
         return -K_EINVAL;
     }

@@ -25,6 +25,7 @@
 #include <SDL_opengl.h>
 #include "../glcommon.h"
 #include "vnboxstats.h"
+#include "vnboxidle.h"
 
 #include <SDL.h>
 #include "knativesystem.h"
@@ -1130,6 +1131,7 @@ void KOpenGLSdl::glSwapBuffers(KThread* thread, const std::shared_ptr<XDrawable>
 #endif
         presented = true;
 #ifdef __EMSCRIPTEN__
+        vnboxIdleWake(VNBOX_WAKE_GL); // GL frames are not compared: each one counts as a change
         if (vnboxStats.on) {
             vnboxStats.presentsGl++;
             vnboxStats.presentGlMs += emscripten_get_now() - swapStart;

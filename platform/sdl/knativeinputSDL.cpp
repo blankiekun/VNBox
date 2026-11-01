@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 #include <SDL.h>
 #include "../../source/x11/x11.h"
+#include "vnboxidle.h"
 #include "sdlcallback.h"
 #include "devinput.h"
 #include "knativeinputSDL.h"
@@ -909,6 +910,9 @@ bool KNativeInputSDL::processEvents() {
         } else
 #endif
         {
+            if (e.type == SDL_MOUSEMOTION) vnboxIdleWake(VNBOX_WAKE_MOTION);
+            else if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP || e.type == SDL_KEYDOWN || e.type == SDL_KEYUP
+                    || e.type == SDL_MOUSEWHEEL || e.type == SDL_FINGERDOWN || e.type == SDL_FINGERUP || e.type == SDL_TEXTINPUT) vnboxIdleWake(VNBOX_WAKE_INPUT);
             if (vnboxStats.on) {
                 if (e.type == SDL_MOUSEMOTION) vnboxStats.motions++;
                 else if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP || e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) vnboxStats.inputs++;

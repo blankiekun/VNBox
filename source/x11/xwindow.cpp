@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 #include "x11.h"
 #include "knativesystem.h"
+#include "vnboxidle.h"
 
 void XWindowChanges::read(KMemory* memory, U32 address) {
 	x = memory->readd(address);
@@ -894,6 +895,7 @@ void XWindow::setDirty() {
 
 int XWindow::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U32 data, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height) {
 	int result = XDrawable::copyImageData(thread, gc, data, bytes_per_line, bits_per_pixel, src_x, src_y, dst_x, dst_y, width, height);
+	vnboxIdleFramePut();
 	if (result != Success || !gc || gc->values.subwindow_mode != IncludeInferiors) {
 		return result;
 	}

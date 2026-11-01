@@ -26,6 +26,7 @@
 #include "../../x11/x11.h"
 #include <algorithm>
 #include "kdspaudio_math.h"
+#include "vnboxidle.h"
 
 #ifdef BOXEDWINE_MULTI_THREADED
 #include "knativethread.h"
@@ -101,12 +102,84 @@ static int mainLoopTimingValue = -1;
 #ifdef BOXEDWINE_JSPI
 static int jspiTickDelay = -1; // what boxedwine_tick returns: ms to wait before the next tick, -1 = next message
 #endif
-extern U32 vnboxClockBackoff; // syscall.cpp
 static U32 idleWaitMs = 16; // the idleWait= URL param: longest idle wait while no guest timer is due sooner
+
+extern U64 vnboxSliceLimitUs; // kscheduler.cpp
+extern U32 vnboxClockBackoff; // syscall.cpp
+static U32 capWaitMs; // > 0: the tick stopped at a CPU cap; the next one starts with the next cap frame
+
+// CPU caps (vnboxidle.h). A cap frame is 1/60 s; the guest may run cap% of it, then the tick waits for the next.
+static U32 idleCapPct = 20, idleCapAreaPct = 2, cpuCapPct = 0;
+static constexpr U64 CAP_FRAME_US = 16667;
+static constexpr U64 IDLE_DELAY_US = 750000;   // small changes only for this long before the idle cap starts
+static constexpr U64 INPUT_GRACE_US = 3000000; // after a click or key: the text it starts revealing runs at full speed
+static constexpr U64 CHANGE_WINDOW_US = 1000000;
+static U64 idleAwakeUntilUs = 15000000;        // boot runs uncapped (file reads keep it so after this)
+static U64 capFrameStartUs, capFrameUsedUs;
+// union of the small changes in the current change window: small changes that add up (text revealed
+// letter by letter, a sprite moving) count as a change, one that keeps hitting the same spot (a cursor) does not
+static unsigned changeX0, changeY0, changeX1, changeY1;
+static U64 changeWindowStartUs;
+
+void vnboxIdleWake(VnboxWake reason) {
+    U64 until = KSystem::getMicroCounter() + (reason == VNBOX_WAKE_INPUT ? INPUT_GRACE_US : IDLE_DELAY_US);
+    if (until > idleAwakeUntilUs) idleAwakeUntilUs = until;
+    if (vnboxStats.on) {
+        switch (reason) {
+        case VNBOX_WAKE_INPUT: case VNBOX_WAKE_MOTION: vnboxStats.capWakeInput++; break;
+        case VNBOX_WAKE_FRAME: vnboxStats.capWakeFrame++; break;
+        case VNBOX_WAKE_FILE: vnboxStats.capWakeFile++; break;
+        case VNBOX_WAKE_AUDIO: vnboxStats.capWakeAudio++; break;
+        case VNBOX_WAKE_GL: vnboxStats.capWakeGl++; break;
+        }
+    }
+}
+
+void vnboxIdleFrameChanged(unsigned x0, unsigned y0, unsigned x1, unsigned y1, unsigned width, unsigned height) {
+    U64 limit = (U64)width * height * idleCapAreaPct / 100;
+    if ((U64)(x1 - x0) * (y1 - y0) > limit) {
+        vnboxIdleWake(VNBOX_WAKE_FRAME);
+        return;
+    }
+    U64 now = KSystem::getMicroCounter();
+    if (now - changeWindowStartUs > CHANGE_WINDOW_US || changeX1 <= changeX0) {
+        changeWindowStartUs = now;
+        changeX0 = x0; changeY0 = y0; changeX1 = x1; changeY1 = y1;
+    } else {
+        changeX0 = std::min(changeX0, x0); changeY0 = std::min(changeY0, y0);
+        changeX1 = std::max(changeX1, x1); changeY1 = std::max(changeY1, y1);
+    }
+    if ((U64)(changeX1 - changeX0) * (changeY1 - changeY0) > limit) {
+        changeX1 = changeX0; // start a new window
+        vnboxIdleWake(VNBOX_WAKE_FRAME);
+        return;
+    }
+    if (vnboxStats.on) vnboxStats.smallFrames++;
+}
+
+// The idle cap paces the guest by its frames: after it puts a frame on screen, it waits so that the time it
+// ran for that frame is idleCap% of the frame interval, but at most idleCapHold= ms (default 50: a cursor
+// that blinks on time still shows each blink, ~0.1 s late at worst in a game that needs a whole frame to draw). A guest that runs without putting frames
+// (loading, decoding) is not held; one that busy-waits on the clock gets the clock back-off instead.
+bool vnboxFramePut;
+static U64 idleMaxHoldUs = 50000; // idleCapHold=<ms>
+static U64 idleHoldUntilUs, idleFrameUsedUs;
 
 static void updateMainLoopTiming(bool idle) {
     int mode = EM_TIMING_SETTIMEOUT;
     int value = 1;
+    if (capWaitMs) {
+        // held at a CPU cap: wait for the next cap frame (timers due meanwhile run then, a bit late)
+        value = (int)capWaitMs;
+#ifdef BOXEDWINE_JSPI
+        jspiTickDelay = value;
+#else
+        if (mode != mainLoopTimingMode || value != mainLoopTimingValue) emscripten_set_main_loop_timing(mode, value);
+#endif
+        mainLoopTimingMode = mode;
+        mainLoopTimingValue = value;
+        return;
+    }
 #ifdef BOXEDWINE_WASM_JIT
     // Keep yielding to the browser between slices without paying the nested
     // timer delay while guest work is available. Sleeping guests still use a
@@ -198,8 +271,42 @@ void mainloop() {
     U32 t;
     U32 count=0;
     BString mipsTitle;
+    capWaitMs = 0;
     while (1) {
         bool ran;
+        U64 sliceStart = KSystem::getMicroCounter();
+        bool idleCapped = idleCapPct && sliceStart >= idleAwakeUntilUs;
+        if (idleCapped && sliceStart < idleHoldUntilUs) {
+            U64 left = idleHoldUntilUs - sliceStart;
+            capWaitMs = (U32)std::max<U64>((left + 999) / 1000, 1);
+            if (vnboxStats.on) { vnboxStats.capTicks++; vnboxStats.capHeldMs += left / 1000.0; }
+            if (!KNativeSystem::getCurrentInput()->processEvents()) { // input still lifts the cap at once
+                KNativeSystem::cleanup();
+                return;
+            }
+            break;
+        }
+        U32 cap = cpuCapPct;
+        if (cap) {
+            if (sliceStart - capFrameStartUs >= CAP_FRAME_US) {
+                capFrameStartUs = sliceStart;
+                capFrameUsedUs = 0;
+            }
+            U64 budget = CAP_FRAME_US * cap / 100;
+            if (capFrameUsedUs >= budget) {
+                U64 left = capFrameStartUs + CAP_FRAME_US - sliceStart;
+                capWaitMs = (U32)std::max<U64>((left + 999) / 1000, 1);
+                if (vnboxStats.on) { vnboxStats.capTicks++; vnboxStats.capHeldMs += left / 1000.0; }
+                if (!KNativeSystem::getCurrentInput()->processEvents()) { // input still lifts the cap at once
+                    KNativeSystem::cleanup();
+                    return;
+                }
+                break;
+            }
+            vnboxSliceLimitUs = budget - capFrameUsedUs;
+        } else {
+            vnboxSliceLimitUs = 9000;
+        }
         try {
             ran = runSlice();
         } catch (...) {
@@ -207,6 +314,16 @@ void mainloop() {
                 throw;
             }
             break;
+        }
+        U64 sliceEnd = KSystem::getMicroCounter();
+        if (ran) {
+            if (cap) capFrameUsedUs += sliceEnd - sliceStart;
+            idleFrameUsedUs += sliceEnd - sliceStart;
+        }
+        if (vnboxFramePut) {
+            vnboxFramePut = false;
+            if (idleCapped) idleHoldUntilUs = sliceEnd + std::min(idleFrameUsedUs * (100 - idleCapPct) / idleCapPct, idleMaxHoldUs);
+            idleFrameUsedUs = 0;
         }
 
         KNativeSystem::tick();
@@ -282,7 +399,15 @@ bool doMainLoop() {
     // (the non-worklet audio path).
 #ifndef BOXEDWINE_MULTI_THREADED
     idleWaitMs = vnboxUrlInt("idleWait", idleWaitMs, 1, 1000);
-    vnboxClockBackoff = vnboxUrlInt("clockBackoff", 1, 0, 1); // syscall.cpp
+    // CPU caps (vnboxidle.h) and the clock poll back-off (syscall.cpp)
+    idleCapPct = vnboxUrlInt("idleCap", idleCapPct, 0, 100);
+    idleCapAreaPct = vnboxUrlInt("idleCapArea", idleCapAreaPct, 0, 100);
+    cpuCapPct = vnboxUrlInt("cpuCap", cpuCapPct, 0, 100);
+    idleMaxHoldUs = 1000ull * vnboxUrlInt("idleCapHold", (int)(idleMaxHoldUs / 1000), 1, 1000);
+    if (idleCapPct == 100) idleCapPct = 0;
+    if (cpuCapPct == 100) cpuCapPct = 0;
+    vnboxClockBackoff = vnboxUrlInt("clockBackoff", 1, 0, 1);
+    if (idleCapPct || cpuCapPct) klog_fmt("CPU caps: idle %u%% (changes under %u%% of the screen count as idle), fixed %u%%", idleCapPct, idleCapAreaPct, cpuCapPct);
 #endif
     XServer::drawFps = vnboxUrlInt("fps", XServer::drawFps, 0, 240); // frames shown per second at most, 0 = unlocked
     U32 period = vnboxUrlInt("audioPeriod", KDspAudioMath::sdlPeriodFrames, 256, 16384);

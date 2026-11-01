@@ -30,6 +30,7 @@
 #define DSP_BUFFER_SIZE (1024*32)
 #ifdef __EMSCRIPTEN__
 #include "vnboxstats.h"
+#include "vnboxidle.h"
 // Kept queued beyond one SDL period, for Wine's 10 ms timer arriving late on the busy main thread.
 #define SDL_RESERVE_MS 30
 #endif
@@ -356,6 +357,7 @@ public:
 		bool shortfall = have < (U32)len;
 		if (shortfall && this->wasFull) {
 			vnboxStats.audioUnderruns++; // ran dry mid-stream
+			vnboxIdleWake(VNBOX_WAKE_AUDIO);
 		}
 		this->wasFull = !shortfall;
 		if (this->got.format == AUDIO_F32SYS && have) {
@@ -447,9 +449,19 @@ static void ensureDrainTimer() {
 	}
 }
 
+// a playing stream whose queue fell from over half to under a quarter: the guest feeding it must run at full speed
+static bool audioQueueWasHigh;
+
 bool KDspAudioSdl::isWriteReady() {
 #ifdef __EMSCRIPTEN__
-	return this->getGuestQueuedAudioSizeWant() + getFragmentSize() <= getBufferCapacity();
+	U32 queued = this->getGuestQueuedAudioSizeWant(), capacity = getBufferCapacity();
+	if (queued * 2 >= capacity) {
+		audioQueueWasHigh = true;
+	} else if (audioQueueWasHigh && queued * 4 < capacity) {
+		audioQueueWasHigh = false;
+		vnboxIdleWake(VNBOX_WAKE_AUDIO);
+	}
+	return queued + getFragmentSize() <= capacity;
 #else
 	U32 capacity = getWriteCapacityWant();
 	if (!capacity) {

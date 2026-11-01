@@ -50,6 +50,7 @@
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
 #include <emscripten/emscripten.h>
 #include "vnboxstats.h"
+#include "vnboxidle.h"
 
 #ifdef __EMSCRIPTEN_PTHREADS__
 // bwCallHandlerCmd comes from boxedwine-multithreaded-helper.js.
@@ -131,6 +132,27 @@ static bool sameFrame(const U8* a, const U8* b, U32 bytes) {
         if (x[i] != y[i]) return false;
     }
     return memcmp(a + (bytes & ~7u), b + (bytes & ~7u), bytes & 7) == 0;
+}
+
+// the box [x0,x1) x [y0,y1) holding every pixel that differs between two frames of 4-byte pixels (they differ)
+static void changedBox(const U32* a, const U32* b, U32 width, U32 height, U32& x0, U32& y0, U32& x1, U32& y1) {
+    y0 = 0;
+    while (y0 < height && !memcmp(a + y0 * width, b + y0 * width, width * 4)) y0++;
+    y1 = height;
+    while (y1 > y0 && !memcmp(a + (y1 - 1) * width, b + (y1 - 1) * width, width * 4)) y1--;
+    x0 = width;
+    x1 = 0;
+    for (U32 y = y0; y < y1; y++) {
+        const U32* p = a + y * width;
+        const U32* q = b + y * width;
+        U32 l = 0, r = width;
+        while (l < x0 && p[l] == q[l]) l++;
+        if (l == width) continue;
+        while (r > x1 && r > l && p[r - 1] == q[r - 1]) r--;
+        if (l < x0) x0 = l;
+        if (r > x1) x1 = r;
+    }
+    if (x1 < x0) x1 = x0;
 }
 
 static bool useEmscriptenSoftwareRenderer(bool skipRenderer) {
@@ -609,6 +631,13 @@ void KNativeScreenSDL::present() {
             if (vnboxStats.on) vnboxStats.skippedSame++;
         }
         if (emscriptenSoftwareDirty) {
+            if (emscriptenShownValid && emscriptenShownWidth == screenWidth() && emscriptenShownHeight == screenHeight()) {
+                U32 x0, y0, x1, y1;
+                changedBox((const U32*)emscriptenSoftwareBuffer, (const U32*)emscriptenShownFrame, screenWidth(), screenHeight(), x0, y0, x1, y1);
+                vnboxIdleFrameChanged(x0, y0, x1, y1, screenWidth(), screenHeight());
+            } else {
+                vnboxIdleWake(VNBOX_WAKE_FRAME);
+            }
             double presentStart = vnboxStats.on ? emscripten_get_now() : 0;
             bool shown = boxedwinePresentSoftwareFrame((const U32*)emscriptenSoftwareBuffer, screenWidth(), screenHeight());
             if (vnboxStats.on) vnboxStats.presentSwMs += emscripten_get_now() - presentStart;
