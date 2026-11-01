@@ -18,6 +18,9 @@
 
 #include "boxedwine.h"
 #include "x11.h"
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#endif
 
 XDrawable::XDrawable(U32 width, U32 height, U32 depth, const VisualPtr& visual, bool isWindow, bool isPBuffer) : id(XServer::getNextId()), isWindow(isWindow), isPBuffer(isPBuffer), depth(depth), visual(visual), w(width), h(height) {
 	data = nullptr;
@@ -122,22 +125,38 @@ int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage*
 	return copyImageData(thread, gc, image->data, image->bytes_per_line, image->bits_per_pixel, src_x, src_y, dest_x, dest_y, width, height);
 }
 
-// guest bytes equal to host ones, 8 bytes at a time (emscripten's memcmp is a byte loop)
+// n bytes equal? 64 at a time with wasm SIMD (emscripten's memcmp is a byte loop, and a U64 loop
+// made the compare of an 800x600 frame cost more than the copy it saves)
+static bool sameBytes(const U8* a, const U8* b, U32 n) {
+	U32 i = 0;
+#ifdef __wasm_simd128__
+	for (; i + 64 <= n; i += 64) {
+		v128_t d = wasm_v128_or(wasm_v128_xor(wasm_v128_load(a + i), wasm_v128_load(b + i)),
+			wasm_v128_xor(wasm_v128_load(a + i + 16), wasm_v128_load(b + i + 16)));
+		d = wasm_v128_or(d, wasm_v128_or(wasm_v128_xor(wasm_v128_load(a + i + 32), wasm_v128_load(b + i + 32)),
+			wasm_v128_xor(wasm_v128_load(a + i + 48), wasm_v128_load(b + i + 48))));
+		if (wasm_v128_any_true(d)) return false;
+	}
+#endif
+	for (; i + 8 <= n; i += 8) {
+		U64 x, y;
+		memcpy(&x, a + i, 8);
+		memcpy(&y, b + i, 8);
+		if (x != y) return false;
+	}
+	for (; i < n; i++) {
+		if (a[i] != b[i]) return false;
+	}
+	return true;
+}
+
+// guest bytes at src equal to the host bytes at dst
 static bool sameAsGuest(KMemory* memory, U32 src, const U8* dst, U32 len) {
 	bool same = true;
 	memory->performOnMemory(src, len, true, [&same, &dst](U8* ram, U32 n) {
-		U32 i = 0;
-		for (; i + 8 <= n; i += 8) {
-			U64 a, b;
-			memcpy(&a, ram + i, 8);
-			memcpy(&b, dst + i, 8);
-			if (a != b) { same = false; return false; }
-		}
-		for (; i < n; i++) {
-			if (ram[i] != dst[i]) { same = false; return false; }
-		}
+		same = sameBytes(ram, dst, n);
 		dst += n;
-		return true;
+		return same;
 	});
 	return same;
 }
