@@ -628,6 +628,9 @@ void KNativeScreenSDL::present() {
             } else if (vnboxStats.on) {
                 vnboxStats.busyDropped++; // kept dirty: shown by the next present
             }
+            if (!shown && XServer::getServer(true)) {
+                XServer::getServer()->isDisplayDirty = true; // no composite comes otherwise when nothing else changes
+            }
         }
     }
 #endif

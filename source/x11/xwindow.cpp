@@ -886,10 +886,9 @@ int XWindow::reparentWindow(const XWindowPtr& parent, S32 x, S32 y) {
 }
 
 void XWindow::setDirty() {
-	if (!isDirty) {
-		isDirty = true;
-		XServer::getServer()->isDisplayDirty = true;
-	}
+	isDirty = true;
+	// always: a window still dirty from before it was mapped (or while hidden) must still schedule a composite
+	XServer::getServer()->isDisplayDirty = true;
 }
 
 int XWindow::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U32 data, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height) {
@@ -1077,6 +1076,7 @@ int XWindow::moveResize(S32 x, S32 y, U32 width, U32 height) {
 	}
 
 	KNativeSystem::moveWindow(shared_from_this());
+	XServer::getServer()->isDisplayDirty = true;
 	
 	configureNotify();
 	// :TODO:
@@ -1127,6 +1127,7 @@ int XWindow::configure(U32 mask, XWindowChanges* changes) {
 		}
 		KNativeSystem::moveWindow(shared_from_this());
 	}
+	XServer::getServer()->isDisplayDirty = true; // moved, resized or restacked
 	configureNotify();
 	if (sizeChanged) {
 		fitToScreen();

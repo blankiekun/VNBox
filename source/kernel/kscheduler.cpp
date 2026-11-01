@@ -270,9 +270,8 @@ bool runSlice() {
 
     XServer* server = XServer::getServer(true);
     if (server) {
-        // a bit of a hack, sometimes popups in Basstour get missed and don't draw
-        // (only while the guest runs; an idle tick still draws a frame the fps cap held back)
-        if (!scheduledThreads.isEmpty()) server->isDisplayDirty = true;
+        // draws only when something changed (XWindow::setDirty, configure, a held-back present);
+        // upstream forced a composite every slice here for missed Basstour popups (setDirty's early return)
         double drawStart = vnboxStatNow();
         server->draw();
         if (!scheduledThreads.isEmpty()) vnboxStatDraw(drawStart); // slice-start calls, as before idle ticks drew

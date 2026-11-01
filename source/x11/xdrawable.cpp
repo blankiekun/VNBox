@@ -122,6 +122,26 @@ int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage*
 	return copyImageData(thread, gc, image->data, image->bytes_per_line, image->bits_per_pixel, src_x, src_y, dest_x, dest_y, width, height);
 }
 
+// guest bytes equal to host ones, 8 bytes at a time (emscripten's memcmp is a byte loop)
+static bool sameAsGuest(KMemory* memory, U32 src, const U8* dst, U32 len) {
+	bool same = true;
+	memory->performOnMemory(src, len, true, [&same, &dst](U8* ram, U32 n) {
+		U32 i = 0;
+		for (; i + 8 <= n; i += 8) {
+			U64 a, b;
+			memcpy(&a, ram + i, 8);
+			memcpy(&b, dst + i, 8);
+			if (a != b) { same = false; return false; }
+		}
+		for (; i < n; i++) {
+			if (ram[i] != dst[i]) { same = false; return false; }
+		}
+		dst += n;
+		return true;
+	});
+	return same;
+}
+
 int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U32 data, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height) {
 	if (bits_per_pixel != this->visual->bits_per_rgb) {
 		return BadMatch;
@@ -148,14 +168,24 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 	U32 copyPerLine = (bits_per_pixel * width + 7) / 8;
 
 	if (!gc || gc->values.function == GXcopy) {
+		// Games that redraw every frame put the same picture again and again: rows equal to what the
+		// drawable holds are not copied, and an image that changed nothing does not mark it dirty (no
+		// composite, no present compare).
+		bool changed = false;
 		for (U32 y = 0; y < height; y++) {
 			if (!memory->canRead(src, copyPerLine)) {
+				if (changed) setDirty();
 				return BadValue;
 			}
-			memory->memcpy(dst, src, copyPerLine);
+			if (!sameAsGuest(memory, src, dst, copyPerLine)) {
+				memory->memcpy(dst, src, copyPerLine);
+				changed = true;
+			}
 			src += bytes_per_line;
 			dst += this->bytes_per_line;
 		}
+		if (changed) setDirty();
+		return Success;
 	} else if (gc->values.function == GXxor && bits_per_pixel == 32) {
 		for (U32 y = 0; y < height; y++) {
 			if (!memory->canRead(src, copyPerLine)) {
