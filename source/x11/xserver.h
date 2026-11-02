@@ -40,6 +40,7 @@ public:
 	void clampPointerToGrab(S32& x, S32& y);
     void mapCapturedMouse(S32& x, S32& y);
     void warpCapturedMouse(S32 x, S32 y);
+    void pointerWarped() { lastMotionValid = false; } // the next browser position is a move again, even the old one
     void resetCapturedMouse();
     void setMouseCursorVisible(bool visible);
     void setMouseFocused(bool focused);
@@ -189,6 +190,11 @@ private:
     CapturedMouse capturedMouse;
     bool mouseCursorVisible = true;
     bool mouseFocused = true;
+    // Where the last MotionNotify put the pointer (screen coords): a browser mousemove at the same place (fake moves
+    // after layout/paint, forwarded copies) is no motion, and an X server sends none (Wine would queue a WM_MOUSEMOVE)
+    S32 lastMotionX = 0, lastMotionY = 0;
+    bool lastMotionValid = false;
+    bool samePointerPos(S32 x, S32 y);
     void configureCapturedMouse(); // Caller holds grabbedMutex.
 
 	U32 extensionXinput2;

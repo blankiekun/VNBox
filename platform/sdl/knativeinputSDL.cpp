@@ -46,7 +46,9 @@
 #include <emscripten/emscripten.h>
 #include <emscripten/em_asm.h>
 
+// These page listeners bypass SDL's queue, so processEvents never counts them: stats=1's input/s and motion/s do it here.
 extern "C" EMSCRIPTEN_KEEPALIVE void boxedwineEmscriptenMouseMove(int x, int y) {
+    if (vnboxStats.on) vnboxStats.motions++;
     KNativeScreenPtr screen = KNativeSystem::getScreen();
     KNativeInputSDLPtr input = screen ? std::static_pointer_cast<KNativeInputSDL>(screen->getInput()) : nullptr;
     if (input) {
@@ -68,6 +70,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void boxedwineEmscriptenPointerLock(U32 enabled)
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void boxedwineEmscriptenMouseButton(U32 down, U32 button, int x, int y) {
+    if (vnboxStats.on) vnboxStats.inputs++;
     KNativeScreenPtr screen = KNativeSystem::getScreen();
     KNativeInputSDLPtr input = screen ? std::static_pointer_cast<KNativeInputSDL>(screen->getInput()) : nullptr;
     if (input) {
@@ -77,6 +80,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void boxedwineEmscriptenMouseButton(U32 down, U3
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void boxedwineEmscriptenKey(U32 sdlScanCode, U32 key, U32 down) {
+    if (vnboxStats.on) vnboxStats.inputs++;
     KNativeScreenPtr screen = KNativeSystem::getScreen();
     KNativeInputPtr input = screen ? screen->getInput() : nullptr;
     if (input) {
