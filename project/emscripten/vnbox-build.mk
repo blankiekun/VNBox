@@ -13,6 +13,8 @@ $(MOVIE_DECODER): vnbox-movie-decoder.c $(PROJDIR)/lib/pl_mpeg/pl_mpeg.h
 
 # Host FreeType, every target (vnbox-freetype.mk).
 include vnbox-freetype.mk
+# Host DIB primitives, every target (vnbox-dibdrv.mk).
+include vnbox-dibdrv.mk
 
 # Host wined3d, only with HOST_WINED3D=1 (vnbox-wined3d.mk).
 include vnbox-wined3d.mk
