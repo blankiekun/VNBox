@@ -25,6 +25,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeClock",
+      "label": "Native clock reads",
+      "description": "Reads QueryPerformanceCounter, timeGetTime and the system time as browser code instead of an emulated system call.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "hotGroup",
       "label": "Hot code groups",
       "description": "Compiles code that runs hot together into one module, so it runs faster.",

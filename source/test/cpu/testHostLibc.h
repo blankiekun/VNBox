@@ -14,5 +14,6 @@ void testHostLibcCopy();
 void testHostLibcCompare();
 void testHostLibcScan();
 void testHostLibcStrtol();
+void testHostClock();
 
 #endif
