@@ -396,6 +396,8 @@ struct WasmJitPendingBlock {
     U32 blockOpCount = 0;
     U32 emulatedLen = 0;
     U32 extraHits = 0;
+    U32 hotCounter = 0xffffffff; // HotGroup: this block's hot-tier entry counter (none: no regrouping)
+    U64 hotGroup = 0; // HotGroup: the hot group it was compiled into
     bool needsMemoryPageArrays = false;
     std::vector<U8> bytes;
     std::vector<U32> relocValues;
@@ -494,6 +496,11 @@ static void retryOldestSealedRequest();
 // block is on the stack) the queued blocks are compiled again, without the counter, into one hot module, and their
 // old slots are freed. A rate rather than a total: only blocks of the loop running now qualify, and they all qualify
 // in the same period, so they share one module. hotGroup=0 (URL) turns it off.
+// Regrouping: a hot set formed over several periods (boot, title, text screen) still ends up in several hot groups,
+// and the loop then hops between them at the cross-instance cost. Hot-group blocks count their entries too (a plain
+// counter, no check); at the end of a period, if the blocks that ran hot span two or more hot groups, or new tier-1
+// blocks got hot next to them, all of them are compiled again into one new hot group. A loop already in one group
+// costs nothing more. Each block is regrouped at most hotRegroup times (URL, default 4; 0 turns regrouping off).
 #define WASM_JIT_HOT_ENTRIES 2048
 #define WASM_JIT_HOT_MAX_BLOCKS 1024
 #define WASM_JIT_HOT_WAIT_MS 1000.0
@@ -507,6 +514,7 @@ struct WasmJitHotEntry {
     DecodedOp* op = nullptr;
     U32 eip = 0;
     int slot = -1;
+    bool regroup = false; // a hot-group block compiled again into the new group
 };
 static std::vector<WasmJitHotEntry> g_wasmJitHotQueue;
 static U64 g_wasmJitHotSubmittedId = 0;
@@ -517,6 +525,24 @@ static int g_wasmJitHotEnabled = -1;
 static U32 g_wasmJitHotEntries = WASM_JIT_HOT_ENTRIES;
 static double g_wasmJitHotWaitMs = WASM_JIT_HOT_WAIT_MS;
 static U32 g_wasmJitHotMaxBlocks = WASM_JIT_HOT_MAX_BLOCKS;
+#define WASM_JIT_HOT_REGROUP_MAX 4
+#define WASM_JIT_HOT_TIER_COUNTERS (1 << 16) // shared on wrap: a collision only makes a block look hot early
+struct WasmJitHotTierBlock {
+    KMemory* memory = nullptr;
+    DecodedOp* op = nullptr;
+    U32 eip = 0;
+    U32 counter = 0;
+    U64 group = 0;
+};
+static U32 g_wasmJitHotTierCounts[WASM_JIT_HOT_TIER_COUNTERS];
+static U32 g_wasmJitHotTierNextCounter = 0;
+static std::unordered_map<int, WasmJitHotTierBlock> g_wasmJitHotTier; // published hot-group blocks, by slot
+static std::unordered_map<U64, U8> g_wasmJitHotRegroups; // (memory, eip) -> times regrouped
+static U32 g_wasmJitHotRegroupMax = WASM_JIT_HOT_REGROUP_MAX;
+static U64 g_wasmJitHotRegroupCount = 0;
+static U64 wasmJitHotRegroupKey(KMemory* memory, U32 eip) {
+    return ((U64)(uintptr_t)memory << 32) | eip;
+}
 
 static bool wasmJitHotEnabled() {
     if (g_wasmJitHotEnabled < 0) {
@@ -530,7 +556,8 @@ static bool wasmJitHotEnabled() {
         if (entries) g_wasmJitHotEntries = (U32)entries;
         if (waitMs >= 0) g_wasmJitHotWaitMs = waitMs;
         if (maxBlocks) g_wasmJitHotMaxBlocks = (U32)maxBlocks;
-        if (g_wasmJitHotEnabled) klog_fmt("[vnbox] hot groups: entries=%u waitMs=%.0f max=%u", g_wasmJitHotEntries, g_wasmJitHotWaitMs, g_wasmJitHotMaxBlocks);
+        g_wasmJitHotRegroupMax = (U32)vnboxUrlInt("hotRegroup", WASM_JIT_HOT_REGROUP_MAX, 0, 255);
+        if (g_wasmJitHotEnabled) klog_fmt("[vnbox] hot groups: entries=%u waitMs=%.0f max=%u regroup=%u", g_wasmJitHotEntries, g_wasmJitHotWaitMs, g_wasmJitHotMaxBlocks, g_wasmJitHotRegroupMax);
 #else
         g_wasmJitHotEnabled = 1;
 #endif
@@ -544,6 +571,7 @@ static U32 wasmJitHotThreshold() {
 }
 
 static void wasmJitHotForgetSlot(int slot) {
+    g_wasmJitHotTier.erase(slot);
     if (g_wasmJitHotQueue.empty()) return;
     g_wasmJitHotQueue.erase(std::remove_if(g_wasmJitHotQueue.begin(), g_wasmJitHotQueue.end(), [slot](const WasmJitHotEntry& e) {
         return e.slot == slot;
@@ -551,6 +579,12 @@ static void wasmJitHotForgetSlot(int slot) {
 }
 
 static void wasmJitHotForgetMemory(KMemory* memory) {
+    for (auto it = g_wasmJitHotTier.begin(); it != g_wasmJitHotTier.end();) {
+        it = it->second.memory == memory ? g_wasmJitHotTier.erase(it) : std::next(it);
+    }
+    for (auto it = g_wasmJitHotRegroups.begin(); it != g_wasmJitHotRegroups.end();) {
+        it = (U32)(it->first >> 32) == (U32)(uintptr_t)memory ? g_wasmJitHotRegroups.erase(it) : std::next(it);
+    }
     if (g_wasmJitHotQueue.empty()) return;
     g_wasmJitHotQueue.erase(std::remove_if(g_wasmJitHotQueue.begin(), g_wasmJitHotQueue.end(), [memory](const WasmJitHotEntry& e) {
         return e.memory == memory;
@@ -4998,6 +5032,12 @@ static void publishWasmJitBlock(WasmJitPendingBlock& pending, int tableIdx) {
     }
 
     claimJitBlockOps(pending.op, pending.blockOpCount, pending.emulatedLen);
+#ifndef BOXEDWINE_MULTI_THREADED
+    if (pending.kind == WasmJitPendingKind::HotGroup && pending.hotCounter < WASM_JIT_HOT_TIER_COUNTERS) {
+        g_wasmJitHotTierCounts[pending.hotCounter] = 0;
+        g_wasmJitHotTier[tableIdx] = {pending.memory, pending.op, pending.address, pending.hotCounter, pending.hotGroup};
+    }
+#endif
     if (vnboxStats.on) vnboxStats.blocksCompiled++; // stats=1, outside the profile build
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
     wasmJitProfileCompiledBlock(pending.blockOpCount);
@@ -5358,6 +5398,33 @@ static void wasmJitHotFlush(CPU* cpu) {
         (e.memory == cpu->memory ? mine : others).push_back(e);
     }
     g_wasmJitHotQueue.swap(others);
+    // Hot-group blocks of this process that ran hot in this period: regroup them with the new hot blocks, or when
+    // they span two or more groups. Already in one group with nothing new: nothing to do.
+    U32 newBlocks = (U32)mine.size();
+    if (g_wasmJitHotRegroupMax) {
+        const U32 threshold = wasmJitHotThreshold();
+        std::vector<WasmJitHotEntry> hotTier;
+        U64 firstGroup = 0;
+        bool spans = false;
+        for (const auto& it : g_wasmJitHotTier) {
+            const WasmJitHotTierBlock& b = it.second;
+            if (b.memory != cpu->memory || g_wasmJitHotTierCounts[b.counter] < threshold) continue;
+            auto regroups = g_wasmJitHotRegroups.find(wasmJitHotRegroupKey(b.memory, b.eip));
+            if (regroups != g_wasmJitHotRegroups.end() && regroups->second >= g_wasmJitHotRegroupMax) continue;
+            if (!firstGroup) firstGroup = b.group;
+            else if (b.group != firstGroup) spans = true;
+            hotTier.push_back({b.memory, b.op, b.eip, it.first, true});
+        }
+        if (!hotTier.empty() && (newBlocks || spans)) {
+            mine.insert(mine.end(), hotTier.begin(), hotTier.end());
+        }
+    }
+    if (mine.empty()) {
+        return;
+    }
+    double startMs = emscripten_get_now();
+    U32 regrouped = 0;
+    const U64 group = g_wasmJitHotModules + 1;
     std::vector<WasmJitBatchEntryId> ids;
     std::vector<void*> oldSlots;
     for (const WasmJitHotEntry& e : mine) {
@@ -5372,9 +5439,19 @@ static void wasmJitHotFlush(CPU* cpu) {
         JitWasmCodeGen* jit = static_cast<JitWasmCodeGen*>(startNewJIT(cpu));
         jit->m_hotTier = true;
         jit->doJIT(e.eip, op);
+        U32 counter = jit->m_hotTierCounter;
         delete jit;
         if (g_wasmJitHotSubmittedId) {
             // Pending now (pfnJitCode cleared): the old slot is unreachable once the group publishes.
+            auto pending = g_wasmJitPendingBlocks.find(g_wasmJitHotSubmittedId);
+            if (pending != g_wasmJitPendingBlocks.end()) {
+                pending->second->hotCounter = counter;
+                pending->second->hotGroup = group;
+            }
+            if (e.regroup) {
+                ++g_wasmJitHotRegroups[wasmJitHotRegroupKey(e.memory, e.eip)];
+                ++regrouped;
+            }
             ids.push_back(g_wasmJitHotSubmittedId);
             oldSlots.push_back((void*)(uintptr_t)(U32)e.slot);
         } else if (op->pfnJitCode == (void*)(uintptr_t)(U32)e.slot && !(op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
@@ -5391,6 +5468,7 @@ static void wasmJitHotFlush(CPU* cpu) {
     request.entries = ids;
     ++g_wasmJitHotModules;
     g_wasmJitHotBlocks += ids.size();
+    if (regrouped) ++g_wasmJitHotRegroupCount;
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopFlushHot = 1;
 #endif
@@ -5399,9 +5477,10 @@ static void wasmJitHotFlush(CPU* cpu) {
     g_hopFlushHot = 0;
 #endif
     clearJitBlock(oldSlots);
-    if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0) {
-        klog_fmt("[WASM JIT hot] group %llu: %u blocks; total %llu blocks, %llu KB", (unsigned long long)g_wasmJitHotModules,
-            (U32)ids.size(), (unsigned long long)g_wasmJitHotBlocks, (unsigned long long)(g_wasmJitHotBytes / 1024));
+    if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0 || (regrouped && g_wasmJitHotRegroupCount <= 16)) {
+        klog_fmt("[WASM JIT hot] group %llu: %u blocks (%u regrouped); total %llu blocks, %llu KB, %.1f ms", (unsigned long long)g_wasmJitHotModules,
+            (U32)ids.size(), regrouped, (unsigned long long)g_wasmJitHotBlocks, (unsigned long long)(g_wasmJitHotBytes / 1024),
+            emscripten_get_now() - startMs);
     }
 }
 
@@ -5418,10 +5497,11 @@ static void wasmJitHotPeriod(CPU* cpu) {
         (U32)g_wasmJitHotQueue.size(), (int)g_wasmJitCompilationPaused, (U32)g_wasmJitSealedRequests.size());
     memset(g_hotDbg, 0, sizeof(g_hotDbg));
 #endif
-    memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
-    if (!g_wasmJitHotQueue.empty()) {
+    if (!g_wasmJitHotQueue.empty() || !g_wasmJitHotTier.empty()) {
         wasmJitHotFlush(cpu);
     }
+    memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
+    memset(g_wasmJitHotTierCounts, 0, sizeof(g_wasmJitHotTierCounts));
 }
 
 static void wasmJitCancelPendingMemory(KMemory* memory) {
@@ -5477,6 +5557,11 @@ void wasmJitTestResetRuntimeBatching() {
     boxedwine_wasm_test_reset_runtime_batching_js();
     g_wasmJitHotQueue.clear();
     memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
+    g_wasmJitHotTier.clear();
+    g_wasmJitHotRegroups.clear();
+    memset(g_wasmJitHotTierCounts, 0, sizeof(g_wasmJitHotTierCounts));
+    g_wasmJitHotRegroupMax = WASM_JIT_HOT_REGROUP_MAX;
+    g_wasmJitHotRegroupCount = 0;
     g_wasmJitHotModules = 0;
     g_wasmJitHotBlocks = 0;
     g_wasmJitHotBytes = 0;
@@ -5491,6 +5576,18 @@ void wasmJitTestSetHotGroups(U32 entries, double waitMs) {
 
 void wasmJitTestHotFlush(CPU* cpu) {
     wasmJitHotFlush(cpu);
+}
+
+void wasmJitTestSetHotRegroup(U32 max) {
+    g_wasmJitHotRegroupMax = max;
+}
+
+void wasmJitTestResetHotCounts() {
+    memset(g_wasmJitHotTierCounts, 0, sizeof(g_wasmJitHotTierCounts));
+}
+
+U64 wasmJitTestHotRegroups() {
+    return g_wasmJitHotRegroupCount;
 }
 
 U32 wasmJitTestHotQueueSize() {
@@ -14905,6 +15002,18 @@ void JitWasmCodeGen::emitHotEntryCounter(DecodedOp* op) {
     m_emitter.emitOp(WASM_I32_ADD);
     m_emitter.emitI32Store(0);
 }
+
+// Hot-group block entry: a plain entry count (load, add, store), read at the end of the period for regrouping.
+void JitWasmCodeGen::emitHotTierCounter() {
+    m_hotTierCounter = g_wasmJitHotTierNextCounter++ & (WASM_JIT_HOT_TIER_COUNTERS - 1);
+    const S32 counter = (S32)(uintptr_t)&g_wasmJitHotTierCounts[m_hotTierCounter];
+    m_emitter.emitI32Const(counter);
+    m_emitter.emitI32Const(counter);
+    m_emitter.emitI32Load(0);
+    m_emitter.emitI32Const(1);
+    m_emitter.emitOp(WASM_I32_ADD);
+    m_emitter.emitI32Store(0);
+}
 #endif
 
 void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
@@ -14936,6 +15045,8 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
 #ifndef BOXEDWINE_MULTI_THREADED
         if (m_chainBlocks && !m_hotTier && wasmJitHotEnabled()) {
             emitHotEntryCounter(op);
+        } else if (m_hotTier && g_wasmJitHotRegroupMax) {
+            emitHotTierCounter();
         }
 #endif
 #ifdef BOXEDWINE_MULTI_THREADED

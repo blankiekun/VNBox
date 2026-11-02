@@ -972,6 +972,9 @@ public:
     // Recompiling a hot block into a hot group (ST): no entry counter, joins the hot batch.
     bool m_hotTier = false;
     void emitHotEntryCounter(DecodedOp* op);
+    // Hot-group blocks: entry counter slot read for regrouping (0xffffffff: none).
+    U32 m_hotTierCounter = 0xffffffff;
+    void emitHotTierCounter();
     // Per-block exit metadata recorded while compiling, exported with the
     // saved module as boxedwine-jit-manifest.json so the offline cache
     // pipeline can build the successor graph for grouping and direct-call
@@ -1350,6 +1353,9 @@ U32 wasmJitTestPendingCount();
 void wasmJitTestSetHotGroups(U32 entries, double waitMs);
 U32 wasmJitTestHotQueueSize();
 void wasmJitTestHotFlush(CPU* cpu);
+void wasmJitTestSetHotRegroup(U32 max);
+void wasmJitTestResetHotCounts();
+U64 wasmJitTestHotRegroups();
 U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
 bool wasmJitTestRelocAllocationTransfer();

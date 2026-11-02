@@ -202,6 +202,129 @@ void testWasmJitHotGroups() {
     }
     wasmJitTestResetRuntimeBatching();
 }
+
+// Hot regrouping: a loop whose hot blocks sit in two hot groups is compiled again into one group, a loop already in
+// one group is left alone, a new hot block pulls the hot group's blocks into the new group, and a block regrouped
+// hotRegroup times stays where it is. Catches: a hot set left split across modules (the cross-instance hop cost
+// stays), regrouping every period (endless recompiles), regrouped code that no longer runs the loop.
+void testWasmJitHotRegroup() {
+    testNewInstruction(0);
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    constexpr U32 blockCount = 8;
+    constexpr U32 blockBytes = 8;
+    constexpr U32 hotEntries = 4;
+    wasmJitTestResetRuntimeBatching();
+    wasmJitTestSetHotGroups(hotEntries, 1e12);
+    for (U32 i = 0; i < blockCount; ++i) {
+        testPushCode8(0x43); // inc ebx
+        testPushCode8(0xb8); testPushCode32((i + 1) * blockBytes); // mov eax,next
+        testPushCode8(0xff); testPushCode8(0xe0); // jmp eax: separate blocks
+    }
+    testPushCode8(0xcd); testPushCode8(0x97);
+    std::vector<DecodedOp*> blocks;
+    for (U32 i = 0; i < blockCount; ++i) {
+        U32 address = TEST_CODE_ADDRESS + i * blockBytes;
+        DecodedOp* op = cpu->getOp(address, 0);
+        startNewJIT(cpu, address, op);
+        if (!op->pfnJitCode || op->pfn != context.process->startJITOp) {
+            testFail("hot regroup test requires compiled block entries");
+            wasmJitTestResetRuntimeBatching();
+            return;
+        }
+        op->runCount = JIT_RUN_COUNT + 1;
+        blocks.push_back(op);
+    }
+    // Runs the chain from block `from` hotEntries times; true if every run reached the end with the right count.
+    auto runHot = [&](U32 from) {
+        bool ok = true;
+        for (U32 n = 0; n < hotEntries; ++n) {
+            cpu->eip.u32 = from * blockBytes;
+            cpu->reg[3].u32 = 0;
+            cpu->nextOp = blocks[from];
+            cpu->yield = false;
+            for (U32 i = 0; i < 4 * blockCount && cpu->nextOp->inst != TestEnd; ++i) {
+                cpu->blockInstructionCount = 0;
+                cpu->run();
+            }
+            ok = ok && cpu->reg[3].u32 == blockCount - from && cpu->nextOp->inst == TestEnd;
+        }
+        return ok;
+    };
+    auto slots = [&]() {
+        std::vector<void*> s;
+        for (DecodedOp* op : blocks) s.push_back(op->pfnJitCode);
+        return s;
+    };
+    auto invalidate = [&](U32 i) { // code changed: the block's slot is freed and it compiles again (tier-1)
+        clearJitBlock({blocks[i]->pfnJitCode});
+        blocks[i]->pfnJitCode = nullptr;
+        blocks[i]->flags &= ~OP_FLAG_JIT;
+        blocks[i]->pfn = NormalCPU::getFunctionForOp(blocks[i]);
+        startNewJIT(cpu, TEST_CODE_ADDRESS + i * blockBytes, blocks[i]);
+        if (!blocks[i]->pfnJitCode) testFail("an invalidated block must compile again");
+    };
+    // Group 1 = blocks 4-7.
+    if (!runHot(4)) testFail("tier-1 blocks must run the chain");
+    wasmJitTestHotFlush(cpu);
+    wasmJitTestResetHotCounts();
+    // Group 2 = blocks 0-3: blocks 4-7 did not count as hot in this period.
+    if (!runHot(0)) testFail("tier-1 and hot-group blocks must run the chain");
+    wasmJitTestResetHotCounts();
+    wasmJitTestHotFlush(cpu);
+    if (wasmJitTestHotModules() != 2 || wasmJitTestHotBlocks() != blockCount || wasmJitTestHotRegroups() != 0) {
+        testFail("the loop must start out split across two hot groups");
+    }
+    // The whole loop runs hot across both groups: one new group.
+    std::vector<void*> before = slots();
+    if (!runHot(0)) testFail("a loop split across hot groups must run the chain");
+    wasmJitTestHotFlush(cpu);
+    if (wasmJitTestHotModules() != 3 || wasmJitTestHotBlocks() != 2 * blockCount || wasmJitTestHotRegroups() != 1) {
+        testFail("hot blocks spanning two hot groups must be compiled into one group");
+    }
+    std::vector<void*> after = slots();
+    for (U32 i = 0; i < blockCount; ++i) {
+        if (!after[i] || after[i] == before[i] || blocks[i]->pfn != context.process->startJITOp) {
+            testFail("a regrouped block must be published at its new slot");
+        }
+    }
+    // Steady loop in one group: nothing is compiled again.
+    wasmJitTestResetHotCounts();
+    if (!runHot(0)) testFail("regrouped blocks must run the chain");
+    wasmJitTestHotFlush(cpu);
+    if (wasmJitTestHotModules() != 3 || slots() != after) {
+        testFail("a hot loop already in one group must not be regrouped");
+    }
+    // A block compiled again (tier-1) that gets hot pulls the hot loop into one new group with it.
+    wasmJitTestResetHotCounts();
+    invalidate(2);
+    if (!runHot(0)) testFail("the loop must run with one block recompiled");
+    if (wasmJitTestHotQueueSize() != 1) testFail("the recompiled tier-1 block must queue at the hot threshold");
+    wasmJitTestHotFlush(cpu);
+    if (wasmJitTestHotModules() != 4 || wasmJitTestHotBlocks() != 3 * blockCount || wasmJitTestHotRegroups() != 2) {
+        testFail("a new hot block must join the hot loop in one new group");
+    }
+    // At the regroup limit, a new hot block gets a group of its own and the loop stays.
+    wasmJitTestSetHotRegroup(1); // every block has been regrouped at least once (counts are per address)
+    wasmJitTestResetHotCounts();
+    invalidate(5);
+    after = slots();
+    if (!runHot(0)) testFail("the loop must run with another block recompiled");
+    wasmJitTestHotFlush(cpu);
+    if (wasmJitTestHotModules() != 5 || wasmJitTestHotBlocks() != 3 * blockCount + 1 || wasmJitTestHotRegroups() != 2) {
+        testFail("blocks at the regroup limit must not be regrouped");
+    }
+    std::vector<void*> last = slots();
+    for (U32 i = 0; i < blockCount; ++i) {
+        if ((i != 5) != (last[i] == after[i])) testFail("only the new hot block may move at the regroup limit");
+    }
+    if (!runHot(0)) testFail("the loop must run after the last flush");
+    cpu->nextOp = nullptr;
+    for (U32 i = 0; i < blockCount; ++i) {
+        context.memory->removeCodeBlock(TEST_CODE_ADDRESS + i * blockBytes, blocks[i], false);
+    }
+    wasmJitTestResetRuntimeBatching();
+}
 #endif
 
 #ifdef BOXEDWINE_MULTI_THREADED
