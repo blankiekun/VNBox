@@ -1,0 +1,13 @@
+--- a/dlls/win32u/dibdrv/primitives.c
++++ b/dlls/win32u/dibdrv/primitives.c
+@@ -8233,3 +8233,10 @@
+     shrink_row_null,
+     halftone_null
+ };
++
++/* VNBox: Boxedwine finds the primitive tables through this export and runs their functions as host
++ * code (a host build of this file); the order is fixed, Boxedwine maps index i to the same table. */
++__attribute__((visibility("default"))) const primitive_funcs *const vnbox_dibdrv_funcs[9] =
++{
++    &funcs_8888, &funcs_32, &funcs_24, &funcs_555, &funcs_16, &funcs_8, &funcs_4, &funcs_1, &funcs_null
++};

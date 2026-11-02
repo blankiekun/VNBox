@@ -238,7 +238,8 @@ enum : U32 {
     LIBC_STRCMP, LIBC_STRNCMP, LIBC_STRCHR, LIBC_STRRCHR, LIBC_STRCPY, LIBC_STRTOL, LIBC_STRTOUL,
     LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_COUNT,
     HOST_ACM = LIBC_COUNT, // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
-    HOST_VORBIS // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
+    HOST_VORBIS, // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
+    HOST_DIBDRV = HOST_VORBIS + 64 // + entry: win32u.so's DIB primitives (hostdibdrv.cpp)
 };
 static const char* const hostLibcNames[LIBC_COUNT] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
@@ -298,6 +299,10 @@ bool hostAcmRun(CPU* cpu);
 static std::atomic<bool> hostAcmAny;
 U32 hostVorbisAt(CPU* cpu, U32 eip); // hostvorbis.cpp
 bool hostVorbisRun(CPU* cpu, U32 fn);
+bool hostDibdrvMapped(KFile* file, std::vector<U32>& offsets); // hostdibdrv.cpp
+U32 hostDibdrvAt(const BString& path, U32 offset);
+bool hostDibdrvRun(CPU* cpu, U32 index);
+static std::atomic<bool> hostDibdrvAny;
 
 // Called by KMemory::mmap for every file mapping; the first libc.so.6 mapped loads the table, a known
 // vorbis.acm adds its DriverProc.
@@ -307,6 +312,12 @@ void hostLibcMapped(KFile* file) {
     if (hostAcmMapped(file, driverProc)) {
         hostLibcPageOffsets[(driverProc & K_PAGE_MASK) >> 3] |= 1 << (driverProc & 7);
         hostAcmAny = true;
+        return;
+    }
+    std::vector<U32> dibOffsets;
+    if (hostDibdrvMapped(file, dibOffsets)) {
+        for (U32 offset : dibOffsets) hostLibcPageOffsets[(offset & K_PAGE_MASK) >> 3] |= 1 << (offset & 7);
+        hostDibdrvAny = true;
         return;
     }
     if (hostLibcState) return;
@@ -329,7 +340,7 @@ void hostLibcMapped(KFile* file) {
 // process, else LIBC_NONE.
 U32 hostLibcAt(CPU* cpu, U32 eip) {
     if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
-    if ((hostLibcState != 1 && !hostAcmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
+    if ((hostLibcState != 1 && !hostAcmAny && !hostDibdrvAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();
     U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
     if (!offset) return LIBC_NONE;
@@ -340,6 +351,7 @@ U32 hostLibcAt(CPU* cpu, U32 eip) {
         }
         return LIBC_NONE;
     }
+    if (U32 dib = hostDibdrvAny ? hostDibdrvAt(name, offset) : 0) return HOST_DIBDRV + dib - 1;
     return hostAcmAny && hostAcmAt(name, offset) ? HOST_ACM : LIBC_NONE;
 }
 
@@ -493,6 +505,7 @@ static bool libcStrtol(KMemory* memory, U32 nptr, U32 endptr, S32 base, bool isS
 // False (nothing changed) means the guest function has to run.
 bool hostLibcRun(CPU* cpu, U32 fn) {
     if (fn == HOST_ACM) return hostAcmRun(cpu);
+    if (fn >= HOST_DIBDRV) return hostDibdrvRun(cpu, fn - HOST_DIBDRV);
     if (fn >= HOST_VORBIS) return hostVorbisRun(cpu, fn - HOST_VORBIS);
     KMemory* memory = cpu->memory;
     if (cpu->getDirection() < 0 || cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF ||
