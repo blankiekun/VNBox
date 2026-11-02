@@ -1167,8 +1167,8 @@ protected:
     void emitBranchBailoutCheck();
     void emitFunctionReturn();
     // Return after cpu->nextOp is set; with m_chainBlocks, first tail-call the next block when the dispatcher would.
-    void emitChainReturn();
-    void emitChainToNextOp();
+    void emitChainReturn(S32 targetLocal = -1, DecodedOp* targetOp = nullptr);
+    void emitChainToNextOp(S32 targetLocal = -1, DecodedOp* targetOp = nullptr);
     void emitBlockExitWithProfile(U32 profileHelperIdx, bool chain = true);
     void coldBlockExit();
     // Bailout check after a slow-path store helper: branches to one shared

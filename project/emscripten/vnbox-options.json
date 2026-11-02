@@ -67,6 +67,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "cheapHop",
+      "label": "Cheaper block jumps",
+      "description": "Jumps between compiled blocks read the next block through the address they already hold instead of loading it again for every check.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "fastX87",
       "label": "Fast x87 maths",
       "description": "How the JIT keeps x87 floating point state: 1 is faster with the same results, 2 skips checks and may break games.",

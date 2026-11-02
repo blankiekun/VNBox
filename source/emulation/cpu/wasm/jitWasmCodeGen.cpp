@@ -1072,6 +1072,22 @@ static bool wasmJitInlineEnabled() {
 #endif
 }
 
+// Block chaining reads the next op through the target the exit already holds (emitChainToNextOp).
+// cheapHop=0 turns it off; tests use BOXEDWINE_WASM_JIT_CHEAP_HOP=0.
+static bool jitCheapHopDisabled() {
+#if defined(__EMSCRIPTEN__) && !defined(__TEST)
+    static int disabled = -1;
+    if (disabled < 0) {
+        disabled = vnboxUrlIs("cheapHop", "0") ? 1 : 0;
+        klog_fmt("[vnbox] jit cheap block hop %s", disabled ? "off (cheapHop=0)" : "on");
+    }
+    return disabled != 0;
+#else
+    const char* value = std::getenv("BOXEDWINE_WASM_JIT_CHEAP_HOP");
+    return value && strcmp(value, "0") == 0;
+#endif
+}
+
 // A block with an inlined callee runs a copy of the callee's code without owning its ops, so code invalidation
 // can't reach it through DecodedOp::blockStart. Keyed by callee page: {callee range -> caller block}.
 struct WasmJitInlineDep {
@@ -13622,7 +13638,7 @@ void JitWasmCodeGen::JumpIfCondition(JitConditional cond, U32 address) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        WASM_JIT_HOP_KIND(0) emitChainReturn();
+        WASM_JIT_HOP_KIND(0) emitChainReturn(targetLocal);
         m_emitter.emitEnd();
         m_emitter.emitEnd();
         freeScratch(targetLocal);
@@ -13636,7 +13652,7 @@ void JitWasmCodeGen::JumpIfCondition(JitConditional cond, U32 address) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitI32Const((S32)(uintptr_t)targetOp);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        WASM_JIT_HOP_KIND(0) emitChainReturn();
+        WASM_JIT_HOP_KIND(0) emitChainReturn(-1, targetOp);
     } else {
         writeEip(address - cpu->seg[CS].address);
         blockExit();
@@ -13720,10 +13736,10 @@ void JitWasmCodeGen::emitFunctionReturn() {
     m_emitter.emitReturn();
 }
 
-void JitWasmCodeGen::emitChainReturn() {
+void JitWasmCodeGen::emitChainReturn(S32 targetLocal, DecodedOp* targetOp) {
     materializeFpuCache();
     syncDirtyRegsToHost();
-    emitChainToNextOp();
+    emitChainToNextOp(targetLocal, targetOp);
     m_emitter.emitReturn();
 }
 
@@ -13732,25 +13748,40 @@ void JitWasmCodeGen::emitChainReturn() {
 // the dispatcher loop makes and tail-call the next block from here; any
 // other case returns to the dispatcher. The budget check also bounds a chain
 // that never returns, and nextOp stays set for the dispatcher either way.
-void JitWasmCodeGen::emitChainToNextOp() {
+// A caller that just stored a known non-null target into cpu->nextOp passes
+// it (a local or a constant op): the sequence then reads the op through it
+// instead of reloading cpu->nextOp per field, and skips the null check.
+void JitWasmCodeGen::emitChainToNextOp(S32 targetLocal, DecodedOp* targetOp) {
 #ifndef BOXEDWINE_MULTI_THREADED
     if (!m_chainBlocks) {
         return;
     }
-    auto nextOp = [this](U32 field, bool half = false) {
-        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-        m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
+    bool known = targetLocal >= 0 || targetOp;
+    if (jitCheapHopDisabled()) {
+        known = false;
+    }
+    auto nextOp = [this, known, targetLocal, targetOp](U32 field, bool half = false) {
+        if (known && targetLocal >= 0) {
+            m_emitter.emitLocalGet((U32)targetLocal);
+        } else if (known) {
+            m_emitter.emitI32Const((S32)(uintptr_t)targetOp);
+        } else {
+            m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+            m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
+        }
         if (half) m_emitter.emitI32Load16U(field); else m_emitter.emitI32Load(field);
     };
     // nextOp && nextOp->pfn == startJITOp && !yield && blockInstructionCount < contextTimeRemaining
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
-    m_emitter.emitOp(WASM_I32_EQZ);
-    m_emitter.emitOp(WASM_I32_EQZ);
     nextOp((U32)offsetof(DecodedOp, pfn));
     m_emitter.emitI32Const((S32)(uintptr_t)(OpCallback)wasmStartJITOp);
     m_emitter.emitOp(WASM_I32_EQ);
-    m_emitter.emitOp(WASM_I32_AND);
+    if (!known) {
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
+        m_emitter.emitOp(WASM_I32_EQZ);
+        m_emitter.emitOp(WASM_I32_EQZ);
+        m_emitter.emitOp(WASM_I32_AND);
+    }
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Load8U((U32)offsetof(CPU, yield));
     m_emitter.emitOp(WASM_I32_EQZ);
@@ -13927,7 +13958,7 @@ void JitWasmCodeGen::blockNext1(U32 eip, DecodedOp* op) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        WASM_JIT_HOP_KIND(1) emitChainReturn();
+        WASM_JIT_HOP_KIND(1) emitChainReturn(targetLocal);
         m_emitter.emitEnd();
         m_emitter.emitEnd();
         m_emitter.emitEnd();
@@ -13953,7 +13984,7 @@ void JitWasmCodeGen::blockNext1(U32 eip, DecodedOp* op) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        WASM_JIT_HOP_KIND(1) emitChainReturn();
+        WASM_JIT_HOP_KIND(1) emitChainReturn(targetLocal);
         m_emitter.emitEnd();
 
         freeScratch(targetLocal);
@@ -13995,7 +14026,7 @@ void JitWasmCodeGen::blockNext2(U32 eip, DecodedOp* op) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        WASM_JIT_HOP_KIND(1) emitChainReturn();
+        WASM_JIT_HOP_KIND(1) emitChainReturn(targetLocal);
         m_emitter.emitEnd();
         m_emitter.emitEnd();
         m_emitter.emitEnd();
@@ -14014,7 +14045,7 @@ void JitWasmCodeGen::blockNext2(U32 eip, DecodedOp* op) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        WASM_JIT_HOP_KIND(1) emitChainReturn();
+        WASM_JIT_HOP_KIND(1) emitChainReturn(targetLocal);
         m_emitter.emitEnd();
         freeScratch(targetLocal);
     }
@@ -14107,7 +14138,7 @@ void JitWasmCodeGen::jumpEip(RegPtr reg) {
     m_emitter.emitI32Store((U32)offsetof(CPU, tmpReg));
     emitProfileSampledCall(HELPER_PROFILE_EXIT_GENERIC);
 #endif
-    WASM_JIT_HOP_KIND(2) emitChainReturn();
+    WASM_JIT_HOP_KIND(2) emitChainReturn((S32)target);
     m_emitter.emitEnd();
     m_emitter.emitEnd();
     m_emitter.emitEnd();
