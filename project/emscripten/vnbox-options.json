@@ -25,6 +25,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeGlyphMetrics",
+      "label": "Native text measuring",
+      "description": "Answers Wine's cached text measuring (text extents, glyph metrics) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "hotGroup",
       "label": "Hot code groups",
       "description": "Compiles code that runs hot together into one module, so it runs faster.",

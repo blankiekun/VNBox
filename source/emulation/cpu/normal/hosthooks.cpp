@@ -238,7 +238,8 @@ enum : U32 {
     LIBC_STRCMP, LIBC_STRNCMP, LIBC_STRCHR, LIBC_STRRCHR, LIBC_STRCPY, LIBC_STRTOL, LIBC_STRTOUL,
     LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_COUNT,
     HOST_ACM = LIBC_COUNT, // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
-    HOST_VORBIS // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
+    HOST_VORBIS, // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
+    HOST_GLYPHM = 0x1000 // + GM_*: win32u.so's text measuring (hostglyphm.cpp)
 };
 static const char* const hostLibcNames[LIBC_COUNT] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
@@ -298,6 +299,10 @@ bool hostAcmRun(CPU* cpu);
 static std::atomic<bool> hostAcmAny;
 U32 hostVorbisAt(CPU* cpu, U32 eip); // hostvorbis.cpp
 bool hostVorbisRun(CPU* cpu, U32 fn);
+bool hostGlyphmMapped(KFile* file, std::vector<U32>& offsets); // hostglyphm.cpp
+U32 hostGlyphmAt(const BString& path, U32 offset);
+bool hostGlyphmRun(CPU* cpu, U32 fn);
+static std::atomic<bool> hostGlyphmAny;
 
 // Called by KMemory::mmap for every file mapping; the first libc.so.6 mapped loads the table, a known
 // vorbis.acm adds its DriverProc.
@@ -308,6 +313,11 @@ void hostLibcMapped(KFile* file) {
         hostLibcPageOffsets[(driverProc & K_PAGE_MASK) >> 3] |= 1 << (driverProc & 7);
         hostAcmAny = true;
         return;
+    }
+    std::vector<U32> glyphmOffsets; // win32u.so; not a return: other hooks may want the same file
+    if (hostGlyphmMapped(file, glyphmOffsets)) {
+        for (U32 offset : glyphmOffsets) hostLibcPageOffsets[(offset & K_PAGE_MASK) >> 3] |= 1 << (offset & 7);
+        hostGlyphmAny = true;
     }
     if (hostLibcState) return;
     const BString& path = file->openFile->node->path;
@@ -329,7 +339,7 @@ void hostLibcMapped(KFile* file) {
 // process, else LIBC_NONE.
 U32 hostLibcAt(CPU* cpu, U32 eip) {
     if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
-    if ((hostLibcState != 1 && !hostAcmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
+    if ((hostLibcState != 1 && !hostAcmAny && !hostGlyphmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();
     U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
     if (!offset) return LIBC_NONE;
@@ -340,6 +350,7 @@ U32 hostLibcAt(CPU* cpu, U32 eip) {
         }
         return LIBC_NONE;
     }
+    if (U32 gm = hostGlyphmAny ? hostGlyphmAt(name, offset) : 0) return HOST_GLYPHM + gm - 1;
     return hostAcmAny && hostAcmAt(name, offset) ? HOST_ACM : LIBC_NONE;
 }
 
@@ -492,6 +503,7 @@ static bool libcStrtol(KMemory* memory, U32 nptr, U32 endptr, S32 base, bool isS
 // above it); on success sets EAX and pops the return address into eip, as the function's `ret` would.
 // False (nothing changed) means the guest function has to run.
 bool hostLibcRun(CPU* cpu, U32 fn) {
+    if (fn >= HOST_GLYPHM) return hostGlyphmRun(cpu, fn - HOST_GLYPHM);
     if (fn == HOST_ACM) return hostAcmRun(cpu);
     if (fn >= HOST_VORBIS) return hostVorbisRun(cpu, fn - HOST_VORBIS);
     KMemory* memory = cpu->memory;

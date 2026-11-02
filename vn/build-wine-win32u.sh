@@ -5,6 +5,7 @@
 # Same source, root fs patches (tools/buildWine/wine_builds.json's 11.0 patches), compiler, flags
 # and configure options as the root fs, with the FreeType, fontconfig and EGL headers win32u is
 # built against (it loads those libraries at run time; no Vulkan, as the web root fs has none).
+# win32u-glyphmetrics-export.patch exports what VNBox needs to answer cached text measuring as host code (hostglyphm.cpp).
 # With WIN32U_PATCHES=0, win32u.so is byte-identical to the root fs's (v0.1.3, checked).
 # Wine is LGPL-2.1: build-jp-overlay.sh ships the patches. Needs Docker.
 # Usage: vn/build-wine-win32u.sh <out dir>  (writes win32u.so)
