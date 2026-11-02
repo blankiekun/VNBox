@@ -129,6 +129,10 @@ public:
     void writew(U32 address, U16 value);
     void writeb(U32 address, U8 value);
     void preflightWrite(U32 address, U32 len);
+    // Host pointer to [address, address + len) when it lies in one page of plain RAM that guest code may read
+    // (write = false) or write (write = true) directly, else nullptr. No side effects: code, copy-on-write,
+    // file-mapped, on-demand and protected pages all give nullptr (callers take their normal path).
+    U8* directRamPtr(U32 address, U32 len, bool write);
 
     BString readString(U32 address);
     BString readStringW(U32 address);
