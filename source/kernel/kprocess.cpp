@@ -2607,6 +2607,10 @@ void KProcess::killAllThreads(KThread* exceptThisThread) {
 }
 
 U32 KProcess::exitgroup(KThread* thread, U32 code) {
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(KSystem::processesCond);
+        this->exiting = true;
+    }
     KProcessPtr parent = KSystem::getProcess(this->parentId);
 
     killAllThreads(thread);
@@ -3855,7 +3859,7 @@ U32 KProcess::signal(U32 signal) {
     if (signal == K_SIGKILL) {
         {
             BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(KSystem::processesCond);
-            if (this->terminated) {
+            if (this->terminated || this->exiting) {
                 return 0;
             }
             this->signaled = K_SIGKILL;
