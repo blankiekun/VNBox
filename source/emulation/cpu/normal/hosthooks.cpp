@@ -236,7 +236,7 @@ void hostHookHit(CPU* cpu) {
 enum : U32 {
     LIBC_NONE, LIBC_MEMCPY, LIBC_MEMMOVE, LIBC_MEMSET, LIBC_MEMCMP, LIBC_MEMCHR, LIBC_STRLEN, LIBC_STRNLEN,
     LIBC_STRCMP, LIBC_STRNCMP, LIBC_STRCHR, LIBC_STRRCHR, LIBC_STRCPY, LIBC_STRTOL, LIBC_STRTOUL,
-    LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_COUNT,
+    LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_MUTEX_LOCK, LIBC_MUTEX_UNLOCK, LIBC_COUNT, // mutex ones: hostmutex.cpp
     HOST_ACM = LIBC_COUNT, // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
     HOST_CLOCK, // + CLOCK_* - 1: ntdll.dll.so's clock reads (hostclock.cpp)
     HOST_VORBIS = HOST_CLOCK + 3, // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
@@ -246,7 +246,8 @@ enum : U32 {
 };
 static const char* const hostLibcNames[LIBC_COUNT] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
-    "strchr", "strrchr", "strcpy", "strtol", "strtoul", "__isoc23_strtol", "__isoc23_strtoul"
+    "strchr", "strrchr", "strcpy", "strtol", "strtoul", "__isoc23_strtol", "__isoc23_strtoul",
+    "pthread_mutex_lock", "pthread_mutex_unlock"
 };
 U32 hostFreetypeFnId(const char* name); // hostfreetype.cpp
 bool hostFreetypeEnabled();
@@ -291,6 +292,10 @@ U32 hostLibcFnId(const char* name) {
 static U32 elf16(const U8* p) { return p[0] | (p[1] << 8); }
 static U32 elf32(const U8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((U32)p[3] << 24); }
 
+bool hostMutexWanted(U32 symValue, U32 index); // hostmutex.cpp
+void hostMutexCheck(KFile* file);
+bool hostMutexRun(CPU* cpu, U32 fn, U32 a0, U32& result);
+
 // Reads the exports from the file's section headers and .dynsym (host-side reads, the guest isn't involved).
 static bool hostLibcParse(KFile* file, HostElfLib& lib) {
     auto read = [file](U64 offset, std::vector<U8>& buf, U32 len) {
@@ -313,7 +318,7 @@ static bool hostLibcParse(KFile* file, HostElfLib& lib) {
             if ((sym[12] & 0xf) != 2 || !shndx || shndx >= shnum || name >= names.size()) continue; // STT_FUNC only (an IFUNC is a resolver)
             if (!memchr(&names[name], 0, names.size() - name)) continue;
             U32 fn = lib.fnId((const char*)&names[name]);
-            if (!fn) continue;
+            if (!fn || (lib.fnId == hostLibcFnId && fn >= LIBC_MUTEX_LOCK && fn < LIBC_COUNT && !hostMutexWanted(value, fn - LIBC_MUTEX_LOCK))) continue;
             const U8* sec = &sh[shndx * 40];
             U64 fileOffset = (U64)value - elf32(sec + 12) + elf32(sec + 16); // st_value - sh_addr + sh_offset
             lib.entries.push_back({ fileOffset, lib.base + fn });
@@ -377,6 +382,7 @@ void hostLibcMapped(KFile* file) {
             lib.state = -1;
             return;
         }
+        if (lib.fnId == hostLibcFnId) hostMutexCheck(file); // before parse: hostMutexWanted needs it
         bool ok = hostLibcParse(file, lib);
         if (ok) lib.path = path;
         lib.state = ok ? 1 : -1;
@@ -417,7 +423,7 @@ static U8* libcRam(KMemory* memory, U32 address, bool write) {
     return ramPageGet((RamPage)mmu.ramIndex) + (address & K_PAGE_MASK);
 }
 
-static bool libcRange(KMemory* memory, U32 address, U32 len, bool write) {
+bool libcRange(KMemory* memory, U32 address, U32 len, bool write) {
     if (!len) return true;
     if ((U64)address + len > 0x100000000ull) return false;
     for (U32 page = address >> K_PAGE_SHIFT; page <= (address + len - 1) >> K_PAGE_SHIFT; page++) {
@@ -676,6 +682,10 @@ bool hostLibcRun(CPU* cpu, U32 fn) {
     case LIBC_STRTOL23:
     case LIBC_STRTOUL23:
         if (!libcStrtol(memory, a0, a1, (S32)a2, fn == LIBC_STRTOL || fn == LIBC_STRTOL23, fn >= LIBC_STRTOL23, result)) return false;
+        break;
+    case LIBC_MUTEX_LOCK:
+    case LIBC_MUTEX_UNLOCK:
+        if (!hostMutexRun(cpu, fn - LIBC_MUTEX_LOCK, a0, result)) return false;
         break;
     default:
         return false;

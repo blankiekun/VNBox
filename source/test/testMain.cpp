@@ -915,6 +915,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostLibcScan, "Test native libc strlen/memchr/strchr/strrchr/strcpy"},
     {testHostLibcStrtol, "Test native libc strtol/strtoul"},
     {testHostClock, "Test native clock reads (QPC, system time)"},
+    {testHostLibcMutex, "Test native pthread_mutex_lock/unlock"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
