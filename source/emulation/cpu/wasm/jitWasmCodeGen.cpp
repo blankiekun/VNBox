@@ -456,10 +456,12 @@ static void registerPendingWasmJitBlock(std::unique_ptr<WasmJitPendingBlock> pen
 U32 g_hopMod[1 << 20];
 U32 g_hopNextMod = 1, g_hopCurMod = 0, g_hopSrcSlot = 0;
 U32 g_hopCnt[24];
-U32 g_hopEntry[0x30];
+U32 g_hopEntry[0x60];
+U32 g_hopHot[8]; // [cross*4 + srcHot*2 + dstHot]
+U32 g_hopCurHot = 0, g_hopFlushHot = 0;
 void hopStatsPrint(double sec) {
     static const char* kinds[4] = { "const", "next", "dyn", "exit" };
-    static const char* regions[3] = { "disp", "vm", "other" };
+    static const char* regions[3] = { "disp", "exe", "other" };
     char buf[2048]; int n = 0; double total = 0, cross = 0;
     for (int i = 0; i < 24; i++) { total += g_hopCnt[i]; if (!(i & 1)) cross += g_hopCnt[i]; }
     n += snprintf(buf + n, sizeof(buf) - n, "[hops] total/s=%.0f cross/s=%.0f |", total / sec, cross / sec);
@@ -467,8 +469,11 @@ void hopStatsPrint(double sec) {
         U32 c = g_hopCnt[(r * 4 + k) * 2], s = g_hopCnt[(r * 4 + k) * 2 + 1];
         if (c + s) n += snprintf(buf + n, sizeof(buf) - n, " %s.%s same=%.0f cross=%.0f", regions[r], kinds[k], s / sec, c / sec);
     }
+    n += snprintf(buf + n, sizeof(buf) - n, " | hot(src>dst) same t1>t1=%.0f t1>hot=%.0f hot>t1=%.0f hot>hot=%.0f cross t1>t1=%.0f t1>hot=%.0f hot>t1=%.0f hot>hot=%.0f",
+        g_hopHot[0] / sec, g_hopHot[1] / sec, g_hopHot[2] / sec, g_hopHot[3] / sec, g_hopHot[4] / sec, g_hopHot[5] / sec, g_hopHot[6] / sec, g_hopHot[7] / sec);
+    memset(g_hopHot, 0, sizeof(g_hopHot));
     n += snprintf(buf + n, sizeof(buf) - n, " | entries:");
-    for (int e = 0; e < 0x30; e++) if (g_hopEntry[e]) n += snprintf(buf + n, sizeof(buf) - n, " %x=%.0f", 0x564e00 + e, g_hopEntry[e] / sec);
+    for (int e = 0; e < 0x60; e++) if (g_hopEntry[e]) n += snprintf(buf + n, sizeof(buf) - n, " %x=%.0f", 0x448b60 + e, g_hopEntry[e] / sec);
     klog_fmt("%s", buf);
     memset(g_hopCnt, 0, sizeof(g_hopCnt)); memset(g_hopEntry, 0, sizeof(g_hopEntry));
 }
@@ -4764,8 +4769,15 @@ static void wasmHelper_movsd32r(CPU* cpu) {
 
 #ifndef BOXEDWINE_MULTI_THREADED
 // A tier-1 block's entry counter reached the hot threshold: queue the block for the next hot group.
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+U32 g_hotDbg[8];
+#endif
 static void wasmHelper_hotBlock(CPU* cpu, U32 eip) {
     DecodedOp* op = cpu->memory->getDecodedOp(eip);
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+    g_hotDbg[0]++;
+    if (!op) g_hotDbg[1]++; else if (!op->pfnJitCode) g_hotDbg[2]++; else if (op->pfn != cpu->thread->process->startJITOp) g_hotDbg[3]++; else if (op->flags2 & OP_FLAG2_WASM_JIT_PENDING) g_hotDbg[4]++;
+#endif
     if (!op || !op->pfnJitCode || op->pfn != cpu->thread->process->startJITOp || (op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
         return;
     }
@@ -4971,7 +4983,7 @@ static void registerPendingWasmJitBlock(std::unique_ptr<WasmJitPendingBlock> pen
 
 static void publishWasmJitBlock(WasmJitPendingBlock& pending, int tableIdx) {
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
-    g_hopMod[(U32)tableIdx & 0xfffff] = g_hopCurMod ? g_hopCurMod : g_hopNextMod++;
+    g_hopMod[(U32)tableIdx & 0xfffff] = (g_hopCurMod ? g_hopCurMod : g_hopNextMod++) | (g_hopCurHot << 31);
 #endif
     std::unique_ptr<U32[]> relocArr = takeWasmJitRelocArray(pending);
     if (relocArr) {
@@ -5111,6 +5123,7 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
 
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopCurMod = g_hopNextMod++;
+    g_hopCurHot = g_hopFlushHot;
 #endif
     for (size_t i = 0; i < liveIds.size(); ++i) {
         auto found = g_wasmJitPendingBlocks.find(liveIds[i]);
@@ -5120,6 +5133,7 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
     }
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopCurMod = 0;
+    g_hopCurHot = 0;
 #endif
     for (WasmJitBatchEntryId id : liveIds) {
         erasePendingWasmJitBlock(id);
@@ -5377,7 +5391,13 @@ static void wasmJitHotFlush(CPU* cpu) {
     request.entries = ids;
     ++g_wasmJitHotModules;
     g_wasmJitHotBlocks += ids.size();
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+    g_hopFlushHot = 1;
+#endif
     queueRuntimeFlushes({request});
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+    g_hopFlushHot = 0;
+#endif
     clearJitBlock(oldSlots);
     if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0) {
         klog_fmt("[WASM JIT hot] group %llu: %u blocks; total %llu blocks, %llu KB", (unsigned long long)g_wasmJitHotModules,
@@ -5393,6 +5413,11 @@ static void wasmJitHotPeriod(CPU* cpu) {
         return;
     }
     g_wasmJitHotPeriodStartMs = now;
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+    klog_fmt("[hotdbg] calls=%u noop=%u nojit=%u pfn=%u pending=%u queue=%u paused=%d sealed=%u", g_hotDbg[0], g_hotDbg[1], g_hotDbg[2], g_hotDbg[3], g_hotDbg[4],
+        (U32)g_wasmJitHotQueue.size(), (int)g_wasmJitCompilationPaused, (U32)g_wasmJitSealedRequests.size());
+    memset(g_hotDbg, 0, sizeof(g_hotDbg));
+#endif
     memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
     if (!g_wasmJitHotQueue.empty()) {
         wasmJitHotFlush(cpu);
@@ -13648,7 +13673,7 @@ void JitWasmCodeGen::emitChainToNextOp() {
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     { // HOPCOUNT: g_hopCnt[base + (mod[src] == mod[dst])]++
         U32 eip = this->startingEip;
-        U32 region = (eip >= 0x564e00 && eip < 0x564e30) ? 0 : (eip >= 0x550000 && eip < 0x570000) ? 1 : 2;
+        U32 region = ((eip >= 0x448b60 && eip < 0x448bc0) || (eip >= 0x401700 && eip < 0x401740)) ? 0 : (eip >= 0x400000 && eip < 0x500000) ? 1 : 2;
         U32 t = allocScratch();
         m_emitter.emitI32Const((S32)(uintptr_t)&g_hopCnt[(region * 4 + m_hopKind) * 2]);
         m_emitter.emitI32Const((S32)(uintptr_t)&g_hopSrcSlot);
@@ -13668,6 +13693,31 @@ void JitWasmCodeGen::emitChainToNextOp() {
         m_emitter.emitI32Load(0);
         m_emitter.emitI32Const(1); m_emitter.emitOp(WASM_I32_ADD);
         m_emitter.emitI32Store(0);
+        // g_hopHot[(mod[src] != mod[dst]) * 4 + hot(src) * 2 + hot(dst)]++
+        U32 a = allocScratch(), b = allocScratch();
+        m_emitter.emitI32Const((S32)(uintptr_t)&g_hopSrcSlot);
+        m_emitter.emitI32Load(0);
+        m_emitter.emitI32Const(0xfffff); m_emitter.emitOp(WASM_I32_AND);
+        m_emitter.emitI32Const(2); m_emitter.emitOp(WASM_I32_SHL);
+        m_emitter.emitI32Load((U32)(uintptr_t)g_hopMod);
+        m_emitter.emitLocalSet(a);
+        nextOp((U32)offsetof(DecodedOp, pfnJitCode));
+        m_emitter.emitI32Const(0xfffff); m_emitter.emitOp(WASM_I32_AND);
+        m_emitter.emitI32Const(2); m_emitter.emitOp(WASM_I32_SHL);
+        m_emitter.emitI32Load((U32)(uintptr_t)g_hopMod);
+        m_emitter.emitLocalSet(b);
+        m_emitter.emitLocalGet(a); m_emitter.emitLocalGet(b); m_emitter.emitOp(WASM_I32_NE);
+        m_emitter.emitI32Const(4); m_emitter.emitOp(WASM_I32_MUL);
+        m_emitter.emitLocalGet(a); m_emitter.emitI32Const(31); m_emitter.emitOp(WASM_I32_SHR_U);
+        m_emitter.emitI32Const(2); m_emitter.emitOp(WASM_I32_MUL); m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitLocalGet(b); m_emitter.emitI32Const(31); m_emitter.emitOp(WASM_I32_SHR_U); m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitI32Const(2); m_emitter.emitOp(WASM_I32_SHL);
+        m_emitter.emitI32Const((S32)(uintptr_t)g_hopHot); m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitLocalTee(a);
+        m_emitter.emitLocalGet(a); m_emitter.emitI32Load(0);
+        m_emitter.emitI32Const(1); m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitI32Store(0);
+        freeScratch(b); freeScratch(a);
         freeScratch(t);
     }
 #endif
@@ -14872,8 +14922,8 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
             m_emitter.emitI32Load((U32)offsetof(DecodedOp, pfnJitCode));
             m_emitter.emitI32Store(0);
             U32 eip = this->startingEip;
-            if (eip >= 0x564e00 && eip < 0x564e30) {
-                U32 a = (U32)(uintptr_t)&g_hopEntry[eip - 0x564e00];
+            if (eip >= 0x448b60 && eip < 0x448bc0) {
+                U32 a = (U32)(uintptr_t)&g_hopEntry[eip - 0x448b60];
                 m_emitter.emitI32Const((S32)a);
                 m_emitter.emitI32Const((S32)a);
                 m_emitter.emitI32Load(0);
