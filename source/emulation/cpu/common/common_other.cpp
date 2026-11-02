@@ -17,6 +17,8 @@
  */
 
 #include "boxedwine.h"
+#include "vnboxparam.h"
+#include "../../softmmu/kmemory_soft.h"
 
 U32 common_bound16(CPU* cpu, U32 reg, U32 address){
 	S16 value = cpu->reg[reg].u16;
@@ -117,7 +119,96 @@ void common_cmpxchg8b(CPU* cpu, U32 address){
     }
 }
 
+// cheapFxsave (URL, default on): FXSAVE/FXRSTOR whose 288 bytes lie in one plain RAM page are done through one host
+// pointer (Wine saves the FPU state this way on every syscall). Same bytes and the same register state as the
+// per-field path below, which still handles page crossings, faults and special pages. cheapFxsave=0 turns it off.
+int g_cheapFxsave = -1;
+
+static bool cheapFxsaveOn() {
+    if (g_cheapFxsave < 0) {
+#if defined(__EMSCRIPTEN__) && !defined(__TEST)
+        g_cheapFxsave = vnboxUrlIs("cheapFxsave", "0") ? 0 : 1;
+        if (!g_cheapFxsave) klog_fmt("[vnbox] cheap fxsave off (cheapFxsave=0)");
+#else
+        g_cheapFxsave = 1;
+#endif
+    }
+    return g_cheapFxsave != 0;
+}
+
+constexpr U32 FXSAVE_BYTES = 288; // FCW .. XMM7; bytes 288-511 (reserved/available) are never touched
+
+static bool fastFxsave(CPU* cpu, U32 address) {
+    U8* p = cpu->memory->directRamPtr(address, FXSAVE_BYTES, true);
+    if (!p) {
+        return false;
+    }
+    FPU& fpu = cpu->fpu;
+    U16 cw = (U16)fpu.CW();
+    U16 sw = (U16)fpu.SW();
+    U8 tag = 0;
+    for (U32 i = 0; i < 8; i++) {
+        // GetTag(i) is TAG_Empty only for an empty slot outside MMX mode (Zero/Special refine a non-empty one)
+        if (fpu.isMMXInUse || (fpu.tags[i] & 3) != TAG_Empty) {
+            tag |= (U8)(1 << i);
+        }
+    }
+    U32 mxcsr = cpu->mxcsr;
+    U32 mxcsrMask = 0xFFFF;
+    memcpy(p + 0, &cw, 2);
+    memcpy(p + 2, &sw, 2);
+    p[4] = tag;
+    memset(p + 5, 0, 19); // reserved, fop, fip, fcs, reserved, fdp, fds, reserved
+    memcpy(p + 24, &mxcsr, 4);
+    memcpy(p + 28, &mxcsrMask, 4);
+    for (U32 i = 0; i < 8; i++) {
+        U32 index = (fpu.GetTop() - i) & 7; // same slot order as the per-field path
+        extFloat80_t& f80 = fpu.getReg(i);
+        memcpy(p + 32 + index * 16, &f80.signif, 8);
+        memcpy(p + 40 + index * 16, &f80.signExp, 2);
+    }
+    for (U32 i = 0; i < 8; i++) {
+        memcpy(p + 160 + i * 16, &cpu->xmm[i].pi.u64[0], 8);
+        memcpy(p + 168 + i * 16, &cpu->xmm[i].pi.u64[1], 8);
+    }
+    cpu->memory->checkDebugTrapOnMemoryWrite(address, FXSAVE_BYTES);
+    return true;
+}
+
+static bool fastFxrstor(CPU* cpu, U32 address) {
+    const U8* p = cpu->memory->directRamPtr(address, FXSAVE_BYTES, false);
+    if (!p) {
+        return false;
+    }
+    U16 cw, sw;
+    U32 mxcsr;
+    memcpy(&cw, p + 0, 2);
+    memcpy(&sw, p + 2, 2);
+    memcpy(&mxcsr, p + 24, 4);
+    cpu->fpu.SetCW(cw);
+    cpu->fpu.SetSW(sw);
+    cpu->fpu.SetTagFromAbridged(p[4]);
+    cpu->setMxcsr(mxcsr);
+    for (U32 i = 0; i < 8; i++) {
+        U32 index = (cpu->fpu.GetTop() - i) & 7;
+        U64 low;
+        U16 high;
+        memcpy(&low, p + 32 + index * 16, 8);
+        memcpy(&high, p + 40 + index * 16, 2);
+        cpu->fpu.LD80(i, low, high);
+    }
+    for (U32 i = 0; i < 8; i++) {
+        memcpy(&cpu->xmm[i].pi.u64[0], p + 160 + i * 16, 8);
+        memcpy(&cpu->xmm[i].pi.u64[1], p + 168 + i * 16, 8);
+    }
+    cpu->fpuDirtyFlags = 1;
+    return true;
+}
+
 void common_fxsave(CPU* cpu, U32 address) {
+    if (cheapFxsaveOn() && fastFxsave(cpu, address)) {
+        return;
+    }
     cpu->memory->writew(address + 0, (U16)cpu->fpu.CW());
     cpu->memory->writew(address + 2, (U16)cpu->fpu.SW());
     cpu->memory->writeb(address + 4, cpu->fpu.GetAbridgedTag(cpu));
@@ -143,6 +234,9 @@ void common_fxsave(CPU* cpu, U32 address) {
 }
 
 void common_fxrstor(CPU* cpu, U32 address) {
+    if (cheapFxsaveOn() && fastFxrstor(cpu, address)) {
+        return;
+    }
     cpu->fpu.SetCW(cpu->memory->readw(address));
     cpu->fpu.SetSW(cpu->memory->readw(address+2));
     cpu->fpu.SetTagFromAbridged(cpu->memory->readb(address+4));
