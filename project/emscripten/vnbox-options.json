@@ -34,8 +34,8 @@
     {
       "name": "hotRegroup",
       "label": "Hot code regrouping",
-      "description": "Times a hot block may be compiled again so a hot loop split across hot groups ends up in one; 0 turns it off.",
-      "type": "int", "default": 4, "min": 0, "max": 255,
+      "description": "Compiles a hot loop split across several hot code groups again into one, so it runs faster.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
       "group": "Speed", "restart": true, "experimental": false
     },
     {

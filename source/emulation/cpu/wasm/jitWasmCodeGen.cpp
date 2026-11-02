@@ -498,9 +498,11 @@ static void retryOldestSealedRequest();
 // in the same period, so they share one module. hotGroup=0 (URL) turns it off.
 // Regrouping: a hot set formed over several periods (boot, title, text screen) still ends up in several hot groups,
 // and the loop then hops between them at the cross-instance cost. Hot-group blocks count their entries too (a plain
-// counter, no check); at the end of a period, if the blocks that ran hot span two or more hot groups, or new tier-1
-// blocks got hot next to them, all of them are compiled again into one new hot group. A loop already in one group
-// costs nothing more. Each block is regrouped at most hotRegroup times (URL, default 4; 0 turns regrouping off).
+// counter, no check). At the end of a period in which no new block got hot (the loop is steady), if the hot-group
+// blocks that ran hot span two or more hot groups, all of them are compiled again into one new hot group: all or
+// nothing, since moving part of a hot set only splits it again. A loop already in one group costs nothing more, and
+// a busy period (new hot blocks, e.g. boot) only adds its new group. Bounded: a split comes from a new hot group, and
+// regroups with no new hot group in between wait 1, 2, 4 ... 64 periods. hotRegroup=0 (URL) turns regrouping off.
 #define WASM_JIT_HOT_ENTRIES 2048
 #define WASM_JIT_HOT_MAX_BLOCKS 1024
 #define WASM_JIT_HOT_WAIT_MS 1000.0
@@ -525,7 +527,7 @@ static int g_wasmJitHotEnabled = -1;
 static U32 g_wasmJitHotEntries = WASM_JIT_HOT_ENTRIES;
 static double g_wasmJitHotWaitMs = WASM_JIT_HOT_WAIT_MS;
 static U32 g_wasmJitHotMaxBlocks = WASM_JIT_HOT_MAX_BLOCKS;
-#define WASM_JIT_HOT_REGROUP_MAX 4
+#define WASM_JIT_HOT_REGROUP_GAP_MAX 64 // periods
 #define WASM_JIT_HOT_TIER_COUNTERS (1 << 16) // shared on wrap: a collision only makes a block look hot early
 struct WasmJitHotTierBlock {
     KMemory* memory = nullptr;
@@ -537,12 +539,14 @@ struct WasmJitHotTierBlock {
 static U32 g_wasmJitHotTierCounts[WASM_JIT_HOT_TIER_COUNTERS];
 static U32 g_wasmJitHotTierNextCounter = 0;
 static std::unordered_map<int, WasmJitHotTierBlock> g_wasmJitHotTier; // published hot-group blocks, by slot
-static std::unordered_map<U64, U8> g_wasmJitHotRegroups; // (memory, eip) -> times regrouped
-static U32 g_wasmJitHotRegroupMax = WASM_JIT_HOT_REGROUP_MAX;
+struct WasmJitHotRegroupState {
+    U32 gap = 1; // periods to wait after the next regroup; doubles per regroup, back to 1 on a new hot group
+    U32 nextFlush = 0; // first period (g_wasmJitHotFlushes) a regroup may happen
+};
+static std::unordered_map<KMemory*, WasmJitHotRegroupState> g_wasmJitHotRegroups;
+static bool g_wasmJitHotRegroupOn = true;
+static U32 g_wasmJitHotFlushes = 0;
 static U64 g_wasmJitHotRegroupCount = 0;
-static U64 wasmJitHotRegroupKey(KMemory* memory, U32 eip) {
-    return ((U64)(uintptr_t)memory << 32) | eip;
-}
 
 static bool wasmJitHotEnabled() {
     if (g_wasmJitHotEnabled < 0) {
@@ -556,8 +560,8 @@ static bool wasmJitHotEnabled() {
         if (entries) g_wasmJitHotEntries = (U32)entries;
         if (waitMs >= 0) g_wasmJitHotWaitMs = waitMs;
         if (maxBlocks) g_wasmJitHotMaxBlocks = (U32)maxBlocks;
-        g_wasmJitHotRegroupMax = (U32)vnboxUrlInt("hotRegroup", WASM_JIT_HOT_REGROUP_MAX, 0, 255);
-        if (g_wasmJitHotEnabled) klog_fmt("[vnbox] hot groups: entries=%u waitMs=%.0f max=%u regroup=%u", g_wasmJitHotEntries, g_wasmJitHotWaitMs, g_wasmJitHotMaxBlocks, g_wasmJitHotRegroupMax);
+        g_wasmJitHotRegroupOn = !vnboxUrlIs("hotRegroup", "0");
+        if (g_wasmJitHotEnabled) klog_fmt("[vnbox] hot groups: entries=%u waitMs=%.0f max=%u regroup=%d", g_wasmJitHotEntries, g_wasmJitHotWaitMs, g_wasmJitHotMaxBlocks, (int)g_wasmJitHotRegroupOn);
 #else
         g_wasmJitHotEnabled = 1;
 #endif
@@ -582,9 +586,7 @@ static void wasmJitHotForgetMemory(KMemory* memory) {
     for (auto it = g_wasmJitHotTier.begin(); it != g_wasmJitHotTier.end();) {
         it = it->second.memory == memory ? g_wasmJitHotTier.erase(it) : std::next(it);
     }
-    for (auto it = g_wasmJitHotRegroups.begin(); it != g_wasmJitHotRegroups.end();) {
-        it = (U32)(it->first >> 32) == (U32)(uintptr_t)memory ? g_wasmJitHotRegroups.erase(it) : std::next(it);
-    }
+    g_wasmJitHotRegroups.erase(memory);
     if (g_wasmJitHotQueue.empty()) return;
     g_wasmJitHotQueue.erase(std::remove_if(g_wasmJitHotQueue.begin(), g_wasmJitHotQueue.end(), [memory](const WasmJitHotEntry& e) {
         return e.memory == memory;
@@ -5398,25 +5400,23 @@ static void wasmJitHotFlush(CPU* cpu) {
         (e.memory == cpu->memory ? mine : others).push_back(e);
     }
     g_wasmJitHotQueue.swap(others);
-    // Hot-group blocks of this process that ran hot in this period: regroup them with the new hot blocks, or when
-    // they span two or more groups. Already in one group with nothing new: nothing to do.
-    U32 newBlocks = (U32)mine.size();
-    if (g_wasmJitHotRegroupMax) {
-        const U32 threshold = wasmJitHotThreshold();
-        std::vector<WasmJitHotEntry> hotTier;
-        U64 firstGroup = 0;
-        bool spans = false;
-        for (const auto& it : g_wasmJitHotTier) {
-            const WasmJitHotTierBlock& b = it.second;
-            if (b.memory != cpu->memory || g_wasmJitHotTierCounts[b.counter] < threshold) continue;
-            auto regroups = g_wasmJitHotRegroups.find(wasmJitHotRegroupKey(b.memory, b.eip));
-            if (regroups != g_wasmJitHotRegroups.end() && regroups->second >= g_wasmJitHotRegroupMax) continue;
-            if (!firstGroup) firstGroup = b.group;
-            else if (b.group != firstGroup) spans = true;
-            hotTier.push_back({b.memory, b.op, b.eip, it.first, true});
-        }
-        if (!hotTier.empty() && (newBlocks || spans)) {
-            mine.insert(mine.end(), hotTier.begin(), hotTier.end());
+    // Steady period (nothing new got hot): if the hot-group blocks that ran hot span two or more groups, all of them
+    // go into one new group.
+    const U32 flush = ++g_wasmJitHotFlushes;
+    bool regroup = false;
+    if (mine.empty() && g_wasmJitHotRegroupOn) {
+        auto state = g_wasmJitHotRegroups.find(cpu->memory);
+        if (state == g_wasmJitHotRegroups.end() || (S32)(flush - state->second.nextFlush) >= 0) {
+            const U32 threshold = wasmJitHotThreshold();
+            U64 firstGroup = 0;
+            for (const auto& it : g_wasmJitHotTier) {
+                const WasmJitHotTierBlock& b = it.second;
+                if (b.memory != cpu->memory || g_wasmJitHotTierCounts[b.counter] < threshold) continue;
+                if (!firstGroup) firstGroup = b.group;
+                else if (b.group != firstGroup) regroup = true;
+                mine.push_back({b.memory, b.op, b.eip, it.first, true});
+            }
+            if (!regroup) mine.clear();
         }
     }
     if (mine.empty()) {
@@ -5448,10 +5448,7 @@ static void wasmJitHotFlush(CPU* cpu) {
                 pending->second->hotCounter = counter;
                 pending->second->hotGroup = group;
             }
-            if (e.regroup) {
-                ++g_wasmJitHotRegroups[wasmJitHotRegroupKey(e.memory, e.eip)];
-                ++regrouped;
-            }
+            if (e.regroup) ++regrouped;
             ids.push_back(g_wasmJitHotSubmittedId);
             oldSlots.push_back((void*)(uintptr_t)(U32)e.slot);
         } else if (op->pfnJitCode == (void*)(uintptr_t)(U32)e.slot && !(op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
@@ -5468,7 +5465,14 @@ static void wasmJitHotFlush(CPU* cpu) {
     request.entries = ids;
     ++g_wasmJitHotModules;
     g_wasmJitHotBlocks += ids.size();
-    if (regrouped) ++g_wasmJitHotRegroupCount;
+    WasmJitHotRegroupState& state = g_wasmJitHotRegroups[cpu->memory];
+    if (regroup) {
+        ++g_wasmJitHotRegroupCount;
+        state.nextFlush = flush + state.gap;
+        state.gap = std::min<U32>(state.gap * 2, WASM_JIT_HOT_REGROUP_GAP_MAX);
+    } else {
+        state.gap = 1; // a new hot group: the split it may make is fixed at the next steady period
+    }
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopFlushHot = 1;
 #endif
@@ -5477,7 +5481,7 @@ static void wasmJitHotFlush(CPU* cpu) {
     g_hopFlushHot = 0;
 #endif
     clearJitBlock(oldSlots);
-    if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0 || (regrouped && g_wasmJitHotRegroupCount <= 16)) {
+    if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0 || (regrouped && (g_wasmJitHotRegroupCount <= 64 || g_wasmJitHotRegroupCount % 64 == 0))) {
         klog_fmt("[WASM JIT hot] group %llu: %u blocks (%u regrouped); total %llu blocks, %llu KB, %.1f ms", (unsigned long long)g_wasmJitHotModules,
             (U32)ids.size(), regrouped, (unsigned long long)g_wasmJitHotBlocks, (unsigned long long)(g_wasmJitHotBytes / 1024),
             emscripten_get_now() - startMs);
@@ -5560,7 +5564,8 @@ void wasmJitTestResetRuntimeBatching() {
     g_wasmJitHotTier.clear();
     g_wasmJitHotRegroups.clear();
     memset(g_wasmJitHotTierCounts, 0, sizeof(g_wasmJitHotTierCounts));
-    g_wasmJitHotRegroupMax = WASM_JIT_HOT_REGROUP_MAX;
+    g_wasmJitHotRegroupOn = true;
+    g_wasmJitHotFlushes = 0;
     g_wasmJitHotRegroupCount = 0;
     g_wasmJitHotModules = 0;
     g_wasmJitHotBlocks = 0;
@@ -5578,8 +5583,8 @@ void wasmJitTestHotFlush(CPU* cpu) {
     wasmJitHotFlush(cpu);
 }
 
-void wasmJitTestSetHotRegroup(U32 max) {
-    g_wasmJitHotRegroupMax = max;
+void wasmJitTestSetHotRegroup(bool on) {
+    g_wasmJitHotRegroupOn = on;
 }
 
 void wasmJitTestResetHotCounts() {
@@ -15045,7 +15050,7 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
 #ifndef BOXEDWINE_MULTI_THREADED
         if (m_chainBlocks && !m_hotTier && wasmJitHotEnabled()) {
             emitHotEntryCounter(op);
-        } else if (m_hotTier && g_wasmJitHotRegroupMax) {
+        } else if (m_hotTier && g_wasmJitHotRegroupOn) {
             emitHotTierCounter();
         }
 #endif

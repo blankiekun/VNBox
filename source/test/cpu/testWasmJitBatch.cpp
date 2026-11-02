@@ -203,9 +203,9 @@ void testWasmJitHotGroups() {
     wasmJitTestResetRuntimeBatching();
 }
 
-// Hot regrouping: a loop whose hot blocks sit in two hot groups is compiled again into one group, a loop already in
-// one group is left alone, a new hot block pulls the hot group's blocks into the new group, and a block regrouped
-// hotRegroup times stays where it is. Catches: a hot set left split across modules (the cross-instance hop cost
+// Hot regrouping: a steady loop whose hot blocks sit in two or more hot groups is compiled again into one group, a
+// loop already in one group is left alone, a busy period (new hot blocks) only adds its new group, and regroups with
+// no new group in between back off. Catches: a hot set left split across modules (the cross-instance hop cost
 // stays), regrouping every period (endless recompiles), regrouped code that no longer runs the loop.
 void testWasmJitHotRegroup() {
     testNewInstruction(0);
@@ -264,60 +264,43 @@ void testWasmJitHotRegroup() {
         startNewJIT(cpu, TEST_CODE_ADDRESS + i * blockBytes, blocks[i]);
         if (!blocks[i]->pfnJitCode) testFail("an invalidated block must compile again");
     };
-    // Group 1 = blocks 4-7.
-    if (!runHot(4)) testFail("tier-1 blocks must run the chain");
-    wasmJitTestHotFlush(cpu);
-    wasmJitTestResetHotCounts();
-    // Group 2 = blocks 0-3: blocks 4-7 did not count as hot in this period.
-    if (!runHot(0)) testFail("tier-1 and hot-group blocks must run the chain");
-    wasmJitTestResetHotCounts();
-    wasmJitTestHotFlush(cpu);
-    if (wasmJitTestHotModules() != 2 || wasmJitTestHotBlocks() != blockCount || wasmJitTestHotRegroups() != 0) {
-        testFail("the loop must start out split across two hot groups");
-    }
-    // The whole loop runs hot across both groups: one new group.
-    std::vector<void*> before = slots();
-    if (!runHot(0)) testFail("a loop split across hot groups must run the chain");
-    wasmJitTestHotFlush(cpu);
-    if (wasmJitTestHotModules() != 3 || wasmJitTestHotBlocks() != 2 * blockCount || wasmJitTestHotRegroups() != 1) {
-        testFail("hot blocks spanning two hot groups must be compiled into one group");
-    }
-    std::vector<void*> after = slots();
-    for (U32 i = 0; i < blockCount; ++i) {
-        if (!after[i] || after[i] == before[i] || blocks[i]->pfn != context.process->startJITOp) {
-            testFail("a regrouped block must be published at its new slot");
+    // Each flush is the end of one hot period. check(): hot group count, regroup count, which blocks moved.
+    std::vector<void*> prev = slots();
+    auto period = [&](int from, U32 modules, U32 regroups, std::initializer_list<U32> movers, const char* what) {
+        wasmJitTestResetHotCounts();
+        if (from >= 0 && !runHot((U32)from)) testFail("the loop must run the chain");
+        wasmJitTestHotFlush(cpu);
+        std::vector<void*> now = slots();
+        bool ok = wasmJitTestHotModules() == modules && wasmJitTestHotRegroups() == regroups;
+        for (U32 i = 0; i < blockCount; ++i) {
+            bool want = std::find(movers.begin(), movers.end(), i) != movers.end();
+            ok = ok && want == (now[i] != prev[i]) && now[i] && blocks[i]->pfn == context.process->startJITOp;
         }
-    }
-    // Steady loop in one group: nothing is compiled again.
+        if (!ok) testFail(what);
+        prev = now;
+    };
+    // 1, 2: the loop gets hot in two halves, so it starts out in two hot groups (a busy period only adds its group).
+    period(4, 1, 0, {4, 5, 6, 7}, "blocks 4-7 must form the first hot group");
     wasmJitTestResetHotCounts();
-    if (!runHot(0)) testFail("regrouped blocks must run the chain");
-    wasmJitTestHotFlush(cpu);
-    if (wasmJitTestHotModules() != 3 || slots() != after) {
-        testFail("a hot loop already in one group must not be regrouped");
-    }
-    // A block compiled again (tier-1) that gets hot pulls the hot loop into one new group with it.
-    wasmJitTestResetHotCounts();
+    if (!runHot(0)) testFail("the loop must run the chain");
+    period(-1, 2, 0, {0, 1, 2, 3}, "blocks 0-3 must form a second hot group, the first left alone");
+    // 3: steady and split: one new group with the whole loop. 4: in one group: nothing.
+    period(0, 3, 1, {0, 1, 2, 3, 4, 5, 6, 7}, "a hot loop split across two groups must be compiled into one");
+    period(0, 3, 1, {}, "a hot loop already in one group must not be regrouped");
+    // 5: block 2 compiled again (tier-1) and hot: a group of its own; 6: steady again: the loop goes back together.
     invalidate(2);
-    if (!runHot(0)) testFail("the loop must run with one block recompiled");
-    if (wasmJitTestHotQueueSize() != 1) testFail("the recompiled tier-1 block must queue at the hot threshold");
-    wasmJitTestHotFlush(cpu);
-    if (wasmJitTestHotModules() != 4 || wasmJitTestHotBlocks() != 3 * blockCount || wasmJitTestHotRegroups() != 2) {
-        testFail("a new hot block must join the hot loop in one new group");
-    }
-    // At the regroup limit, a new hot block gets a group of its own and the loop stays.
-    wasmJitTestSetHotRegroup(1); // every block has been regrouped at least once (counts are per address)
-    wasmJitTestResetHotCounts();
+    prev = slots();
+    period(0, 4, 1, {2}, "a new hot block must get its own group in a busy period");
+    period(0, 5, 2, {0, 1, 2, 3, 4, 5, 6, 7}, "the next steady period must regroup the loop with the new block");
+    // 7: block 5 new (gap back to 1). 8: blocks 4-7 hot: regrouped (next regroup waits 2 periods). 9: blocks 2-7
+    // hot: regrouped, blocks 0-1 stay behind (next waits 4). 10: whole loop split but backing off: nothing. 11: regroup.
     invalidate(5);
-    after = slots();
-    if (!runHot(0)) testFail("the loop must run with another block recompiled");
-    wasmJitTestHotFlush(cpu);
-    if (wasmJitTestHotModules() != 5 || wasmJitTestHotBlocks() != 3 * blockCount + 1 || wasmJitTestHotRegroups() != 2) {
-        testFail("blocks at the regroup limit must not be regrouped");
-    }
-    std::vector<void*> last = slots();
-    for (U32 i = 0; i < blockCount; ++i) {
-        if ((i != 5) != (last[i] == after[i])) testFail("only the new hot block may move at the regroup limit");
-    }
+    prev = slots();
+    period(0, 6, 2, {5}, "block 5 must get its own group");
+    period(4, 7, 3, {4, 5, 6, 7}, "the hot part split across groups must be regrouped");
+    period(2, 8, 4, {2, 3, 4, 5, 6, 7}, "the hot part split across groups must be regrouped after the gap");
+    period(0, 8, 4, {}, "regroups with no new hot group in between must back off");
+    period(0, 9, 5, {0, 1, 2, 3, 4, 5, 6, 7}, "the split must be regrouped when the back-off is over");
     if (!runHot(0)) testFail("the loop must run after the last flush");
     cpu->nextOp = nullptr;
     for (U32 i = 0; i < blockCount; ++i) {

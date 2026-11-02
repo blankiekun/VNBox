@@ -1353,7 +1353,7 @@ U32 wasmJitTestPendingCount();
 void wasmJitTestSetHotGroups(U32 entries, double waitMs);
 U32 wasmJitTestHotQueueSize();
 void wasmJitTestHotFlush(CPU* cpu);
-void wasmJitTestSetHotRegroup(U32 max);
+void wasmJitTestSetHotRegroup(bool on);
 void wasmJitTestResetHotCounts();
 U64 wasmJitTestHotRegroups();
 U64 wasmJitTestHotModules();
