@@ -58,6 +58,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <algorithm>
 #include <unordered_set>
 
 #if defined(BOXEDWINE_MULTI_THREADED) && defined(__EMSCRIPTEN_PTHREADS__)
@@ -456,10 +457,12 @@ static void registerPendingWasmJitBlock(std::unique_ptr<WasmJitPendingBlock> pen
 U32 g_hopMod[1 << 20];
 U32 g_hopNextMod = 1, g_hopCurMod = 0, g_hopSrcSlot = 0;
 U32 g_hopCnt[24];
-U32 g_hopEntry[0x30];
+U32 g_hopEntry[0x60];
+U32 g_hopHot[8]; // [cross*4 + srcHot*2 + dstHot]
+U32 g_hopCurHot = 0, g_hopFlushHot = 0;
 void hopStatsPrint(double sec) {
     static const char* kinds[4] = { "const", "next", "dyn", "exit" };
-    static const char* regions[3] = { "disp", "vm", "other" };
+    static const char* regions[3] = { "disp", "exe", "other" };
     char buf[2048]; int n = 0; double total = 0, cross = 0;
     for (int i = 0; i < 24; i++) { total += g_hopCnt[i]; if (!(i & 1)) cross += g_hopCnt[i]; }
     n += snprintf(buf + n, sizeof(buf) - n, "[hops] total/s=%.0f cross/s=%.0f |", total / sec, cross / sec);
@@ -467,8 +470,11 @@ void hopStatsPrint(double sec) {
         U32 c = g_hopCnt[(r * 4 + k) * 2], s = g_hopCnt[(r * 4 + k) * 2 + 1];
         if (c + s) n += snprintf(buf + n, sizeof(buf) - n, " %s.%s same=%.0f cross=%.0f", regions[r], kinds[k], s / sec, c / sec);
     }
+    n += snprintf(buf + n, sizeof(buf) - n, " | hot(src>dst) same t1>t1=%.0f t1>hot=%.0f hot>t1=%.0f hot>hot=%.0f cross t1>t1=%.0f t1>hot=%.0f hot>t1=%.0f hot>hot=%.0f",
+        g_hopHot[0] / sec, g_hopHot[1] / sec, g_hopHot[2] / sec, g_hopHot[3] / sec, g_hopHot[4] / sec, g_hopHot[5] / sec, g_hopHot[6] / sec, g_hopHot[7] / sec);
+    memset(g_hopHot, 0, sizeof(g_hopHot));
     n += snprintf(buf + n, sizeof(buf) - n, " | entries:");
-    for (int e = 0; e < 0x30; e++) if (g_hopEntry[e]) n += snprintf(buf + n, sizeof(buf) - n, " %x=%.0f", 0x564e00 + e, g_hopEntry[e] / sec);
+    for (int e = 0; e < 0x60; e++) if (g_hopEntry[e]) n += snprintf(buf + n, sizeof(buf) - n, " %x=%.0f", 0x448e40 + e, g_hopEntry[e] / sec);
     klog_fmt("%s", buf);
     memset(g_hopCnt, 0, sizeof(g_hopCnt)); memset(g_hopEntry, 0, sizeof(g_hopEntry));
 }
@@ -1045,6 +1051,96 @@ static std::atomic<bool> g_wasmJitRecordActive{false};
 
 static inline bool wasmJitRecordActive() {
     return g_wasmJitRecordActive.load(std::memory_order_relaxed);
+}
+
+// Leaf-call inlining (JitWasmCodeGen::emitInlinedCall). jitInline=0 turns it off; tests use
+// BOXEDWINE_WASM_JIT_INLINE=0.
+#define WASM_JIT_INLINE_MAX_OPS 16
+#define WASM_JIT_INLINE_MAX_SITES 16
+static U64 g_wasmJitInlinedCalls = 0;
+static bool wasmJitInlineEnabled() {
+#if defined(__EMSCRIPTEN__) && !defined(__TEST)
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = vnboxUrlIs("jitInline", "0") ? 0 : 1;
+        klog_fmt("[vnbox] jit leaf-call inlining %s", enabled ? "on" : "off (jitInline=0)");
+    }
+    return enabled != 0;
+#else
+    const char* value = std::getenv("BOXEDWINE_WASM_JIT_INLINE");
+    return !value || strcmp(value, "0") != 0;
+#endif
+}
+
+// A block with an inlined callee runs a copy of the callee's code without owning its ops, so code invalidation
+// can't reach it through DecodedOp::blockStart. Keyed by callee page: {callee range -> caller block}.
+struct WasmJitInlineDep {
+    KMemory* memory;
+    U32 start, end;     // callee code [start, end)
+    U32 callerEip;
+    DecodedOp* caller;  // caller block start
+};
+static std::unordered_map<U32, std::vector<WasmJitInlineDep>> g_wasmJitInlineDeps;
+
+static void wasmJitAddInlineDep(KMemory* memory, U32 start, U32 end, U32 callerEip, DecodedOp* caller) {
+    for (U32 page = start >> K_PAGE_SHIFT; page <= ((end - 1) >> K_PAGE_SHIFT); ++page) {
+        std::vector<WasmJitInlineDep>& deps = g_wasmJitInlineDeps[page];
+        bool known = false;
+        for (const WasmJitInlineDep& dep : deps) {
+            if (dep.memory == memory && dep.start == start && dep.end == end && dep.caller == caller && dep.callerEip == callerEip) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) deps.push_back({memory, start, end, callerEip, caller});
+    }
+}
+
+// Lifecycle callback (KMemory::prepareCodeInvalidation / removeCode). Drops entries whose caller block is gone.
+static void wasmJitCollectInlineDependents(KMemory* memory, U32 address, U32 len, std::vector<std::pair<U32, DecodedOp*>>& blocks) {
+    if (g_wasmJitInlineDeps.empty() || !len) {
+        return;
+    }
+    const U64 end = (U64)address + len;
+    auto scan = [&](std::vector<WasmJitInlineDep>& deps) {
+        for (size_t i = 0; i < deps.size();) {
+            WasmJitInlineDep& dep = deps[i];
+            if (dep.memory == memory) {
+                if (memory->getDecodedOp(dep.callerEip) != dep.caller || !dep.caller->blockOpCount) {
+                    deps[i] = deps.back();
+                    deps.pop_back();
+                    continue;
+                }
+                if (dep.start < end && address < dep.end) {
+                    blocks.push_back({dep.callerEip, dep.caller});
+                }
+            }
+            ++i;
+        }
+    };
+    const U32 firstPage = address >> K_PAGE_SHIFT;
+    const U32 lastPage = (U32)((end - 1) >> K_PAGE_SHIFT);
+    if ((U64)(lastPage - firstPage) + 1 > g_wasmJitInlineDeps.size()) {
+        for (auto it = g_wasmJitInlineDeps.begin(); it != g_wasmJitInlineDeps.end();) {
+            if (it->first >= firstPage && it->first <= lastPage) scan(it->second);
+            it = it->second.empty() ? g_wasmJitInlineDeps.erase(it) : std::next(it);
+        }
+        return;
+    }
+    for (U32 page = firstPage; page <= lastPage; ++page) {
+        auto it = g_wasmJitInlineDeps.find(page);
+        if (it == g_wasmJitInlineDeps.end()) continue;
+        scan(it->second);
+        if (it->second.empty()) g_wasmJitInlineDeps.erase(it);
+    }
+}
+
+static void wasmJitForgetInlineDeps(KMemory* memory) {
+    for (auto it = g_wasmJitInlineDeps.begin(); it != g_wasmJitInlineDeps.end();) {
+        auto& deps = it->second;
+        deps.erase(std::remove_if(deps.begin(), deps.end(), [memory](const WasmJitInlineDep& dep) { return dep.memory == memory; }), deps.end());
+        it = deps.empty() ? g_wasmJitInlineDeps.erase(it) : std::next(it);
+    }
 }
 
 // Exported to JS (see EXPORTED_FUNCTIONS in project/emscripten/makefile).
@@ -4764,8 +4860,15 @@ static void wasmHelper_movsd32r(CPU* cpu) {
 
 #ifndef BOXEDWINE_MULTI_THREADED
 // A tier-1 block's entry counter reached the hot threshold: queue the block for the next hot group.
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+U32 g_hotDbg[8];
+#endif
 static void wasmHelper_hotBlock(CPU* cpu, U32 eip) {
     DecodedOp* op = cpu->memory->getDecodedOp(eip);
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+    g_hotDbg[0]++;
+    if (!op) g_hotDbg[1]++; else if (!op->pfnJitCode) g_hotDbg[2]++; else if (op->pfn != cpu->thread->process->startJITOp) g_hotDbg[3]++; else if (op->flags2 & OP_FLAG2_WASM_JIT_PENDING) g_hotDbg[4]++;
+#endif
     if (!op || !op->pfnJitCode || op->pfn != cpu->thread->process->startJITOp || (op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
         return;
     }
@@ -4971,7 +5074,7 @@ static void registerPendingWasmJitBlock(std::unique_ptr<WasmJitPendingBlock> pen
 
 static void publishWasmJitBlock(WasmJitPendingBlock& pending, int tableIdx) {
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
-    g_hopMod[(U32)tableIdx & 0xfffff] = g_hopCurMod ? g_hopCurMod : g_hopNextMod++;
+    g_hopMod[(U32)tableIdx & 0xfffff] = (g_hopCurMod ? g_hopCurMod : g_hopNextMod++) | (g_hopCurHot << 31);
 #endif
     std::unique_ptr<U32[]> relocArr = takeWasmJitRelocArray(pending);
     if (relocArr) {
@@ -5111,6 +5214,7 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
 
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopCurMod = g_hopNextMod++;
+    g_hopCurHot = g_hopFlushHot;
 #endif
     for (size_t i = 0; i < liveIds.size(); ++i) {
         auto found = g_wasmJitPendingBlocks.find(liveIds[i]);
@@ -5120,6 +5224,7 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
     }
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopCurMod = 0;
+    g_hopCurHot = 0;
 #endif
     for (WasmJitBatchEntryId id : liveIds) {
         erasePendingWasmJitBlock(id);
@@ -5377,7 +5482,13 @@ static void wasmJitHotFlush(CPU* cpu) {
     request.entries = ids;
     ++g_wasmJitHotModules;
     g_wasmJitHotBlocks += ids.size();
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+    g_hopFlushHot = 1;
+#endif
     queueRuntimeFlushes({request});
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+    g_hopFlushHot = 0;
+#endif
     clearJitBlock(oldSlots);
     if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0) {
         klog_fmt("[WASM JIT hot] group %llu: %u blocks; total %llu blocks, %llu KB", (unsigned long long)g_wasmJitHotModules,
@@ -5393,6 +5504,11 @@ static void wasmJitHotPeriod(CPU* cpu) {
         return;
     }
     g_wasmJitHotPeriodStartMs = now;
+#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
+    klog_fmt("[hotdbg] calls=%u noop=%u nojit=%u pfn=%u pending=%u queue=%u paused=%d sealed=%u", g_hotDbg[0], g_hotDbg[1], g_hotDbg[2], g_hotDbg[3], g_hotDbg[4],
+        (U32)g_wasmJitHotQueue.size(), (int)g_wasmJitCompilationPaused, (U32)g_wasmJitSealedRequests.size());
+    memset(g_hotDbg, 0, sizeof(g_hotDbg));
+#endif
     memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
     if (!g_wasmJitHotQueue.empty()) {
         wasmJitHotFlush(cpu);
@@ -5474,6 +5590,10 @@ U32 wasmJitTestHotQueueSize() {
 
 U64 wasmJitTestHotModules() {
     return g_wasmJitHotModules;
+}
+
+U64 wasmJitTestInlinedCalls() {
+    return g_wasmJitInlinedCalls;
 }
 
 U64 wasmJitTestHotBlocks() {
@@ -13648,7 +13768,7 @@ void JitWasmCodeGen::emitChainToNextOp() {
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     { // HOPCOUNT: g_hopCnt[base + (mod[src] == mod[dst])]++
         U32 eip = this->startingEip;
-        U32 region = (eip >= 0x564e00 && eip < 0x564e30) ? 0 : (eip >= 0x550000 && eip < 0x570000) ? 1 : 2;
+        U32 region = ((eip >= 0x448e40 && eip < 0x448ea0) || (eip >= 0x401700 && eip < 0x401740)) ? 0 : (eip >= 0x400000 && eip < 0x500000) ? 1 : 2;
         U32 t = allocScratch();
         m_emitter.emitI32Const((S32)(uintptr_t)&g_hopCnt[(region * 4 + m_hopKind) * 2]);
         m_emitter.emitI32Const((S32)(uintptr_t)&g_hopSrcSlot);
@@ -13668,6 +13788,31 @@ void JitWasmCodeGen::emitChainToNextOp() {
         m_emitter.emitI32Load(0);
         m_emitter.emitI32Const(1); m_emitter.emitOp(WASM_I32_ADD);
         m_emitter.emitI32Store(0);
+        // g_hopHot[(mod[src] != mod[dst]) * 4 + hot(src) * 2 + hot(dst)]++
+        U32 a = allocScratch(), b = allocScratch();
+        m_emitter.emitI32Const((S32)(uintptr_t)&g_hopSrcSlot);
+        m_emitter.emitI32Load(0);
+        m_emitter.emitI32Const(0xfffff); m_emitter.emitOp(WASM_I32_AND);
+        m_emitter.emitI32Const(2); m_emitter.emitOp(WASM_I32_SHL);
+        m_emitter.emitI32Load((U32)(uintptr_t)g_hopMod);
+        m_emitter.emitLocalSet(a);
+        nextOp((U32)offsetof(DecodedOp, pfnJitCode));
+        m_emitter.emitI32Const(0xfffff); m_emitter.emitOp(WASM_I32_AND);
+        m_emitter.emitI32Const(2); m_emitter.emitOp(WASM_I32_SHL);
+        m_emitter.emitI32Load((U32)(uintptr_t)g_hopMod);
+        m_emitter.emitLocalSet(b);
+        m_emitter.emitLocalGet(a); m_emitter.emitLocalGet(b); m_emitter.emitOp(WASM_I32_NE);
+        m_emitter.emitI32Const(4); m_emitter.emitOp(WASM_I32_MUL);
+        m_emitter.emitLocalGet(a); m_emitter.emitI32Const(31); m_emitter.emitOp(WASM_I32_SHR_U);
+        m_emitter.emitI32Const(2); m_emitter.emitOp(WASM_I32_MUL); m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitLocalGet(b); m_emitter.emitI32Const(31); m_emitter.emitOp(WASM_I32_SHR_U); m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitI32Const(2); m_emitter.emitOp(WASM_I32_SHL);
+        m_emitter.emitI32Const((S32)(uintptr_t)g_hopHot); m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitLocalTee(a);
+        m_emitter.emitLocalGet(a); m_emitter.emitI32Load(0);
+        m_emitter.emitI32Const(1); m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitI32Store(0);
+        freeScratch(b); freeScratch(a);
         freeScratch(t);
     }
 #endif
@@ -14762,6 +14907,18 @@ void JitWasmCodeGen::findForwardTargets() {
 }
 
 bool JitWasmCodeGen::emitForwardBranch(U32 address) {
+    if (m_inlineDepth) {
+        // Inside an inlined callee only its own labels are in reach.
+        for (const auto& target : m_inlineTargets) {
+            if (target.eip == address && target.token && address > currentEip) {
+                branchBoundary();
+                writeEip(address - cpu->seg[CS].address);
+                m_emitter.emitBr(m_emitter.currentCtrlDepth() - target.token);
+                return true;
+            }
+        }
+        return false;
+    }
     auto emit = [&](const std::vector<ForwardTarget>& targets) {
         for (const auto& target : targets) {
             if (target.eip == address && target.token && address > currentEip) {
@@ -14783,6 +14940,7 @@ bool JitWasmCodeGen::emitForwardBranch(U32 address) {
 }
 
 bool JitWasmCodeGen::emitDirectLoopBackedge(U32 address) {
+    if (m_inlineDepth) return false;
     if (!m_directLoopOpen || address != m_directLoop->targetEip ||
         currentEip != m_directLoop->sourceEip) {
         return false;
@@ -14857,7 +15015,208 @@ void JitWasmCodeGen::emitHotEntryCounter(DecodedOp* op) {
 }
 #endif
 
+bool JitWasmCodeGen::analyzeInlineCallee(U32 eip, DecodedOp* op, InlineCallee& callee) {
+#ifdef BOXEDWINE_MULTI_THREADED
+    (void)eip; (void)op; (void)callee;
+    return false;
+#else
+    if (op->inst != CallJd || m_inlineCalls.size() >= WASM_JIT_INLINE_MAX_SITES || !wasmJitInlineEnabled() ||
+            wasmJitPersistenceActive() || wasmJitRecordActive() || !cpu->big) {
+        return false;
+    }
+    const U32 target = eip + op->len + op->imm;
+    // Only code that already ran (decoded); inlining never decodes bytes that might not be code.
+    DecodedOp* cur = cpu->memory->getDecodedOp(target);
+    U32 address = target;
+    std::vector<U32> jumps;
+    for (U32 i = 0; i < WASM_JIT_INLINE_MAX_OPS && cur; ++i) {
+        if (!cur->isValid() || cur->inst == Done || (cur->flags & OP_FLAG_NO_JIT) || cur->lock ||
+                cur->isFpuOp() || cur->isMmxOp() || cur->isSSEOp() || cur->isStringOp()) {
+            return false;
+        }
+        callee.ops.push_back(cur);
+        callee.opEips.push_back(address);
+        if (cur->inst == Retn32 || cur->inst == Retn32Iw) {
+            callee.eip = target;
+            callee.end = address + cur->len;
+            break;
+        }
+        if (cur->isBranch()) {
+            // Straight line: forward conditional jumps only (to a label inside, or a side exit past the ret).
+            if (!cur->isJumpCC() || address + cur->len + cur->imm <= address) return false;
+            jumps.push_back(address + cur->len + cur->imm);
+        }
+        DecodedOp* next = cur->next ? cur->next : cpu->memory->getDecodedOp(address + cur->len);
+        address += cur->len;
+        cur = next;
+    }
+    if (!callee.end) return false;
+    // The block's analyses key on eip: the callee must not overlap the caller's code.
+    if (callee.eip < eip + op->len && this->startingEip < callee.end) return false;
+    for (U32 jump : jumps) {
+        if (jump >= callee.end) continue; // side exit
+        auto found = std::find(callee.opEips.begin(), callee.opEips.end(), jump);
+        if (found == callee.opEips.end()) return false; // into the middle of an instruction
+        callee.targets.push_back(jump);
+    }
+    std::sort(callee.targets.begin(), callee.targets.end(), std::greater<U32>());
+    callee.targets.erase(std::unique(callee.targets.begin(), callee.targets.end()), callee.targets.end());
+    return true;
+#endif
+}
+
+bool JitWasmCodeGen::canInlineCall(U32 eip, DecodedOp* op) {
+    if (m_inlineCalls.count(eip)) return true;
+    InlineCallee callee;
+    if (!analyzeInlineCallee(eip, op, callee)) return false;
+    m_inlineCalls.emplace(eip, std::move(callee));
+    return true;
+}
+
+// Per-op state reset for an op of an inlined callee. The block-level analyses (loops, forward labels, read groups,
+// eip map, op count) describe the caller's linear code only and are left alone.
+void JitWasmCodeGen::preCompileInlined(DecodedOp* op) {
+    m_emulatedCurrentOp = false;
+    currentOp = op;
+    m_currentWasmOp = op;
+    if ((op->flags2 & OP_FLAG2_JUMP_TARGET) || !canKeepPublishedFlagType(op)) m_publishedLazyFlagType = FLAGS_NULL;
+    if (m_forwardedResultConsumer != op || (op->flags2 & OP_FLAG2_JUMP_TARGET)) {
+        m_forwardedResultConsumer = nullptr;
+    }
+    m_forwardedResultEndEip = 0;
+    m_scratchInUse.fill(false);
+    m_f64ScratchInUse.fill(false);
+    m_v128ScratchInUse.fill(false);
+    m_readGroupActive = false;
+    m_readGroupReady = false;
+    lastCompiledOpLen = op->len;
+    for (auto& target : m_inlineTargets) {
+        if (target.eip == this->currentEip && target.token) {
+            branchBoundary();
+            m_emitter.emitEnd();
+            target.token = 0;
+            currentLazyFlags = FLAGS_NULL;
+            m_publishedLazyFlagType = FLAGS_NULL;
+            m_forwardedResultConsumer = nullptr;
+        }
+    }
+    if (!canKeepFpuCache(op)) {
+        flushFpuCache();
+    }
+}
+
+// call rel32 to a leaf: push the return address, run the callee's ops here, pop it at the callee's ret and go on
+// with the next instruction when it is the address pushed. Any other address leaves through jumpEip.
+bool JitWasmCodeGen::emitInlinedCall(DecodedOp* op) {
+    auto found = m_inlineCalls.find(this->currentEip);
+    if (found == m_inlineCalls.end() || m_inlineDepth || keptRegisterUsage() || m_preserveCpuRegisterState) {
+        return false;
+    }
+    InlineCallee& callee = found->second;
+    const U32 callEip = this->currentEip;
+    const U32 returnEip = callEip + op->len;
+    // The callee must not be part of this block (its analyses key on eip).
+    if (callee.eip <= this->lastOpEip + 15 && this->startingEip < callee.end) {
+        return false;
+    }
+    RegPtr returnAddress = getTmpReg();
+    movValue(JitWidth::b32, returnAddress, returnEip - cpu->seg[CS].address);
+    push32(returnAddress);
+    returnAddress = nullptr;
+
+    m_inlineDepth++;
+    m_inlinedRanges.push_back({callee.eip, callee.end});
+    g_wasmJitInlinedCalls++;
+    m_forwardedResultConsumer = nullptr;
+    m_forwardedResultEndEip = 0;
+    m_publishedLazyFlagType = FLAGS_NULL;
+    m_readGroupActive = false;
+    m_inlineTargets.clear();
+    for (U32 target : callee.targets) {
+        m_emitter.emitBlock();
+        m_inlineTargets.push_back({target, m_emitter.currentCtrlDepth()});
+    }
+    const size_t count = callee.ops.size();
+    for (size_t i = 0; i + 1 < count; ++i) {
+        DecodedOp* cur = callee.ops[i];
+        this->currentEip = callee.opEips[i];
+        preCompile(cur);
+        compile(cur);
+        if (skipToOp) {
+            // Fused flag producer + consumer: continue after the consumer.
+            cur = skipToOp;
+            skipToOp = nullptr;
+            auto at = std::find(callee.ops.begin(), callee.ops.end(), cur);
+            if (at == callee.ops.end()) kpanic("emitInlinedCall: fused op outside the callee");
+            i = (size_t)(at - callee.ops.begin());
+            this->currentEip = callee.opEips[i];
+        }
+        postCompile(cur);
+    }
+    DecodedOp* ret = callee.ops[count - 1];
+    this->currentEip = callee.opEips[count - 1];
+    preCompile(ret);
+    for (const auto& target : m_inlineTargets) {
+        if (target.token) kpanic("emitInlinedCall: open label");
+    }
+    emitBranchBailoutCheck();
+    RegPtr popped = getTmpReg();
+    pop32(popped, ret->inst == Retn32Iw ? ret->imm + 4 : 4);
+    {
+        // Rare path: the callee changed its return address. Keep the hot path's register mapping.
+        auto gpLoaded = m_gpLoaded, gpDirty = m_gpDirty;
+        auto xmmLoaded = m_xmmLoaded, xmmDirty = m_xmmDirty;
+        auto segLoaded = m_segLoaded;
+        auto fpu = fpuStackCache;
+        auto lazy = currentLazyFlags, published = m_publishedLazyFlagType;
+        pushRegValue(popped);
+        m_emitter.emitI32Const((S32)(returnEip - cpu->seg[CS].address));
+        m_emitter.emitOp(WASM_I32_NE);
+        m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
+        m_emitter.emitIf();
+        jumpEip(popped);
+        m_emitter.emitEnd();
+        m_gpLoaded = gpLoaded; m_gpDirty = gpDirty;
+        m_xmmLoaded = xmmLoaded; m_xmmDirty = xmmDirty;
+        m_segLoaded = segLoaded;
+        fpuStackCache = fpu;
+        currentLazyFlags = lazy; m_publishedLazyFlagType = published;
+    }
+    popped = nullptr;
+    // The dispatcher counts the caller's ops (blockOpCount); count the callee's here.
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load((U32)offsetof(CPU, blockInstructionCount));
+    m_emitter.emitI32Const((S32)count);
+    m_emitter.emitOp(WASM_I32_ADD);
+    m_emitter.emitI32Store((U32)offsetof(CPU, blockInstructionCount));
+
+    m_inlineTargets.clear();
+    m_inlineDepth--;
+    m_scratchInUse.fill(false);
+    m_forwardedResultConsumer = nullptr;
+    m_forwardedResultEndEip = 0;
+    m_publishedLazyFlagType = FLAGS_NULL;
+    m_readGroupActive = false;
+    m_readGroupReady = false;
+    this->currentEip = callEip;
+    currentOp = op;
+    m_currentWasmOp = op;
+    lastCompiledOpLen = op->len;
+    if (callEip >= this->lastOpEip && !(this->stopBeforeEip && this->stopBeforeEip == returnEip)) {
+        // The block ends with this call: continue at the return site through the dispatcher.
+        RegPtr next = getTmpReg();
+        movValue(JitWidth::b32, next, returnEip - cpu->seg[CS].address);
+        jumpEip(next);
+    }
+    return true;
+}
+
 void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
+    if (m_inlineDepth) {
+        preCompileInlined(op);
+        return;
+    }
     m_emulatedCurrentOp = false;
     // Reset per-instruction scratch state, then run base bookkeeping (block
     // op count, eip→buffer-pos map, preOp hook). Stash op->len for
@@ -14872,8 +15231,8 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
             m_emitter.emitI32Load((U32)offsetof(DecodedOp, pfnJitCode));
             m_emitter.emitI32Store(0);
             U32 eip = this->startingEip;
-            if (eip >= 0x564e00 && eip < 0x564e30) {
-                U32 a = (U32)(uintptr_t)&g_hopEntry[eip - 0x564e00];
+            if (eip >= 0x448e40 && eip < 0x448ea0) {
+                U32 a = (U32)(uintptr_t)&g_hopEntry[eip - 0x448e40];
                 m_emitter.emitI32Const((S32)a);
                 m_emitter.emitI32Const((S32)a);
                 m_emitter.emitI32Load(0);
@@ -15224,6 +15583,9 @@ void JitWasmCodeGen::compile(DecodedOp* op) {
     if (op->isBranch()) {
         emitBranchBailoutCheck();
     }
+    if (op->inst == CallJd && emitInlinedCall(op)) {
+        return;
+    }
     if (op->inst == Pause) {
         dynamic_pause(op);
         return;
@@ -15269,7 +15631,7 @@ bool JitWasmCodeGen::shouldStopBlockBefore(U32 eip, DecodedOp* op) {
     m_stopScanPrev = op;
     m_stopScanPrevEip = eip;
     // A hot-group block runs through other block starts: a hop saved is worth more than the duplicated code.
-    if (op && eip != this->startingEip && ((prev && prev->isCall()) || (!m_hotTier &&
+    if (op && eip != this->startingEip && ((prev && prev->isCall() && !m_inlineCalls.count(eip - prev->len)) || (!m_hotTier &&
             ((op->flags2 & OP_FLAG2_WASM_JIT_PENDING) || ((op->flags & OP_FLAG_JIT) && op->pfnJitCode))))) {
         return true;
     }
@@ -15391,6 +15753,11 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
     m_wasmBinary = m_emitter.finalize();
 
     if (m_wasmBinary.empty()) return;
+#ifndef BOXEDWINE_MULTI_THREADED
+    for (const auto& range : m_inlinedRanges) {
+        wasmJitAddInlineDep(cpu->memory, range.first, range.second, this->startingEip, op);
+    }
+#endif
 #ifdef __TEST
     g_wasmJitTestBytes += m_wasmBinary.size();
     if (this->blockOpCount == 1) { g_wasmJitTestOneOpModules++; g_wasmJitTestOneOpBytes += m_wasmBinary.size(); }
@@ -16493,6 +16860,7 @@ static void wasmJitMtBrokerMemoryInvalidated(U32 memoryId, KMemory* memory = nul
 static void wasmJitMemoryInvalidated(KMemory* memory) {
 #ifndef BOXEDWINE_MULTI_THREADED
     wasmJitCancelPendingMemory(memory);
+    wasmJitForgetInlineDeps(memory);
 #else
     KThread* currentThread = KThread::currentThread();
     if (currentThread && currentThread->memory == memory &&
@@ -16529,6 +16897,9 @@ static void registerWasmJitLifecycleCallbacks() {
         JitLifecycleCallbacks callbacks;
         callbacks.prepareCodeInvalidation = wasmJitPrepareCodeInvalidation;
         callbacks.memoryInvalidated = wasmJitMemoryInvalidated;
+#ifndef BOXEDWINE_MULTI_THREADED
+        callbacks.collectDependentBlocks = wasmJitCollectInlineDependents;
+#endif
 #ifdef BOXEDWINE_MULTI_THREADED
         callbacks.threadStartPreparing = wasmJitThreadStartPreparing;
         callbacks.threadStartCancelled = wasmJitThreadStartCancelled;

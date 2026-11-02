@@ -11,6 +11,7 @@
 #define __JIT_CODE_LIFECYCLE_H__
 
 #include <vector>
+#include <utility>
 
 class DecodedOp;
 class CPU;
@@ -43,12 +44,16 @@ using JitPrepareCodeInvalidationCallback = PreparedJitCodeInvalidation (*)(KMemo
 using JitMemoryInvalidatedCallback = void (*)(KMemory* memory);
 using JitThreadStartPreparingCallback = void (*)(CPU* cpu);
 using JitThreadStartCancelledCallback = void (*)(CPU* cpu);
+// Adds {eip, blockStart} of blocks whose code copies guest code in [address, address + len) without owning its ops
+// (wasm: a call inlined into its caller). Those blocks must be invalidated with that code.
+using JitCollectDependentBlocksCallback = void (*)(KMemory* memory, U32 address, U32 len, std::vector<std::pair<U32, DecodedOp*>>& blocks);
 
 struct JitLifecycleCallbacks {
     JitPrepareCodeInvalidationCallback prepareCodeInvalidation = nullptr;
     JitMemoryInvalidatedCallback memoryInvalidated = nullptr;
     JitThreadStartPreparingCallback threadStartPreparing = nullptr;
     JitThreadStartCancelledCallback threadStartCancelled = nullptr;
+    JitCollectDependentBlocksCallback collectDependentBlocks = nullptr;
     bool aggregatePreparedCodeInvalidation = false;
     bool usesCodeMemory = true;
 };
@@ -75,6 +80,8 @@ void jitCodeInvalidated(KMemory* memory, const std::vector<DecodedOp*>& decodedO
 void jitMemoryInvalidated(KMemory* memory, const std::vector<void*>& jitEntries);
 
 void jitThreadStartPreparing(CPU* cpu);
+// Blocks that depend on code in the range (see JitCollectDependentBlocksCallback); false when there are none.
+bool jitCollectDependentBlocks(KMemory* memory, U32 address, U32 len, std::vector<std::pair<U32, DecodedOp*>>& blocks);
 void jitThreadStartCancelled(CPU* cpu);
 
 // Wasm JIT blocks can overlap. Each decoded op's blockStart is the earliest-
