@@ -550,6 +550,7 @@ static void x11_UngrabPointer(CPU* cpu) {
 // int XWarpPointer(Display* display, Window src_w, Window dest_w, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y)
 static void x11_WarpPointer(CPU* cpu) {
     KNativeSystem::getCurrentInput()->setMousePos(ARG8, ARG9);
+    XServer::getServer()->pointerWarped();
     EAX = Success;
 }
 
