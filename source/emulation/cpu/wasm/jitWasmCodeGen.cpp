@@ -474,7 +474,7 @@ void hopStatsPrint(double sec) {
         g_hopHot[0] / sec, g_hopHot[1] / sec, g_hopHot[2] / sec, g_hopHot[3] / sec, g_hopHot[4] / sec, g_hopHot[5] / sec, g_hopHot[6] / sec, g_hopHot[7] / sec);
     memset(g_hopHot, 0, sizeof(g_hopHot));
     n += snprintf(buf + n, sizeof(buf) - n, " | entries:");
-    for (int e = 0; e < 0x60; e++) if (g_hopEntry[e]) n += snprintf(buf + n, sizeof(buf) - n, " %x=%.0f", 0x448b60 + e, g_hopEntry[e] / sec);
+    for (int e = 0; e < 0x60; e++) if (g_hopEntry[e]) n += snprintf(buf + n, sizeof(buf) - n, " %x=%.0f", 0x448e40 + e, g_hopEntry[e] / sec);
     klog_fmt("%s", buf);
     memset(g_hopCnt, 0, sizeof(g_hopCnt)); memset(g_hopEntry, 0, sizeof(g_hopEntry));
 }
@@ -13768,7 +13768,7 @@ void JitWasmCodeGen::emitChainToNextOp() {
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     { // HOPCOUNT: g_hopCnt[base + (mod[src] == mod[dst])]++
         U32 eip = this->startingEip;
-        U32 region = ((eip >= 0x448b60 && eip < 0x448bc0) || (eip >= 0x401700 && eip < 0x401740)) ? 0 : (eip >= 0x400000 && eip < 0x500000) ? 1 : 2;
+        U32 region = ((eip >= 0x448e40 && eip < 0x448ea0) || (eip >= 0x401700 && eip < 0x401740)) ? 0 : (eip >= 0x400000 && eip < 0x500000) ? 1 : 2;
         U32 t = allocScratch();
         m_emitter.emitI32Const((S32)(uintptr_t)&g_hopCnt[(region * 4 + m_hopKind) * 2]);
         m_emitter.emitI32Const((S32)(uintptr_t)&g_hopSrcSlot);
@@ -15231,8 +15231,8 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
             m_emitter.emitI32Load((U32)offsetof(DecodedOp, pfnJitCode));
             m_emitter.emitI32Store(0);
             U32 eip = this->startingEip;
-            if (eip >= 0x448b60 && eip < 0x448bc0) {
-                U32 a = (U32)(uintptr_t)&g_hopEntry[eip - 0x448b60];
+            if (eip >= 0x448e40 && eip < 0x448ea0) {
+                U32 a = (U32)(uintptr_t)&g_hopEntry[eip - 0x448e40];
                 m_emitter.emitI32Const((S32)a);
                 m_emitter.emitI32Const((S32)a);
                 m_emitter.emitI32Load(0);
