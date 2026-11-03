@@ -1,5 +1,5 @@
-# VNBox checks on every pull request and push to master: the fork's own self-checks, which need no
-# browser, game files or emsdk and take seconds.
+# VNBox checks on every pull request and push to master: the fork's own self-checks (vn-checks.yml) and the
+# testJit suite.
 name: VN CI
 
 on:
@@ -15,36 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Catches regressions in lazyfs.js ranged reads, frida-compat.js string/pattern/trans code,
-  # boxedwine-shell.js (URL options, CUE/BIN, zips), source/io/readahead.h, and VNBox options read in
-  # code but missing from vnbox-options.json (or listed but read nowhere).
+  # Catches a regression in any self-check listed in vn-checks.yml.
   checks:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 6
-    steps:
-      - uses: actions/checkout@v4
-
-      # No npm dependencies to cache: the checks use only Node's standard library.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: lazyfs.check.mjs
-        run: node project/emscripten/lazyfs.check.mjs
-
-      - name: frida-compat.check.mjs
-        run: node project/emscripten/frida-compat.check.mjs
-
-      - name: vnbox-options.check.mjs
-        run: node project/emscripten/vnbox-options.check.mjs
-
-      - name: boxedwine-shell.test.cjs
-        run: node --test project/emscripten/boxedwine-shell.test.cjs
-
-      - name: test_read_ahead.cpp
-        run: |
-          g++ -std=c++17 -I source/io tools/test_read_ahead.cpp -o "$RUNNER_TEMP/test_read_ahead"
-          "$RUNNER_TEMP/test_read_ahead"
+    uses: ./.github/workflows/vn-checks.yml
 
   # Catches CPU emulation and WASM JIT regressions (the source/test suite: CPU/MMX/SSE/x87 ops, JIT
   # chaining, hard links, ...) by building `make testJit` and running it under Node. -fast runs every test
