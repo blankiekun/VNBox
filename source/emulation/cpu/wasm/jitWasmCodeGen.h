@@ -197,6 +197,7 @@
 #include "../jit/jitSSE.h"
 #include "wasmEmitter.h"
 #include <array>
+#include <map>
 #include <chrono>
 
 // Number of WASM locals used as GP register slots (eax-edi = 8).
@@ -968,6 +969,31 @@ public:
     void postCompile(DecodedOp* op) override;
     bool shouldStopBlockBefore(U32 eip, DecodedOp* op) override;
     bool supportsConditionalSideExit(U32, U32) const override { return true; }
+    // Leaf-call inlining (jitInline=0 turns it off): `call rel32` to a short straight-line callee is compiled
+    // into the caller's block. The return address is still pushed and popped; a ret that pops another address
+    // leaves through the dispatcher. Callee code changes invalidate the caller (wasmJitInlineDeps).
+    struct InlineCallee {
+        U32 eip = 0;               // callee entry
+        U32 end = 0;               // end of the ret
+        std::vector<DecodedOp*> ops; // straight-line ops, ret last
+        std::vector<U32> opEips;
+        std::vector<U32> targets;  // forward jcc targets inside the callee (descending)
+    };
+    std::map<U32, InlineCallee> m_inlineCalls; // by call eip
+    struct InlineTarget { U32 eip; U32 token; };
+    std::vector<InlineTarget> m_inlineTargets;
+    U32 m_inlineDepth = 0;
+    std::vector<std::pair<U32, U32>> m_inlinedRanges; // callee code copied into this block, for wasmJitInlineDeps
+    bool canInlineCall(U32 eip, DecodedOp* op) override;
+    bool analyzeInlineCallee(U32 eip, DecodedOp* op, InlineCallee& callee);
+    bool emitInlinedCall(DecodedOp* op);
+    void preCompileInlined(DecodedOp* op);
+    using JitCodeGen::canJumpInBlock;
+    bool canJumpInBlock(U32 opEip, DecodedOp* op) override {
+        // Inside an inlined callee every jcc is a side exit or a jump to one of its own labels.
+        if (m_inlineDepth) return op->isJumpCC();
+        return JitCodeGen::canJumpInBlock(opEip, op);
+    }
 
     // Recompiling a hot block into a hot group (ST): no entry counter, joins the hot batch.
     bool m_hotTier = false;
@@ -1141,8 +1167,8 @@ protected:
     void emitBranchBailoutCheck();
     void emitFunctionReturn();
     // Return after cpu->nextOp is set; with m_chainBlocks, first tail-call the next block when the dispatcher would.
-    void emitChainReturn();
-    void emitChainToNextOp();
+    void emitChainReturn(S32 targetLocal = -1, DecodedOp* targetOp = nullptr);
+    void emitChainToNextOp(S32 targetLocal = -1, DecodedOp* targetOp = nullptr);
     void emitBlockExitWithProfile(U32 profileHelperIdx, bool chain = true);
     void coldBlockExit();
     // Bailout check after a slow-path store helper: branches to one shared
@@ -1352,6 +1378,7 @@ U32 wasmJitTestHotQueueSize();
 void wasmJitTestHotFlush(CPU* cpu);
 U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
+U64 wasmJitTestInlinedCalls();
 bool wasmJitTestRelocAllocationTransfer();
 U32 wasmJitTestSealedCount();
 extern "C" U32 wasmJitTestRuntimeGroupCount();

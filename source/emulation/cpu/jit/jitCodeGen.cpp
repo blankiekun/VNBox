@@ -249,6 +249,15 @@ void jitThreadStartPreparing(CPU* cpu) {
     }
 }
 
+bool jitCollectDependentBlocks(KMemory* memory, U32 address, U32 len, std::vector<std::pair<U32, DecodedOp*>>& blocks) {
+    if (!g_jitLifecycleCallbacks.collectDependentBlocks) {
+        return false;
+    }
+    size_t before = blocks.size();
+    g_jitLifecycleCallbacks.collectDependentBlocks(memory, address, len, blocks);
+    return blocks.size() != before;
+}
+
 void jitThreadStartCancelled(CPU* cpu) {
     if (g_jitLifecycleCallbacks.threadStartCancelled) {
         g_jitLifecycleCallbacks.threadStartCancelled(cpu);
@@ -389,6 +398,10 @@ bool JitCodeGen::calculateLongestBlock(DecodedOp* op) {
                 nextOp->next = this->cpu->getOp(eip + nextOp->len, 0);
             }
             if (!nextOp->next && nextOp->isCall() && furthestJump > eip) {
+                nextOp->next = this->cpu->getOp(eip + nextOp->len, 0);
+            }
+            // An inlined call returns to the next instruction inside this block.
+            if (nextOp->isCall() && canInlineCall(eip, nextOp) && !nextOp->next) {
                 nextOp->next = this->cpu->getOp(eip + nextOp->len, 0);
             }
             if (!nextOp->next && jumpTo.contains(eip + nextOp->len)) {

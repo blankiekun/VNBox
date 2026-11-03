@@ -9,6 +9,7 @@
 
 #include "boxedwine.h"
 #include "testCPU.h"
+#include "ksignal.h"
 #if defined(BOXEDWINE_WASM_JIT)
 #include "../../emulation/cpu/jit/jitCodeLifecycle.h"
 #include "../../emulation/cpu/wasm/jitWasmCodeGen.h"
@@ -201,6 +202,136 @@ void testWasmJitHotGroups() {
         testFail("the hot group must be released with its last block");
     }
     wasmJitTestResetRuntimeBatching();
+}
+
+// Leaf-call inlining: `call rel32` to a short callee is compiled into the caller's block. Catches: an inlined call
+// that skips the guest push/pop of the return address (stack contents or esp differ), a forward jcc inside the callee
+// taking the wrong path, a callee that changes its return address returning to the call site anyway, a write to the
+// callee's code leaving the caller running the old copy, a fault inside the callee reported at the call (or without
+// the return address on the stack), and jitInline off still inlining.
+void testWasmJitInlineCall() {
+    testNewInstruction(0);
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    cpu->big = 1;
+    auto code = [&](U32 offset, std::initializer_list<U8> bytes) {
+        context.codeIp = TEST_CODE_ADDRESS + offset;
+        for (U8 b : bytes) testPushCode8(b);
+    };
+    auto call = [&](U32 offset, U32 target) {
+        U32 rel = target - (offset + 5);
+        code(offset, {0xe8, (U8)rel, (U8)(rel >> 8), (U8)(rel >> 16), (U8)(rel >> 24)});
+    };
+    // Caller: call A; inc ebx; call A; inc ebx; call B; inc ebx (skipped: B returns to 0x200); int 97.
+    call(0x00, 0x100); code(0x05, {0x43});
+    call(0x06, 0x100); code(0x0b, {0x43});
+    call(0x0c, 0x140); code(0x11, {0x43, 0xcd, 0x97});
+    // A: inc ecx; cmp ecx,100; ja +3; add edx,2; ret
+    code(0x100, {0x41, 0x83, 0xf9, 0x64, 0x77, 0x03, 0x83, 0xc2, 0x02, 0xc3});
+    // B: mov dword [esp],0x200; ret
+    code(0x140, {0xc7, 0x04, 0x24, 0x00, 0x02, 0x00, 0x00, 0xc3});
+    code(0x200, {0x46, 0xcd, 0x97}); // inc esi; int 97
+    // Second caller: call C; int 97. C: mov eax,[disp32] (faults); ret. Signal handler: int 97.
+    call(0x300, 0x180); code(0x305, {0xcd, 0x97});
+    const U32 faultTarget = TEST_HEAP_ADDRESS + 0x4000;
+    const U32 disp = faultTarget - cpu->seg[DS].address;
+    code(0x180, {0xa1, (U8)disp, (U8)(disp >> 8), (U8)(disp >> 16), (U8)(disp >> 24), 0xc3});
+    code(0x380, {0xcd, 0x97});
+
+    auto compile = [&](U32 offset) {
+        // Inlining only copies code that already ran (was decoded): both paths of A's jcc.
+        cpu->getOp(TEST_CODE_ADDRESS + 0x100, 0);
+        cpu->getOp(TEST_CODE_ADDRESS + 0x106, 0);
+        cpu->getOp(TEST_CODE_ADDRESS + 0x140, 0);
+        cpu->getOp(TEST_CODE_ADDRESS + 0x180, 0);
+        DecodedOp* op = cpu->getOp(TEST_CODE_ADDRESS + offset, 0);
+        startNewJIT(cpu, TEST_CODE_ADDRESS + offset, op);
+        op->runCount = JIT_RUN_COUNT + 1;
+        return op;
+    };
+    auto run = [&](DecodedOp* op, U32 offset) {
+        cpu->eip.u32 = offset;
+        cpu->nextOp = op;
+        cpu->yield = false;
+        for (U32 i = 0; i < 64 && (!cpu->nextOp || cpu->nextOp->inst != TestEnd); ++i) {
+            cpu->blockInstructionCount = 0;
+            try {
+                cpu->run();
+            } catch (int) {
+                cpu->nextOp = nullptr; // a guest fault delivered its signal (as in testRunCPU)
+            }
+        }
+        return cpu->nextOp && cpu->nextOp->inst == TestEnd;
+    };
+    const U32 stackTop = cpu->reg[4].u32;
+    auto runCaller = [&](DecodedOp* op) {
+        cpu->reg[1].u32 = 99; cpu->reg[2].u32 = 0; cpu->reg[3].u32 = 0; cpu->reg[6].u32 = 0;
+        cpu->reg[4].u32 = stackTop;
+        context.memory->writed(cpu->seg[SS].address + stackTop - 4, 0);
+        if (!run(op, 0)) testFail("inlined calls: caller did not reach its end");
+        if (cpu->reg[1].u32 != 101 || cpu->reg[3].u32 != 2 || cpu->reg[6].u32 != 1 || cpu->reg[4].u32 != stackTop) {
+            testFail("inlined calls: ecx=%u ebx=%u esi=%u esp=%x", cpu->reg[1].u32, cpu->reg[3].u32, cpu->reg[6].u32, cpu->reg[4].u32);
+        }
+        if (context.memory->readd(cpu->seg[SS].address + stackTop - 4) != 0x200) {
+            testFail("inlined calls must push the return address on the guest stack");
+        }
+        return cpu->reg[2].u32;
+    };
+
+    U64 before = wasmJitTestInlinedCalls();
+    DecodedOp* caller = compile(0);
+    if (wasmJitTestInlinedCalls() - before != 3 || !caller->pfnJitCode) {
+        testFail("three direct calls to leaf callees must be inlined (%llu)", (unsigned long long)(wasmJitTestInlinedCalls() - before));
+    }
+    if (runCaller(caller) != 2) testFail("inlined callee jcc: edx=%u, expected 2", cpu->reg[2].u32);
+    DecodedOp* calleeA = context.memory->getDecodedOp(TEST_CODE_ADDRESS + 0x100);
+    if (calleeA && calleeA->pfnJitCode) testFail("an inlined callee must not run as its own block");
+
+    // The callee's code changes (add edx,2 -> add edx,5): the caller must be invalidated and compile again.
+    context.memory->writeb(TEST_CODE_ADDRESS + 0x108, 5);
+    if (caller->pfnJitCode && context.memory->getDecodedOp(TEST_CODE_ADDRESS) == caller) {
+        testFail("a write to an inlined callee must invalidate its caller");
+    }
+    caller = compile(0);
+    if (runCaller(caller) != 5) testFail("after the callee changed: edx=%u, expected 5", cpu->reg[2].u32);
+
+    // jitInline=0
+    setenv("BOXEDWINE_WASM_JIT_INLINE", "0", 1);
+    context.memory->removeCodeBlock(TEST_CODE_ADDRESS, caller, false);
+    before = wasmJitTestInlinedCalls();
+    caller = compile(0);
+    unsetenv("BOXEDWINE_WASM_JIT_INLINE");
+    if (wasmJitTestInlinedCalls() != before) testFail("jitInline off must not inline");
+    if (runCaller(caller) != 5) testFail("not inlined: edx=%u, expected 5", cpu->reg[2].u32);
+    // A fault inside the inlined callee reports the callee's eip, with the return address pushed.
+    Seg savedSegs[7];
+    memcpy(savedSegs, cpu->seg, sizeof(savedSegs));
+    KSigAction savedAction = context.process->sigActions[K_SIGSEGV];
+    KSigAction& action = context.process->sigActions[K_SIGSEGV];
+    action.reset(); action.flags = K_SA_SIGINFO; action.handlerAndSigAction = TEST_CODE_ADDRESS + 0x380;
+    const U32 page = faultTarget & ~K_PAGE_MASK;
+    context.memory->mprotect(context.thread, page, K_PAGE_SIZE, 0);
+    before = wasmJitTestInlinedCalls();
+    DecodedOp* faulting = compile(0x300);
+    if (wasmJitTestInlinedCalls() - before != 1) testFail("a callee that can fault must still be inlined");
+    cpu->reg[4].u32 = stackTop;
+    const U32 stackBase = cpu->seg[SS].address;
+    run(faulting, 0x300);
+    const U32 uc = action.sigInfo[0] == K_SIGSEGV ? cpu->reg[2].u32 : 0;
+    if (!uc) {
+        testFail("a fault inside an inlined callee must raise SIGSEGV");
+    } else {
+        const U32 faultEip = context.memory->readd(uc + 0x4c);
+        const U32 faultEsp = context.memory->readd(uc + 0x30);
+        if (faultEip != 0x180 || faultEsp != stackTop - 4 || context.memory->readd(stackBase + faultEsp) != 0x305) {
+            testFail("inlined callee fault: eip=%x esp=%x", faultEip, faultEsp);
+        }
+    }
+    context.memory->mprotect(context.thread, page, K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE);
+    context.process->sigActions[K_SIGSEGV] = savedAction;
+    memcpy(cpu->seg, savedSegs, sizeof(savedSegs));
+
+    cpu->nextOp = nullptr;
 }
 #endif
 

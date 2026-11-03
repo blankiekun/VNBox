@@ -32,6 +32,7 @@
 #include "cpu/testHostLibc.h"
 #include "cpu/testHostAcm.h"
 #include "cpu/testHostVorbis.h"
+#include "cpu/testHostFreetype.h"
 #include "cpu/testHostWined3d.h"
 #include "opengl/testHostWined3dWgl.h"
 #include "cpu/testCMov.h"
@@ -379,6 +380,7 @@ const TestEntry TEST_ENTRIES[] = {
 #if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
     {testWasmJitStBoundedDispatch, "Test ST WASM JIT instruction budget", TEST_ENTRY_SERIAL},
     {testWasmJitHotGroups, "Test ST WASM JIT hot groups", TEST_ENTRY_SERIAL},
+    {testWasmJitInlineCall, "Test ST WASM JIT leaf-call inlining", TEST_ENTRY_SERIAL},
     {testWasmJitRuntimeGrouping, "Test WASM JIT runtime grouping"},
     {testWasmJitPendingLifecycle, "Test WASM JIT pending lifecycle"},
     {testWasmJitTinyAnonymousPromotion, "Test WASM JIT tiny anonymous promotion"},
@@ -912,9 +914,13 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostLibcCompare, "Test native libc memcmp/strcmp/strncmp"},
     {testHostLibcScan, "Test native libc strlen/memchr/strchr/strrchr/strcpy"},
     {testHostLibcStrtol, "Test native libc strtol/strtoul"},
+    {testHostClock, "Test native clock reads (QPC, system time)"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
+#endif
+#ifdef BOXEDWINE_HOST_FREETYPE
+    {testHostFreetypeGlyphs, "Test host FreeType faces and glyphs as win32u uses them"},
 #endif
 #ifdef BOXEDWINE_HOST_WINED3D
     {testHostWined3dNo3d, "Test host wined3d links and creates a no-3D wined3d", TEST_ENTRY_SERIAL},
