@@ -98,6 +98,8 @@ void removeTimer(KTimerCallback* timer) {
     timer->active = false;
 }
 
+static U64 schedulerQueueCount;
+
 void scheduleThread(KThread* thread) {
 #ifdef _DEBUG
     if (thread->waitingCond) {
@@ -108,6 +110,7 @@ void scheduleThread(KThread* thread) {
     }
 #endif
     thread->cpu->yield = false;
+    thread->queuedOrder = ++schedulerQueueCount;
     scheduledThreads.addToFront(&thread->scheduledThreadNode);
 }
 
@@ -274,6 +277,12 @@ void runTimers() {
     });
 }
 
+// A woken thread goes to the front, so whoever waits on it gets an answer at once. But two threads that wake each other
+// and block stay ahead of everything, and a thread behind them would get no turn at all. So after others have run this
+// long, the next turn goes to the thread queued the longest. This only chooses the order: there is always a turn, and
+// with nothing else runnable the same threads keep running.
+static const U64 MAX_OVERTAKEN_US = 2000;
+
 extern U64 sysCallTime;
 U64 elapsedTimeMIPS;
 U64 elapsedInstructionsMIPS;
@@ -296,6 +305,7 @@ bool runSlice() {
     const U64 sliceStart = schedulerMicroCounter();
     U64 now = sliceStart; // one clock read per thread turn: each turn starts where the last ended
     U64 nextTimerCheck = 1000;
+    U64 lastOldestTurnEnd = sliceStart;
 
     while (!scheduledThreads.isEmpty() && elapsedTime<9000) {
         // Yielding threads can stay runnable while waiting for a sleeping
@@ -315,6 +325,16 @@ bool runSlice() {
         }
         U64 threadStartTime = now;
         KListNode<KThread*>* node = scheduledThreads.front();
+        KListNode<KThread*>* oldest = node;
+        for (KListNode<KThread*>* n = node->getNext(); n; n = n->getNext()) {
+            if (n->data->queuedOrder < oldest->data->queuedOrder) {
+                oldest = n;
+            }
+        }
+        if (now - lastOldestTurnEnd >= MAX_OVERTAKEN_US) {
+            node = oldest;
+        }
+        const bool isOldestTurn = node == oldest;
         KThread* currentThread = (KThread*)node->data;
         KNativeSystem::scheduledNewThread(currentThread);
         sysCallTime = 0;
@@ -346,6 +366,10 @@ bool runSlice() {
         currentThread->userTime+=diff-sysCallTime;
         currentThread->kernelTime+=sysCallTime;
 
+        if (isOldestTurn) {
+            lastOldestTurnEnd = now;
+        }
+
         // this is how we signal to delete the current thread, since we can't delete it in the syscall, maybe we should use smart_ptr for threads
         if (currentThread->terminating) {
             KProcessPtr process = currentThread->process;
@@ -356,6 +380,7 @@ bool runSlice() {
             // make sure we are behind any threads that were recently scheduled
             node->remove();
             scheduledThreads.addToBack(node);
+            currentThread->queuedOrder = ++schedulerQueueCount;
         }
     }
     if (!scheduledThreads.isEmpty()) {

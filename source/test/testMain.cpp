@@ -218,6 +218,11 @@ void testStartupArgsLocalServerOption();
 #endif
 void testTerminatingThreadDoesNotEnterFutexWait();
 void testSharedFutexUnmappedAddressReturnsEFAULT();
+void testRobustListOnThreadExit();
+void testSelfSignalResumeAddress();
+#ifndef BOXEDWINE_MULTI_THREADED
+void testNtsyncSignalDuringWaitLeavesEvent();
+#endif
 void testUnixSocketPollOutClearsPeerCondition();
 void testUnixSocketSendmsgStreamPayloadCanBeRead();
 void testUnixSocketWritevInvalidSecondIovAfterZeroLengthFirstReturnsEfault();
@@ -256,6 +261,8 @@ const TestEntry TEST_ENTRIES[] = {
 #ifndef BOXEDWINE_MULTI_THREADED
     {testSingleThreadSchedulerTimeSlice, "Test single-thread scheduler timed turns", TEST_ENTRY_SERIAL},
     {testSingleThreadSchedulerTimers, "Test single-thread scheduler timer deadlines", TEST_ENTRY_SERIAL},
+    {testSingleThreadSchedulerWakeChain, "Test single-thread scheduler wake chain doesn't starve others", TEST_ENTRY_SERIAL},
+    {testNtsyncSignalDuringWaitLeavesEvent, "Test ntsync waiter taking a signal leaves the event to the next", TEST_ENTRY_SERIAL},
 #endif
 #if defined(BOXEDWINE_JIT_X86) || defined(BOXEDWINE_JIT_X64) || defined(BOXEDWINE_JIT_ARMV8)
     {testWasmJitFpuCache, "Test native JIT x87 stack cache"},
@@ -1284,6 +1291,8 @@ const TestEntry TEST_ENTRIES[] = {
 #endif
     {testCapturedMouseSensitivity, "Test captured mouse sensitivity and recentering"},
     {testSharedFutexUnmappedAddressReturnsEFAULT, "Test unmapped shared futex returns EFAULT"},
+    {testRobustListOnThreadExit, "Test thread exit marks its robust futexes owner-dead"},
+    {testSelfSignalResumeAddress, "Test a thread signalling itself resumes at the right address", TEST_ENTRY_SERIAL},
 #ifdef BOXEDWINE_MULTI_THREADED
     {testTerminatingThreadDoesNotEnterFutexWait, "Test terminating thread does not enter futex wait"},
 #endif

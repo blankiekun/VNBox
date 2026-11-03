@@ -4,8 +4,9 @@
 # Linked against Debian 12's glibc 2.36 (the root fs has 2.38): a static glibc binary crashes in malloc at start,
 # and musl's threads don't start under the emulator. Built without -O2 like kselftest: at -O2 gcc keeps
 # stress_wait's unsynchronized counter in a register and the test fails on any kernel. Needs Docker.
-# signal_wait.c, fd_limit.c and futex_clock.c (this directory) go in the same zip: VNBox's own checks for what the Linux tests don't
-# cover, a handler running on a blocked thread, a full fd table and a futex wait's clock, deadline and bitset.
+# signal_wait.c, fd_limit.c, futex_clock.c, self_signal.c and robust_futex.c (this directory) go in the same zip: VNBox's own checks
+# for what the Linux tests don't cover, a handler running on a blocked thread, a full fd table, a futex wait's clock, deadline and
+# bitset, a thread signalling itself, and a thread dying with a robust mutex.
 # Test source: Linux master facd8463 (adds wait_args_validation, fixes wake_all's EXPECT); harness: v6.14
 # (later harnesses need pidfd_open). Usage: vn/ntsync-selftest/build.sh <out dir>
 set -euo pipefail
@@ -18,7 +19,9 @@ get facd8463a5b62278fd5cdaa3fd6bad49315702a0 tools/testing/selftests/drivers/nts
 get v6.14 tools/testing/selftests/kselftest_harness.h kselftest_harness.h 68ee4952aa3db3f5bc47fcbe1cae985c599749d1752e66f365b30ad8bcec6160
 get v6.14 tools/testing/selftests/kselftest.h kselftest.h e0273c88b63a3db4b29cffd8f5fdb9dd4c9229ba6a8890b15899f06791a1ec1b
 get v6.14 include/uapi/linux/ntsync.h linux/ntsync.h 006437ee52a3e04f921df77081eb5c21c44c71f598b10ac534c6ef9e78296262
-cp "$(dirname "$0")/signal_wait.c" "$(dirname "$0")/fd_limit.c" "$(dirname "$0")/futex_clock.c" "$work/"
+# tv_sec * 1000000000 overflows 32 bits on i386, so a wait's timeout comes out huge or in the past depending on the clock.
+sed -i 's/tv_sec \* 1000000000\b/&ULL/' "$work/ntsync.c"
+cp "$(dirname "$0")/signal_wait.c" "$(dirname "$0")/fd_limit.c" "$(dirname "$0")/futex_clock.c" "$(dirname "$0")/self_signal.c" "$(dirname "$0")/robust_futex.c" "$work/"
 mkdir -p "$out"
 docker run --rm --platform linux/386 -v "$work:/s" -w /s -e HOST_UID="$(id -u)" i386/debian:bookworm-slim sh -euc '
   apt-get update -qq >/dev/null && apt-get install -y -qq gcc libc6-dev linux-libc-dev zip >/dev/null 2>&1
@@ -26,6 +29,8 @@ docker run --rm --platform linux/386 -v "$work:/s" -w /s -e HOST_UID="$(id -u)" 
   gcc -I/s -O1 -o signal_wait signal_wait.c -lpthread
   gcc -I/s -O1 -o fd_limit fd_limit.c
   gcc -I/s -O1 -o futex_clock futex_clock.c -lpthread
-  zip -q ntsync.zip ntsync_test signal_wait fd_limit futex_clock && chown "$HOST_UID" ntsync.zip'
+  gcc -I/s -O1 -no-pie -o self_signal self_signal.c
+  gcc -I/s -O1 -o robust_futex robust_futex.c -lpthread
+  zip -q ntsync.zip ntsync_test signal_wait fd_limit futex_clock self_signal robust_futex && chown "$HOST_UID" ntsync.zip'
 cp "$work/ntsync.zip" "$out/"
 echo "$out/ntsync.zip"
