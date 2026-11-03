@@ -25,44 +25,9 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
-      "name": "cheapSpi",
-      "label": "Cached system metrics",
-      "description": "SystemParametersInfo's window metrics are built once and reused until a setting or font changes, instead of measuring three fonts on every call.",
-      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
-      "group": "Speed", "restart": true, "experimental": false
-    },
-    {
-      "name": "nativeMutex",
-      "label": "Native mutexes",
-      "description": "Takes and releases uncontended Linux-side locks (Wine's font, GDI and window locks) as browser code instead of emulated x86.",
-      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
-      "group": "Speed", "restart": true, "experimental": false
-    },
-    {
-      "name": "cheapFxsave",
-      "label": "Cheap FPU state save",
-      "description": "Saves and restores the FPU/SSE state (FXSAVE/FXRSTOR, done on every Wine system call) in one step instead of field by field. Same results.",
-      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
-      "group": "Speed", "restart": true, "experimental": false
-    },
-    {
-      "name": "nativeGlyphMetrics",
-      "label": "Native text measuring",
-      "description": "Answers Wine's cached text measuring (text extents, glyph metrics) as browser code instead of emulated x86.",
-      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
-      "group": "Speed", "restart": true, "experimental": false
-    },
-    {
-      "name": "nativeDibdrv",
-      "label": "Native GDI drawing",
-      "description": "Runs Wine's per-pixel GDI drawing into bitmaps (text, fills, blits, blends) as browser code instead of emulated x86.",
-      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
-      "group": "Speed", "restart": true, "experimental": false
-    },
-    {
-      "name": "cheapGetMessage",
-      "label": "Cheap message retrieval",
-      "description": "GetMessage asks Wine's server only for the message itself, not twice more to reset and re-read its queue state.",
+      "name": "nativeFreetype",
+      "label": "Native FreeType",
+      "description": "Loads and draws Windows text glyphs (GDI fonts) as browser code instead of emulated x86.",
       "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
       "group": "Speed", "restart": true, "experimental": false
     },
@@ -74,9 +39,44 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
-      "name": "nativeFreetype",
-      "label": "Native FreeType",
-      "description": "Loads and draws Windows text glyphs (GDI fonts) as browser code instead of emulated x86.",
+      "name": "cheapGetMessage",
+      "label": "Cheap message retrieval",
+      "description": "GetMessage asks Wine's server only for the message itself, not twice more to reset and re-read its queue state.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeDibdrv",
+      "label": "Native GDI drawing",
+      "description": "Runs Wine's per-pixel GDI drawing into bitmaps (text, fills, blits, blends) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeGlyphMetrics",
+      "label": "Native text measuring",
+      "description": "Answers Wine's cached text measuring (text extents, glyph metrics) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "cheapFxsave",
+      "label": "Cheap FPU state save",
+      "description": "Saves and restores the FPU/SSE state (FXSAVE/FXRSTOR, done on every Wine system call) in one step instead of field by field. Same results.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeMutex",
+      "label": "Native mutexes",
+      "description": "Takes and releases uncontended Linux-side locks (Wine's font, GDI and window locks) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "cheapSpi",
+      "label": "Cached system metrics",
+      "description": "SystemParametersInfo's window metrics are built once and reused until a setting or font changes, instead of measuring three fonts on every call.",
       "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
       "group": "Speed", "restart": true, "experimental": false
     },
