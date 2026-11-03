@@ -55,18 +55,18 @@ U32 ksocket(U32 domain, U32 type, U32 protocol) {
     if (domain==K_AF_UNIX) {
         std::shared_ptr<KUnixSocketObject> kSocket = std::make_shared<KUnixSocketObject>(domain, type, protocol);
         KFileDescriptorPtr result = KThread::currentThread()->process->allocFileDescriptor(kSocket, K_O_RDWR, 0, -1, 0);
-        return result->handle;
+        return result ? result->handle : -K_EMFILE;
     } else if (domain == K_AF_NETLINK) {       
         std::shared_ptr<KNetLinkObject> kSocket = std::make_shared<KNetLinkObject>(domain, type, protocol);
         KFileDescriptorPtr result = KThread::currentThread()->process->allocFileDescriptor(kSocket, K_O_RDWR, 0, -1, 0);
-        return result->handle;
+        return result ? result->handle : -K_EMFILE;
     } else if (domain == K_AF_INET) {
         std::shared_ptr<KSocketObject> s = KSocketObject::createInetSocket(domain, type, protocol);
         if (s->error) {
             return s->error;
         } else {
             KFileDescriptorPtr result = KThread::currentThread()->process->allocFileDescriptor(s, K_O_RDWR, 0, -1, 0);
-            return result->handle;
+            return result ? result->handle : -K_EMFILE;
         }
     }
     return -K_EAFNOSUPPORT;
@@ -129,6 +129,10 @@ U32 kaccept(KThread* thread, U32 socket, U32 address, U32 len, U32 flags) {
     if (!s->listening) {
         return -K_EINVAL;
     }
+    // Linux takes the number before it accepts: a full table leaves the connection queued
+    if (thread->process->isFileDescriptorTableFull()) {
+        return -K_EMFILE;
+    }
     return s->accept(thread, fd, address, len, flags);
 }
 
@@ -178,7 +182,14 @@ U32 ksocketpair(KThread* thread, U32 af, U32 type, U32 protocol, U32 socks, U32 
         return -1;
     }
     fd1 = ksocket(af, type, protocol);
+    if ((S32)fd1 < 0) {
+        return fd1;
+    }
     fd2 = ksocket(af, type, protocol);
+    if ((S32)fd2 < 0) {
+        thread->process->close(fd1);
+        return fd2;
+    }
     f1 = thread->process->getFileDescriptor(fd1);
     f2 = thread->process->getFileDescriptor(fd2);
     s1 = std::dynamic_pointer_cast<KUnixSocketObject>(f1->kobject);

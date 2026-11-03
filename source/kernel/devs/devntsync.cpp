@@ -26,8 +26,9 @@
 // Differences from Linux: one lock for every device and object (Linux locks per object plus a per-device
 // wait-all lock), and a blocked wait is a record that outlives the syscall: the single-threaded scheduler
 // returns K_WAIT and runs the ioctl again when the thread wakes, so the rerun finds its record by thread and
-// argument address and picks up where it left off. A signal delivered to a blocked thread runs its handler
-// first and the ioctl then restarts the same wait (Linux: -ERESTARTSYS), so the timeout stays absolute.
+// argument address and picks up where it left off. A signal delivered to a blocked thread takes it out of line
+// before the handler runs, so a set or release during the handler goes to the next waiter. The ioctl then runs
+// again from the guest's args (Linux: -ERESTARTSYS): the timeout stays absolute and it queues at the back.
 
 #define NTSYNC_K_EOVERFLOW 75
 #define NTSYNC_K_EOWNERDEAD 130
@@ -572,8 +573,9 @@ static U32 ntsyncWait(KThread* thread, const std::shared_ptr<NtsyncDevice>& dev,
             return -K_EINTR;
         }
         if (thread->startSignal) {
-            // the handler runs, then the ioctl restarts and finds this wait again
+            // out of line for the handler; a wait that got its object stays for the rerun to report
             thread->startSignal = false;
+            ntsyncSignalDelivered(thread);
             return -K_CONTINUE;
         }
 #endif
@@ -581,12 +583,12 @@ static U32 ntsyncWait(KThread* thread, const std::shared_ptr<NtsyncDevice>& dev,
     return finishWait(thread, q);
 }
 
-void ntsyncThreadExit(KThread* thread) {
+static void dropWaits(KThread* thread, bool keepClaimed) {
     std::vector<NtsyncWait*> mine;
     {
         NtsyncLock lock;
         for (NtsyncWait* q : ntsyncWaits) {
-            if (q->thread == thread) {
+            if (q->thread == thread && !(keepClaimed && q->signaled.load() != -1)) {
                 mine.push_back(q);
             }
         }
@@ -597,6 +599,14 @@ void ntsyncThreadExit(KThread* thread) {
     for (NtsyncWait* q : mine) {
         delete q;
     }
+}
+
+void ntsyncThreadExit(KThread* thread) {
+    dropWaits(thread, false);
+}
+
+void ntsyncSignalDelivered(KThread* thread) {
+    dropWaits(thread, true);
 }
 
 class DevNtsync : public FsVirtualOpenNode {
@@ -616,6 +626,9 @@ private:
 
 U32 DevNtsync::create(KThread* thread, const std::shared_ptr<NtsyncObject>& obj) {
     KFileDescriptorPtr fd = thread->process->allocFileDescriptor(obj, K_O_RDWR, 0, -1, 0);
+    if (!fd) {
+        return -K_EMFILE;
+    }
     fd->descriptorFlags |= FD_CLOEXEC;
     return fd->handle;
 }

@@ -220,6 +220,7 @@ public:
     BString getAbsoluteExePath();
     void clone(const KProcessPtr& from);
     U32 getNextFileDescriptorHandle(int after);
+    bool isFileDescriptorTableFull();
     U32 alloc(KThread* thread, U32 len);
     void free(U32 address);
     U32 createString(KThread* thread, const BString& str);

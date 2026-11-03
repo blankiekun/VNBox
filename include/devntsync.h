@@ -8,4 +8,7 @@ FsOpenNode* openDevNtsync(const std::shared_ptr<FsNode>& node, U32 flags, U32 da
 // A thread that exits while blocked in a wait leaves its queue entries behind: drop them.
 void ntsyncThreadExit(KThread* thread);
 
+// A signal handler is about to run on this thread: a wait not yet given its object leaves its queues, as on Linux.
+void ntsyncSignalDelivered(KThread* thread);
+
 #endif
