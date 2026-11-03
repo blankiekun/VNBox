@@ -897,6 +897,25 @@ test('a payload in the URL is refused only with a game folder', () => {
     }
 });
 
+// The bug: a crafted link straight to the engine page runs p=cmd against a game's folder and saves.
+test('a game folder is refused on a top-level page, except on localhost', () => {
+    const start = (base, topLevel) => {
+        const shell = bootShell(base + 'lazy=opfs%3Avnbox%2Fg1&p=cmd');
+        if (topLevel) shell.window.top = shell.window;
+        else shell.window.top = {};
+        shell.context.setConfiguration();
+    };
+    assert.throws(() => start(page, true), /refused on a top-level page/);
+    assert.throws(() => start('https://localhost.evil.example/boxedwine.html?', true), /refused on a top-level page/);
+    start(page, false);
+    for (const base of ['http://127.0.0.1:8147/run.html?', 'http://localhost/boxedwine.html?', 'http://[::1]:8000/boxedwine.html?']) {
+        start(base, true);
+    }
+    const noGame = bootShell(page + 'app=game.zip');
+    noGame.window.top = noGame.window;
+    noGame.context.setConfiguration();
+});
+
 // The bug: the attacker's program gets a way out to the attacker's gateway.
 test('the network gateway stays on the page\'s host', () => {
     const gateway = (host, base = page) => bootShell(base + 'network=websocket&networkGateway=' + host).context.setConfiguration();
