@@ -13,9 +13,31 @@
 # vn/webgl/*.patch (build-webgl-wined3d.sh).
 # Usage: vn/build-jp-overlay.sh <TinyCore15Wine11.0-web.zip> <out/jp.zip>
 set -euo pipefail
+# The plain-build switches of the build scripts are for their byte-identical checks; a jp.zip is always patched.
+unset WIN32U_PATCHES WINEX11_PATCHES NTDLL_PATCHES NTSYNC WEBGL_FIX
 root_zip=$(realpath "$1")
 out=$(realpath -m "$2")
 here=$(cd "$(dirname "$0")" && pwd)
+
+# jp.zip's binaries replace files in the root fs, so all of these must be what that root fs was built from. They were
+# pinned apart: change them together, and only with a root fs rebuilt from that Wine and those patches.
+root_fs_sha=4d505092956dd78e36712dac8111c252e5d1b859ce2373fbe7c80242bb65ad47 # as ROOT_FS_SHA256 in vn-release.yml
+wine_sha=c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701 # sha= in the build-*.sh here
+root_fs_patches_sha=0c38425e39f1b20522787759400e2ca6d9e8b86f8b9ce84e8e296687b72720be # wine_builds.json's 11.0 patches
+echo "$root_fs_sha  $root_zip" | sha256sum -c --quiet || { echo "$root_zip is not the root fs jp.zip is built for" >&2; exit 1; }
+[ "$(grep -h '^sha=' "$here"/build-*.sh | sort -u)" = "sha=$wine_sha" ] || { echo "a vn/build-*.sh builds another Wine tar than the root fs's" >&2; exit 1; }
+python3 -I - "$here/../tools/buildWine" "$root_fs_patches_sha" <<'PY' || { echo "wine_builds.json's 11.0 patches are not the root fs's" >&2; exit 1; }
+import hashlib, json, sys
+src, want = sys.argv[1:]
+ver = lambda s: tuple(int(x) for x in s.split("."))
+h = hashlib.sha256()
+for op in json.load(open(f"{src}/wine_builds.json"))["operations"]:
+    w = op.get("when", {})
+    if ver(w.get("min", "0")) <= (11, 0) <= ver(w.get("max", "999")):
+        h.update(op["apply_patch"].encode() + b"\0" + open(f"{src}/patches/{op['apply_patch']}", "rb").read())
+sys.exit(h.hexdigest() != want)
+PY
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 boot_services="Eventlog PlugPlay NDIS nsiproxy"
@@ -50,7 +72,10 @@ FONTS
   # Faster Wine boot: services.exe starts every auto-start service and root device before the
   # game may run (~1.4 s in VNBox). A VN needs none of these: the event log, Plug and Play,
   # networking drivers, and the Bluetooth/HID/USB buses (no such devices in the browser; HID
-  # means no gamepads). Kept: mountmgr (drives, discs). Wine only reads this at boot, so the
+  # means no gamepads). With nsiproxy off, iphlpapi fails: GetAdaptersInfo, GetAdaptersAddresses,
+  # GetIfTable return ERROR_FILE_NOT_FOUND (with it on, GetIfTable works and the adapter calls return
+  # ERROR_NOT_SUPPORTED, as the emulator has no /proc/net/route), so a game can't read a MAC address
+  # either way. Kept: mountmgr (drives, discs). Wine only reads this at boot, so the
   # import takes effect from the next launch; the prefix below covers the first one.
   printf '\r\n'
   for s in $boot_services; do
@@ -154,3 +179,4 @@ sys.stdout.write(text)
 rm "$work/fonts.txt"
 rm -f "$out"
 (cd "$work" && find usr opt home | LC_ALL=C sort | zip -q -X -9 "$out" -@)
+python3 -I "$here/check-jp-zip.py" "$out"
