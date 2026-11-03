@@ -15,8 +15,14 @@ upstream_sha=1b624780d0e274c59706f120f1e190cc11daa5848da9f4b6a1558c40f939bbec
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-curl -sSfL --retry 5 --retry-all-errors -o "$work/wine.tar.xz" "$url"
-echo "$sha  $work/wine.tar.xz" | sha256sum -c --quiet
+# One download for all wine builds: dl.winehq.org answers a second fetch within a minute with 429.
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/vnbox/wine-11.0.tar.xz
+if ! echo "$sha  $cache" | sha256sum -c --quiet 2>/dev/null; then
+  mkdir -p "$(dirname "$cache")"
+  curl -sSfL --retry 5 --retry-all-errors -o "$cache" "$url"
+  echo "$sha  $cache" | sha256sum -c --quiet
+fi
+cp "$cache" "$work/wine.tar.xz"
 # The series in order as 000-name.patch, then VNBox's.
 mkdir -p "$work/patches"
 python3 -I - "$here/.." "$work/patches" <<'PY'

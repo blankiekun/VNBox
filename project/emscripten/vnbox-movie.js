@@ -32,7 +32,7 @@ function VnboxMovie(blob, canvas) {
     this.D = null;
     this.ready = (vnboxMovieModule = vnboxMovieModule || VnboxMovieDecoder()).then(D => {
         this.D = D;
-        this.restart();
+        if (!this.closed) this.restart();
     });
     this.ready.catch(error => this.fail(error));
 }
@@ -101,6 +101,7 @@ VnboxMovie.prototype.step = function () {
         this.audioClock = vnboxMovieAudio.currentTime + 0.05 - time;
     }
     var flags = D._vm_decode(m, Math.max(0, now - this.clock - time));
+    if (flags & 4) return this.fail("no MPEG-1 stream to decode in this file");
     if (flags & 1) this.draw();
     for (var i = 0, n = D._vm_audio_count(m); i < n; i++) this.play(D._vm_audio_time(m, i), D._vm_audio(m, i));
     if (flags & 2) {
@@ -159,6 +160,8 @@ VnboxMovie.prototype.pause = function () {
 };
 
 VnboxMovie.prototype.destroy = function () {
+    this.closed = true;
+    this.wanted = false;
     this.pause();
     this.reading = null;
     if (this.m) this.D._vm_destroy(this.m);
@@ -211,11 +214,15 @@ function vnboxMovieCommand(id, cmd, arg) {
     if (cmd === "rect") {
         movie.rect = arg.split(" ").map(Number);
     } else if (cmd === "run") {
-        movie.ready.then(() => movie.run());
+        // Deferred, so a pause, stop or close sent right after it, or queued with it, comes first.
+        movie.wanted = true;
+        movie.ready.then(() => { if (movie.wanted) movie.run(); });
     } else if (cmd === "pause") {
+        movie.wanted = false;
         movie.stopped = false;
         movie.pause();
     } else if (cmd === "stop") {
+        movie.wanted = false;
         movie.stopped = true;
         movie.pause();
     } else if (cmd === "seek") {

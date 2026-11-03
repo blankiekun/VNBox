@@ -35,7 +35,7 @@
  
 --- a/dlls/win32u/sysparams.c
 +++ b/dlls/win32u/sysparams.c
-@@ -4863,6 +4863,84 @@ static DWORD load_entry( struct sysparam_entry *entry, void *data, DWORD size )
+@@ -4863,6 +4863,82 @@ static DWORD load_entry( struct sysparam_entry *entry, void *data, DWORD size )
      return count;
  }
  
@@ -78,7 +78,6 @@
 +static LONG ncm_cache_get( NONCLIENTMETRICSW *ncm, BOOL for_dpi, UINT dpi )
 +{
 +    UINT context = get_thread_dpi_awareness_context(), cb = ncm->cbSize;
-+    int padded = ncm->iPaddedBorderWidth;
 +    LONG gen;
 +    unsigned int i;
 +
@@ -88,10 +87,9 @@
 +    {
 +        if (ncm_cache[i].gen != gen || ncm_cache[i].for_dpi != for_dpi || ncm_cache[i].dpi != dpi ||
 +            ncm_cache[i].context != context) continue;
-+        *ncm = ncm_cache[i].ncm;
++        memcpy( ncm, &ncm_cache[i].ncm, cb == sizeof(*ncm) ? sizeof(*ncm) : FIELD_OFFSET(NONCLIENTMETRICSW, iPaddedBorderWidth) );
 +        pthread_mutex_unlock( &ncm_cache_lock );
 +        ncm->cbSize = cb;
-+        if (cb != sizeof(*ncm)) ncm->iPaddedBorderWidth = padded;
 +        return 0;
 +    }
 +    pthread_mutex_unlock( &ncm_cache_lock );
@@ -120,7 +118,7 @@
  /* save a value to a registry entry */
  static BOOL save_entry( const struct sysparam_entry *entry, const void *data, DWORD size,
                          DWORD type, UINT flags )
-@@ -4870,6 +4948,8 @@ static BOOL save_entry( const struct sysparam_entry *entry, const void *data, DW
+@@ -4870,6 +4946,8 @@ static BOOL save_entry( const struct sysparam_entry *entry, const void *data, DW
      HKEY base_key, volatile_key;
      WCHAR nameW[64];
  
@@ -129,7 +127,7 @@
      asciiz_to_unicode( nameW, entry->regval );
      if (flags & SPIF_UPDATEINIFILE)
      {
-@@ -5975,8 +6055,14 @@ BOOL WINAPI NtUserSystemParametersInfoForDpi( UINT action, UINT val, PVOID ptr,
+@@ -5975,8 +6053,14 @@ BOOL WINAPI NtUserSystemParametersInfoForDpi( UINT action, UINT val, PVOID ptr,
      case SPI_GETNONCLIENTMETRICS:
      {
          NONCLIENTMETRICSW *ncm = ptr;
@@ -144,7 +142,7 @@
          ret = get_entry_dpi( &entry_BORDER, 0, &ncm->iBorderWidth, dpi ) &&
                get_entry_dpi( &entry_SCROLLWIDTH, 0, &ncm->iScrollWidth, dpi ) &&
                get_entry_dpi( &entry_SCROLLHEIGHT, 0, &ncm->iScrollHeight, dpi ) &&
-@@ -5994,6 +6080,7 @@ BOOL WINAPI NtUserSystemParametersInfoForDpi( UINT action, UINT val, PVOID ptr,
+@@ -5994,6 +6078,7 @@ BOOL WINAPI NtUserSystemParametersInfoForDpi( UINT action, UINT val, PVOID ptr,
          if (ret && ncm->cbSize == sizeof(NONCLIENTMETRICSW))
              ret = get_entry_dpi( &entry_PADDEDBORDERWIDTH, 0, &ncm->iPaddedBorderWidth, dpi );
          normalize_nonclientmetrics( ncm );
@@ -152,7 +150,7 @@
          break;
      }
      case SPI_GETICONMETRICS:
-@@ -6197,9 +6284,15 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
+@@ -6197,9 +6282,15 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
      {
          NONCLIENTMETRICSW *nm = ptr;
          int padded_border;
@@ -168,7 +166,7 @@
          ret = get_entry( &entry_BORDER, 0, &nm->iBorderWidth ) &&
                get_entry( &entry_PADDEDBORDERWIDTH, 0, &padded_border ) &&
                get_entry( &entry_SCROLLWIDTH, 0, &nm->iScrollWidth ) &&
-@@ -6221,6 +6314,7 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
+@@ -6221,6 +6312,7 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
              if (nm->cbSize == sizeof(NONCLIENTMETRICSW)) nm->iPaddedBorderWidth = 0;
          }
          normalize_nonclientmetrics( nm );

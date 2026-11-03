@@ -1,5 +1,5 @@
-# VNBox checks on every pull request and push to master: the fork's own self-checks (vn-checks.yml) and the
-# testJit suite.
+# VNBox checks on every pull request and push to master: the fork's own self-checks (vn-checks.yml), the
+# testJit suite, and a build of the web engine VNBox ships.
 name: VN CI
 
 on:
@@ -55,3 +55,32 @@ jobs:
 
       - name: Run testJit
         run: project/emscripten/run-testjit-node.sh -fast
+
+  # Catches compile and link breaks in the build VNBox ships (JSPI, the movie decoder), which testJit doesn't build.
+  # Not jp.zip or a guest boot: nothing runs here.
+  jitjspi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      EMSDK_VERSION: 5.0.7 # same as vn-release.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      # Its own cache: this build's flags need other compiled system libraries than testJit's.
+      - id: emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ env.EMSDK_VERSION }}-jitjspi-${{ runner.os }}
+
+      - name: Install emsdk ${{ env.EMSDK_VERSION }}
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git ~/emsdk
+          ~/emsdk/emsdk install "$EMSDK_VERSION"
+          ~/emsdk/emsdk activate "$EMSDK_VERSION"
+
+      - name: Build jitJspi
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          make -C project/emscripten jitJspi make_jobs="$(nproc)"

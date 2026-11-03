@@ -106,3 +106,127 @@ for (const burst of ['？？「―――」', '「―――」？？遠くから
 }
 assert.deepEqual(joined, ['？？「―――」', '？？遠くから。', '「……」', '「……」']);
 console.log('frida-compat joiner ok');
+// Bug caught: scriptFor()'s comment line ends at a line separator (a guest module name, an H-code's), and the rest runs in the site's origin at the next boot.
+let injected = false;
+const evil = F.scriptFor(F.loadHcode('/HS4@2000:a\u2028injected()//'));
+const fakeNamed = { ...fake, Process: { ...fake.Process, findModuleByName: () => ({ base: ptr(0x1000) }) } };
+new Function('injected', ...Object.keys(fakeNamed), evil)(() => { injected = true; }, ...Object.values(fakeNamed));
+assert.ok(!injected);
+console.log('frida-compat scriptFor comment ok');
+
+// A second copy of the file, as the page loads it: p= and frida= in the URL, and a fake game process.
+const reports = [];
+const loadPage = (url) => {
+    const q = new URL(url).searchParams;
+    globalThis.location = { href: url };
+    globalThis.vnboxParam = (name) => q.get(name);
+    globalThis.vnboxReport = (source, message) => reports.push(source + ': ' + message);
+    new Function(fs.readFileSync(new URL('./frida-compat.js', import.meta.url), 'utf8'))();
+    return globalThis.boxedwineFrida;
+};
+// Bug caught: a frida= that isn't a URL stopped the file while loading, and the emulator's first poll() threw through its wasm frames.
+const badUrl = loadPage('https://ex.org/vn/vnbox/boxedwine.html?p=game.exe&frida=http://');
+assert.equal(badUrl.poll(1, 1, 0x1000), 0);
+assert.deepEqual(reports.splice(0), ['frida: bad frida= URL: http://']);
+console.log('frida-compat bad URL ok');
+
+const P = loadPage('https://ex.org/vn/vnbox/boxedwine.html?p=game.exe');
+const TEB = 0x1000, LDR = 0x1200, HEAD = LDR + 0x0c;
+const guest = new DataView(new ArrayBuffer(0x400000)), guestBytes = new Uint8Array(guest.buffer);
+const heap2 = new Uint8Array(1 << 20);
+let top2 = 16, readable = guestBytes.length, fakeScan, prefetched = [];
+const scanAll = (pid, addr, size, pat, mask, len, out) => { // what bw_scan does
+    let n = 0;
+    const end = Math.min(addr + size, readable);
+    for (let a = addr; a + len <= end; a++) {
+        let i = 0;
+        while (i < len && (guestBytes[a + i] & heap2[mask + i]) === heap2[pat + i]) i++;
+        if (i === len) new DataView(heap2.buffer).setUint32(out + 4 * n++, a, true);
+    }
+    return n;
+};
+const scanWithinPages = (pid, addr, size, pat, mask, len, out) => { // the bug the self-check is there for
+    let n = 0;
+    const end = Math.min(addr + size, readable);
+    for (let a = addr; a + len <= end; a++) {
+        if ((a & 0xfff) + len > 0x1000) continue;
+        let i = 0;
+        while (i < len && (guestBytes[a + i] & heap2[mask + i]) === heap2[pat + i]) i++;
+        if (i === len) new DataView(heap2.buffer).setUint32(out + 4 * n++, a, true);
+    }
+    return n;
+};
+P.api = {
+    malloc: (n) => { const p = top2; top2 += n; return p; }, free: () => {}, heap: () => heap2,
+    read: (pid, addr, buf, len) => {
+        const n = Math.max(0, Math.min(len, readable - addr));
+        heap2.set(guestBytes.subarray(addr, addr + n), buf);
+        return n;
+    },
+    scan: (...a) => fakeScan(...a), prefetch: (addr, size) => prefetched.push([addr, size]), hookAdd: () => 1, hookRemove: () => {},
+};
+fakeScan = scanAll;
+const put16 = (at, s) => { [...s].forEach((c, i) => guest.setUint16(at + 2 * i, c.charCodeAt(0), true)); };
+const putString = (at, s, buffer) => { guest.setUint16(at, s.length * 2, true); guest.setUint32(at + 4, buffer, true); put16(buffer, s); };
+let entryAt = 0x2000, lastEntry = HEAD;
+guest.setUint32(TEB + 0x30, 0x1100, true);
+guest.setUint32(0x1100 + 0x0c, LDR, true);
+guest.setUint32(HEAD, HEAD, true);
+guest.setUint32(HEAD + 4, HEAD, true);
+const addModule = (path, base, size, exportRva = 0) => { // an InLoadOrderModuleList entry, at the end as the loader adds it
+    const e = entryAt, name = path.split('\\').pop();
+    entryAt += 0x400;
+    guest.setUint32(e, HEAD, true);
+    guest.setUint32(HEAD + 4, e, true);
+    guest.setUint32(lastEntry, e, true);
+    lastEntry = e;
+    guest.setUint32(e + 0x18, base, true);
+    guest.setUint32(e + 0x20, size, true);
+    putString(e + 0x24, path, e + 0x40);
+    putString(e + 0x2c, name, e + 0x200);
+    guest.setUint32(base + 0x3c, 0x80, true); // PE header at 0x80, its export directory entry at +0x78
+    guest.setUint32(base + 0x80 + 0x78, exportRva, true);
+    guest.setUint32(base + 0x80 + 0x7c, exportRva ? 0x500 : 0, true);
+};
+const EXE = 0x100000, WINEDLL = 0x200000, GAMEDLL = 0x280000, LATE = 0x300000, LATEWINE = 0x340000;
+guestBytes.set([0x4d, 0x5a, 0x90], EXE);
+guestBytes.set([1, 2, 3, 4, 5, 6, 7, 8], EXE + 0xffc); // the self-check's match across a page boundary
+addModule('C:\\launcher\\explorer.exe', EXE, 0x4000);
+addModule('C:\\windows\\system32\\kernel32.dll', WINEDLL, 0x50000, 0x7000);
+addModule('C:\\games\\windows\\engine.dll', GAMEDLL, 0x40000, 0x2000);
+const takePrefetched = () => prefetched.splice(0);
+let clock = 1000;
+performance.now = () => clock;
+P.loadHcode('/HS4@2000:'); // starts attaching
+// Bug caught: a pid seen once under another name (a launcher's fork child before its exec) was never looked at again, so that boot had no hook.
+assert.equal(P.poll(7, 1, TEB), 0);
+putString(0x2000 + 0x2c, 'game.exe', 0x2000 + 0x200);
+assert.equal(P.poll(7, 1, TEB), 0);
+clock += 2001;
+// Bug caught: a game's own DLL loaded only its headers, so scans missed every page it had not run yet. Wine's DLLs stay headers and export directory.
+assert.equal(P.poll(7, 1, TEB), 2);
+assert.deepEqual(takePrefetched(), [[EXE, 0x4000], [WINEDLL, 0x1000], [GAMEDLL, 0x40000]]);
+assert.equal(P.poll(7, 1, TEB), 1);
+assert.deepEqual(takePrefetched(), [[WINEDLL + 0x7000, 0x500], [GAMEDLL + 0x2000, 0x500]]);
+P.attach(7, 1, TEB);
+assert.deepEqual(reports.splice(0), []);
+assert.equal(P.poll(7, 1, TEB), 0);
+assert.deepEqual(takePrefetched(), []);
+// Bug caught: a DLL loaded after attach got nothing, so a script's retry of its export lookup or scan could never work.
+addModule('C:\\games\\late.dll', LATE, 0x8000, 0x1000);
+addModule('C:\\windows\\system32\\quartz.dll', LATEWINE, 0x20000, 0x3000);
+assert.equal(P.poll(7, 1, TEB), 2);
+assert.deepEqual(takePrefetched(), [[LATE, 0x8000], [LATEWINE, 0x1000]]);
+assert.equal(P.poll(7, 1, TEB), 0);
+assert.deepEqual(takePrefetched(), [[LATE + 0x1000, 0x500], [LATEWINE + 0x3000, 0x500]]);
+assert.equal(P.poll(7, 1, TEB), 0);
+assert.deepEqual(takePrefetched(), []);
+console.log('frida-compat attach ok');
+// Bug caught: a scan that stops at page ends made every game with a scanning script "have no text", with one console line to say why.
+fakeScan = scanWithinPages;
+P.attach(7, 1, TEB);
+assert.deepEqual(reports.splice(0), ['frida: scan self-check failed: scripts that scan memory will find nothing']);
+readable = EXE + 0x1000; // an exe with no second page has no boundary to check
+P.attach(7, 1, TEB);
+assert.deepEqual(reports.splice(0), []);
+console.log('frida-compat scan self-check ok');

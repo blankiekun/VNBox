@@ -87,6 +87,7 @@ private:
     std::atomic<U32> emscriptenMouseButtons{0};
     std::atomic<U64> emscriptenMousePosition{~(U64)0};
 #endif
+    void hostMousePos(int* x, int* y);
     void updateMouseConfinement(SDL_Window* window);
     bool wantsMouseCapture();
     void updateMouseCaptureTitle(SDL_Window* window);

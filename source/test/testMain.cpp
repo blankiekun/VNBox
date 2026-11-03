@@ -33,6 +33,8 @@
 #include "cpu/testHostAcm.h"
 #include "cpu/testHostVorbis.h"
 #include "cpu/testHostFreetype.h"
+#include "cpu/testHostDibdrv.h"
+#include "cpu/testHostGlyphm.h"
 #include "cpu/testHostWined3d.h"
 #include "opengl/testHostWined3dWgl.h"
 #include "cpu/testCMov.h"
@@ -218,6 +220,11 @@ void testStartupArgsLocalServerOption();
 #endif
 void testTerminatingThreadDoesNotEnterFutexWait();
 void testSharedFutexUnmappedAddressReturnsEFAULT();
+void testRobustListOnThreadExit();
+void testSelfSignalResumeAddress();
+#ifndef BOXEDWINE_MULTI_THREADED
+void testNtsyncSignalDuringWaitLeavesEvent();
+#endif
 void testUnixSocketPollOutClearsPeerCondition();
 void testUnixSocketSendmsgStreamPayloadCanBeRead();
 void testUnixSocketWritevInvalidSecondIovAfterZeroLengthFirstReturnsEfault();
@@ -256,6 +263,8 @@ const TestEntry TEST_ENTRIES[] = {
 #ifndef BOXEDWINE_MULTI_THREADED
     {testSingleThreadSchedulerTimeSlice, "Test single-thread scheduler timed turns", TEST_ENTRY_SERIAL},
     {testSingleThreadSchedulerTimers, "Test single-thread scheduler timer deadlines", TEST_ENTRY_SERIAL},
+    {testSingleThreadSchedulerWakeChain, "Test single-thread scheduler wake chain doesn't starve others", TEST_ENTRY_SERIAL},
+    {testNtsyncSignalDuringWaitLeavesEvent, "Test ntsync waiter taking a signal leaves the event to the next", TEST_ENTRY_SERIAL},
 #endif
 #if defined(BOXEDWINE_JIT_X86) || defined(BOXEDWINE_JIT_X64) || defined(BOXEDWINE_JIT_ARMV8)
     {testWasmJitFpuCache, "Test native JIT x87 stack cache"},
@@ -379,6 +388,7 @@ const TestEntry TEST_ENTRIES[] = {
 #endif
 #if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
     {testWasmJitStBoundedDispatch, "Test ST WASM JIT instruction budget", TEST_ENTRY_SERIAL},
+    {testWasmJitSideExitTargetRewritten, "Test ST WASM JIT side exit after its target is rewritten", TEST_ENTRY_SERIAL},
     {testWasmJitHotGroups, "Test ST WASM JIT hot groups", TEST_ENTRY_SERIAL},
     {testWasmJitHotGroupOom, "Test ST WASM JIT hot group out of memory", TEST_ENTRY_SERIAL},
     {testWasmJitSingleOpOomPropagates, "Test ST WASM JIT single op allocation failure", TEST_ENTRY_SERIAL},
@@ -920,12 +930,27 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostLibcStrtol, "Test native libc strtol/strtoul"},
     {testHostClock, "Test native clock reads (QPC, system time)"},
     {testHostLibcMutex, "Test native pthread_mutex_lock/unlock"},
+    {testHostHookPatchedExport, "Test a game's patch on a hooked export runs instead of the hook"},
+    {testHostLibcHead, "Test a hooked export's head op does the call or goes on with the guest function"},
+    {testHostLibcDeclines, "Test native libc leaves DF, segments, code, copy-on-write and unloaded pages to the guest"},
+    {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
+    {testHostAcmBadFile, "Test a corrupt vorbis.acm can't make the host allocate gigabytes"},
+    {testHostAcmBadSource, "Test a bad source length can't make the host allocate gigabytes"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
+    {testHostVorbisSeek, "Test native libvorbis restart, trackonly and a second stream on the same objects"},
 #endif
 #ifdef BOXEDWINE_HOST_FREETYPE
     {testHostFreetypeGlyphs, "Test host FreeType faces and glyphs as win32u uses them"},
+    {testHostFreetypeTables, "Test host FreeType's sfnt tables, names and bitmap-font mirrors"},
+#endif
+#ifdef BOXEDWINE_HOST_DIBDRV
+    {testHostDibdrvCopies, "Test host DIB primitives give the bytes of a whole-bitmap run"},
+    {testHostDibdrvDeclines, "Test host DIB primitives leave what they can't do to the guest"},
+#endif
+#ifndef BOXEDWINE_MULTI_THREADED
+    {testHostGlyphmAnswers, "Test host glyph metrics answer as Wine's cache does, or not at all"},
 #endif
 #ifdef BOXEDWINE_HOST_WINED3D
     {testHostWined3dNo3d, "Test host wined3d links and creates a no-3D wined3d", TEST_ENTRY_SERIAL},
@@ -1284,6 +1309,8 @@ const TestEntry TEST_ENTRIES[] = {
 #endif
     {testCapturedMouseSensitivity, "Test captured mouse sensitivity and recentering"},
     {testSharedFutexUnmappedAddressReturnsEFAULT, "Test unmapped shared futex returns EFAULT"},
+    {testRobustListOnThreadExit, "Test thread exit marks its robust futexes owner-dead"},
+    {testSelfSignalResumeAddress, "Test a thread signalling itself resumes at the right address", TEST_ENTRY_SERIAL},
 #ifdef BOXEDWINE_MULTI_THREADED
     {testTerminatingThreadDoesNotEnterFutexWait, "Test terminating thread does not enter futex wait"},
 #endif

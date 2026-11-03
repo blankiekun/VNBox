@@ -31,6 +31,9 @@ encoding instead:
 make release WASM_EXCEPTIONS_FLAG=-fwasm-exceptions
 ```
 
+The `jitJspi` target also needs WebAssembly JSPI: Chrome/Edge 137+ or Firefox 153+.
+Other browsers get a message on the page saying so.
+
 
 ## Build
 
@@ -152,6 +155,10 @@ The current cache version is `v6`. Record new cache ZIPs with this build;
 `v5` modules embed an older CPU layout and are rejected. Keep the cache version
 in `boxedwine-shell.js`, `jitWasmCodeGen.cpp`, and the offline cache pipeline
 in sync whenever generated modules become incompatible with the runtime.
+
+The cache is opt-in: only a page opened with `?jit-record=true` opens its
+IndexedDB store and looks for a cache ZIP. Any other start does neither, and
+ignores a ZIP at that URL.
 
 Run `node testJitCacheVersion.mjs` to check old-cache rejection, current-cache
 imports in ST/MT loaders, and flat-to-grouped pipeline round trips. The test

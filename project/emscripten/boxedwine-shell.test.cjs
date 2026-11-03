@@ -785,6 +785,7 @@ async function loadDisc(url, served) {
             stat(file) { if (!files.has(file)) { throw new Error('ENOENT'); } return {}; },
             mkdirTree() {},
             readFile(file) { return files.get(file); },
+            writeFile(file, text) { files.set(file, Buffer.from(text)); },
             createDataFile(dir, name, bytes) { files.set(dir + name, Buffer.from(bytes)); },
         },
         fetch(name) {
@@ -792,7 +793,7 @@ async function loadDisc(url, served) {
             const body = served[name];
             return Promise.resolve({
                 status: body === undefined ? 404 : 200,
-                arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+                arrayBuffer: async () => (typeof body === 'string' ? new TextEncoder().encode(body) : body).buffer,
             });
         },
     });
@@ -809,6 +810,15 @@ test('a BIN is downloaded with the CUE sheet beside it', async () => {
     const disc = await loadDisc('http://localhost/?cdrom=e:game.bin', { 'game.bin': 'data', 'game.cue': gameCue });
     assert.deepEqual(disc.written, ['/game.bin', '/game.cue']);
     assert.deepEqual(disc.discFiles, ['game.bin', 'game.cue']);
+});
+
+// Decoded as UTF-8 the name turns to U+FFFD: the download 404s, and no disc.
+test('a Shift-JIS CUE sheet gets its files under their real names', async () => {
+    const sjis = Uint8Array.from(Buffer.from('FILE "\x83\x51\x81\x5B\x83\x80.bin" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n', 'latin1'));
+    const bin = '\u30b2\u30fc\u30e0.bin';
+    const disc = await loadDisc('http://localhost/?cdrom=e:game.cue', { 'game.cue': sjis, [encodeURIComponent(bin)]: 'data' });
+    assert.deepEqual(disc.discFiles, ['game.cue', bin]);
+    assert.ok(disc.written.includes('/' + bin));
 });
 
 test('a BIN without a CUE sheet is downloaded alone', async () => {
@@ -835,13 +845,14 @@ function bootShell(url, syncError = null) {
     const elements = new Map();
     const reports = [];
     const window = { location: new URL(url), addEventListener() {}, parent: { postMessage(message) { reports.push(message); } } };
+    const element = () => ({ style: {}, value: '', listeners: {}, addEventListener(type, listener) { this.listeners[type] = listener; }, getContext() {}, contains() { return false; } });
     const context = vm.createContext({
         window,
         document: {
             addEventListener() {},
             getElementById(id) {
                 if (!elements.has(id)) {
-                    elements.set(id, { style: {}, value: '', addEventListener() {}, getContext() {}, contains() { return false; } });
+                    elements.set(id, element());
                 }
                 return elements.get(id);
             },
@@ -897,6 +908,47 @@ test('a payload in the URL is refused only with a game folder', () => {
     }
 });
 
+// The bug: every start opened IndexedDB and fetched a zip no release ships (a 404), and a file at that URL
+// silently turned on the slower replay mode. Only a recording may touch the cache.
+test('a plain start leaves the JIT cache alone; a recording opens it', () => {
+    const start = (query) => {
+        const shell = bootShell(page + query);
+        const calls = [];
+        Object.assign(shell.context, {
+            indexedDB: { open(name) { calls.push('open ' + name); return {}; } },
+            fetch(url) { calls.push('fetch ' + url); return new Promise(() => {}); },
+        });
+        Object.assign(shell.context.Module, {
+            _wasm_jit_set_persistence_active() {},
+            addRunDependency(name) { calls.push('wait ' + name); },
+        });
+        vm.runInContext('loadPersistedHostFolderHandle = () => new Promise(() => {})', shell.context);
+        shell.context.initialSetup();
+        return calls;
+    };
+    assert.deepEqual(start(''), ['wait setupBoxedWine']);
+    assert.deepEqual(start('jit-record=true'), ['wait wasm-jit-cache', 'open boxedwine-wasm-jit', 'wait setupBoxedWine']);
+});
+
+// The bug: a crafted link straight to the engine page runs p=cmd against a game's folder and saves.
+test('a game folder is refused on a top-level page, except on localhost', () => {
+    const start = (base, topLevel) => {
+        const shell = bootShell(base + 'lazy=opfs%3Avnbox%2Fg1&p=cmd');
+        if (topLevel) shell.window.top = shell.window;
+        else shell.window.top = {};
+        shell.context.setConfiguration();
+    };
+    assert.throws(() => start(page, true), /refused on a top-level page/);
+    assert.throws(() => start('https://localhost.evil.example/boxedwine.html?', true), /refused on a top-level page/);
+    start(page, false);
+    for (const base of ['http://127.0.0.1:8147/run.html?', 'http://localhost/boxedwine.html?', 'http://[::1]:8000/boxedwine.html?']) {
+        start(base, true);
+    }
+    const noGame = bootShell(page + 'app=game.zip');
+    noGame.window.top = noGame.window;
+    noGame.context.setConfiguration();
+});
+
 // The bug: the attacker's program gets a way out to the attacker's gateway.
 test('the network gateway stays on the page\'s host', () => {
     const gateway = (host, base = page) => bootShell(base + 'network=websocket&networkGateway=' + host).context.setConfiguration();
@@ -947,4 +999,101 @@ test('the boot going on after a stray rejection clears the message', () => {
     shell.context.setConfiguration();
     shell.context.startEmulator();
     assert.equal(shell.element('status').innerHTML, '');
+});
+
+// The bug: env=%22ABCD%22 threw in initialSetup and boot stopped; a value with a colon lost its tail.
+test('env= with no colon is ignored; a value keeps its colons', () => {
+    const env = (value) => bootShell(page + 'env=' + value).context.getEnvProp();
+    assert.equal(env('%22ABCD%22'), '');
+    assert.equal(env('%22A:b:c%22'), 'A=b:c');
+});
+
+// The bug: a URIError out of setConfiguration said nothing of which value; the page must name it.
+test('a malformed base URL stops the boot and names the parameter', () => {
+    for (const param of ['rootBase', 'appBase', 'overlayBase']) {
+        assert.throws(() => bootShell(page + param + '=%zz').context.setConfiguration(), new RegExp(param + ' is not a valid URL value: %zz'));
+    }
+    assert.equal(vm.runInContext('Config.locateRootBaseUrl', (() => {
+        const shell = bootShell(page + 'rootBase=a%20b+c');
+        shell.context.setConfiguration();
+        return shell.context;
+    })()), 'a b+c/'); // a plus in a folder name stays a plus
+});
+
+// The bug: every failure after start was dropped (bootFailed returns once running), so a dead game showed only its last frame.
+test('a failure after start shows over the game and stays; a stray rejection still does not', () => {
+    const shell = bootShell(page);
+    vm.runInContext('isRunning = true', shell.context);
+    shell.window.onunhandledrejection({ reason: new Error('stray') });
+    assert.equal(shell.element('status').textContent, undefined);
+    shell.context.gameFailed('The game stopped: <b>x</b>. Reload to continue.');
+    assert.equal(shell.element('status').textContent, 'The game stopped: <b>x</b>. Reload to continue.');
+    shell.context.Module.setStatus('');
+    assert.equal(shell.element('status').textContent, 'The game stopped: <b>x</b>. Reload to continue.');
+});
+
+// The bug: the listener called alert, which this page replaces with a console line.
+test('losing the WebGL context tells the player and the embedding page', () => {
+    const shell = bootShell(page);
+    const lost = shell.element('canvas').listeners.webglcontextlost;
+    let prevented = false;
+    lost({ preventDefault() { prevented = true; } });
+    assert.equal(shell.element('status').textContent, 'Graphics were lost. Reload the page.');
+    assert.deepEqual(shell.reports.map((report) => report.source), ['webgl']);
+    assert.equal(prevented, true);
+});
+
+// The bug: the loader's new WebAssembly.Suspending threw, and the page read "not a constructor" (before that, "Downloading..." forever).
+test('a JSPI build on a browser without JSPI says what the browser lacks', () => {
+    const shell = bootShell(page);
+    vm.runInContext('globalThis.boxedwineJspiReads = true; WebAssembly.Suspending = undefined', shell.context);
+    shell.window.onunhandledrejection({ reason: new TypeError('WebAssembly.Suspending is not a constructor') });
+    assert.match(shell.element('status').textContent, /needs WebAssembly JSPI/);
+
+    // Another failure on the same browser, in a build that does not use JSPI, keeps its own reason.
+    const other = bootShell(page);
+    vm.runInContext('WebAssembly.Suspending = undefined', other.context);
+    other.window.onunhandledrejection({ reason: new Error('disk') });
+    assert.equal(other.element('status').textContent, 'Unable to start: disk');
+});
+
+// The bug: a failed disc only reached the console, and the game asked for a disc with the cause hidden.
+test('a disc that fails to load is reported, at boot and at a swap; the boot goes on', async () => {
+    const shell = bootShell(page + 'cdrom=disc1.iso;disc2.iso');
+    shell.context.fetch = async () => ({ status: 404 });
+    shell.context.Module.ccall = () => 1;
+    shell.context.setConfiguration();
+    await new Promise((resolve) => shell.context.buildCDRomFileSystems(resolve));
+    assert.match(shell.reports[0].message, /Unable to load disc 1/);
+    shell.context.insertCDRomDisc(1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(shell.reports[1].message, /Unable to load disc 2/);
+    assert.deepEqual(shell.reports.map((report) => report.source), ['cdrom', 'cdrom']);
+});
+
+// The bug: an abort at commit (a full disk) fires no error event, so nothing ended the wasm-jit-cache wait and main never ran.
+// Also the audit's onabort = onerror: an error is followed by an abort, which would start the emulator twice.
+test('the JIT database ends its wait once on an abort, an error, or an open that throws', async () => {
+    const run = async (open, fire) => {
+        const shell = bootShell(page);
+        shell.context.updateSaveJitButton = () => {};
+        shell.context.fetch = async () => ({ ok: false });
+        shell.context.indexedDB = { open };
+        vm.runInContext('Config.appZipFile = ""; Config.locateRootBaseUrl = ""; Config.rootZipFile = "root.zip"', shell.context);
+        let ends = 0;
+        shell.context.initWasmJitCache(() => { ends++; });
+        if (fire) fire();
+        await new Promise((resolve) => setImmediate(resolve));
+        return ends;
+    };
+    const openWith = (fireOn) => {
+        const req = {};
+        const tx = { objectStore: () => ({ clear() {} }) };
+        return { open: () => req, fire: () => { req.onsuccess({ target: { result: { transaction: () => tx } } }); fireOn(tx); } };
+    };
+    const aborted = openWith((tx) => tx.onabort());
+    assert.equal(await run(aborted.open, aborted.fire), 1);
+    const errored = openWith((tx) => { if (tx.onerror) tx.onerror(); tx.onabort(); }); // as a browser fires them
+    assert.equal(await run(errored.open, errored.fire), 1);
+    assert.equal(await run(() => { throw new Error('SecurityError'); }), 1);
 });

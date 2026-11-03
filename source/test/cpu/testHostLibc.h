@@ -17,5 +17,9 @@ void testHostLibcScan();
 void testHostLibcStrtol();
 void testHostClock();
 void testHostLibcMutex();
+void testHostHookPatchedExport();
+void testHostLibcHead();
+void testHostLibcDeclines();
+void testHostHookHeadSingleStep();
 
 #endif

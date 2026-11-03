@@ -120,6 +120,67 @@ U32 runPtrace(TestContext& context, U32 request, U32 pid, U32 addr, U32 data) {
 
 } // namespace
 
+// Catches: kill or tgkill on the calling thread stepping eip past the syscall twice, which entered a handler 2 bytes in
+// and made an ignored signal skip 2 bytes of guest code.
+void testSelfSignalResumeAddress() {
+    TestContext& context = testContext();
+    constexpr U32 STACK_PAGE = 0x61800000;
+    constexpr U32 SYSCALL_EIP = 0x1000;
+    constexpr U32 HANDLER = 0x2000;
+    constexpr U32 NR_KILL = 37;
+    constexpr U32 NR_TGKILL = 270;
+    if (context.memory->mmap(context.thread, STACK_PAGE, K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE,
+        K_MAP_FIXED | K_MAP_PRIVATE, -1, 0) != STACK_PAGE) {
+        testFail("map self-signal stack");
+        return;
+    }
+    KThread* thread = context.process->createThread();
+    CPU* cpu = thread->cpu;
+    const KSigAction savedUsr1 = context.process->sigActions[K_SIGUSR1];
+    const KSigAction savedChld = context.process->sigActions[K_SIGCHLD];
+    const U64 savedMask = context.thread->sigMask;
+    context.thread->sigMask = ~0ULL; // kill must pick the new thread, the one making the call
+    auto call = [&](U32 number, U32 arg1, U32 arg2, U32 arg3) {
+        ChangeThread c(thread);
+        cpu->reg[0].u32 = number;
+        cpu->reg[3].u32 = arg1;
+        cpu->reg[1].u32 = arg2;
+        cpu->reg[2].u32 = arg3;
+        cpu->reg[4].u32 = STACK_PAGE + K_PAGE_SIZE / 2;
+        cpu->eip.u32 = SYSCALL_EIP;
+        thread->sigMask = 0;
+        thread->inSignal = 0;
+        ksyscall(cpu, 2);
+    };
+
+    context.process->sigActions[K_SIGUSR1].handlerAndSigAction = HANDLER;
+    context.process->sigActions[K_SIGUSR1].flags = 0;
+    context.process->sigActions[K_SIGCHLD].handlerAndSigAction = K_SIG_DFL;
+
+    call(NR_TGKILL, context.process->id, thread->id, K_SIGUSR1);
+    if (cpu->eip.u32 != HANDLER || cpu->reg[0].u32 != K_SIGUSR1) {
+        testFail("tgkill self with a handler: eip 0x%X, EAX %d", cpu->eip.u32, cpu->reg[0].u32);
+    }
+    call(NR_KILL, context.process->id, K_SIGUSR1, 0);
+    if (cpu->eip.u32 != HANDLER || cpu->reg[0].u32 != K_SIGUSR1) {
+        testFail("kill self with a handler: eip 0x%X, EAX %d", cpu->eip.u32, cpu->reg[0].u32);
+    }
+    call(NR_TGKILL, context.process->id, thread->id, K_SIGCHLD);
+    if (cpu->eip.u32 != SYSCALL_EIP + 2 || cpu->reg[0].u32 != 0) {
+        testFail("tgkill self ignored: eip 0x%X, EAX %d", cpu->eip.u32, cpu->reg[0].u32);
+    }
+    call(NR_KILL, context.process->id, K_SIGCHLD, 0);
+    if (cpu->eip.u32 != SYSCALL_EIP + 2 || cpu->reg[0].u32 != 0) {
+        testFail("kill self ignored: eip 0x%X, EAX %d", cpu->eip.u32, cpu->reg[0].u32);
+    }
+
+    context.process->sigActions[K_SIGUSR1] = savedUsr1;
+    context.process->sigActions[K_SIGCHLD] = savedChld;
+    context.thread->sigMask = savedMask;
+    context.process->deleteThread(thread);
+    context.memory->unmap(STACK_PAGE, K_PAGE_SIZE);
+}
+
 void testWaitPid() {
     TestContext& context = testContext();
     KThread* thread = context.thread;

@@ -48,6 +48,7 @@ void testRunCPU();
 void testCloneVmCompiledEntryHelpers();
 void testSingleThreadSchedulerTimeSlice();
 void testSingleThreadSchedulerTimers();
+void testSingleThreadSchedulerWakeChain();
 void testFail(const char* msg, ...);
 void testRunParallel(const TestEntry* entries, size_t entryCount, U32 workerCount = 0);
 void testJitSignalPendingReset();
@@ -77,6 +78,9 @@ void testWasmJitLoopReachability();
 void testWasmJitRepMovsdState();
 void testWasmJitMultipleLoops();
 void testWasmJitConditionalSideExits();
+#ifndef BOXEDWINE_MULTI_THREADED
+void testWasmJitSideExitTargetRewritten();
+#endif
 void testWasmJitSseCompareConditions();
 void testWasmJitFpuCache();
 void testWasmJitFpuMemory();

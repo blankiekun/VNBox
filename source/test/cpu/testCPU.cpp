@@ -352,6 +352,103 @@ void testSingleThreadSchedulerTimers() {
     }
 }
 
+// Catches: two threads that wake each other and block keeping every other runnable thread from a turn, including one
+// that was woken and then overtaken; a fix that loses the woken threads' place in front (their answers get slow), or
+// that takes a turn away when nothing else is runnable.
+void testSingleThreadSchedulerWakeChain() {
+    extern S32 contextTime;
+    extern S32 contextTimeRemaining;
+    static U64 hostTime;
+    TestContext& context = testContext();
+    class ChainCPU : public NormalCPU {
+    public:
+        ChainCPU(KMemory* memory) : NormalCPU(memory) { op.inst = Nop; }
+        DecodedOp* getOp(U32, U32) override { return &op; }
+        void run() override {
+            if (!turns++) {
+                firstTurnAt = hostTime;
+            }
+            blockInstructionCount += 1024;
+            if (sleepOn) {
+                hostTime += 50;
+                wake->signal();
+                sleepOn->wait();
+            } else {
+                hostTime += 1000;
+            }
+        }
+        DecodedOp op;
+        BOXEDWINE_CONDITION sleepOn;
+        BOXEDWINE_CONDITION wake;
+        U32 turns = 0;
+        U64 firstTurnAt = 0;
+    };
+    BOXEDWINE_CONDITION condA = std::make_shared<BoxedWineCondition>(B("testChainA"));
+    BOXEDWINE_CONDITION condC = std::make_shared<BoxedWineCondition>(B("testChainC"));
+    ChainCPU cpuA(context.memory), cpuC(context.memory), cpuB1(context.memory), cpuB2(context.memory);
+    cpuA.sleepOn = condA;
+    cpuA.wake = condC;
+    cpuC.sleepOn = condC;
+    cpuC.wake = condA;
+    struct Restore {
+        KProcessPtr process;
+        KThread* threads[4];
+        CPU* cpus[4];
+        S32 budget = contextTime;
+        S32 remaining = contextTimeRemaining;
+        ~Restore() {
+            for (U32 i = 0; i < 4; i++) {
+                threads[i]->cpu = cpus[i];
+                process->deleteThread(threads[i]);
+            }
+            contextTime = budget;
+            contextTimeRemaining = remaining;
+            setSchedulerTestClock(nullptr);
+        }
+    } restore{context.process, {}, {}};
+    ChainCPU* cpus[4] = {&cpuA, &cpuC, &cpuB1, &cpuB2};
+    for (U32 i = 0; i < 4; i++) {
+        restore.threads[i] = context.process->createThread();
+        restore.cpus[i] = restore.threads[i]->cpu;
+        restore.threads[i]->cpu = cpus[i];
+        cpus[i]->thread = restore.threads[i];
+    }
+    KThread* threadA = restore.threads[0];
+    KThread* threadC = restore.threads[1];
+    KThread* threadB1 = restore.threads[2];
+    KThread* threadB2 = restore.threads[3];
+    {
+        ChangeThread c(threadC);
+        condC->wait();
+    }
+    hostTime = 0;
+    setSchedulerTestClock([]() -> U64 { return hostTime; });
+    // Each B was woken, as a real thread would be, and then overtaken by A and C, so none of them has had a turn.
+    scheduleThread(threadB1);
+    scheduleThread(threadB2);
+    scheduleThread(threadA);
+
+    runSlice();
+    if (!cpuB1.turns || !cpuB2.turns) {
+        testFail("threads overtaken by a wake chain got no turn: B1 %u, B2 %u", cpuB1.turns, cpuB2.turns);
+    }
+    if (cpuB1.firstTurnAt < 2000 || cpuA.turns + cpuC.turns < 80) {
+        testFail("woken threads must keep running first: B1 started at %u, A and C had %u turns",
+            (U32)cpuB1.firstTurnAt, cpuA.turns + cpuC.turns);
+    }
+
+    // With nothing else runnable, the chain gets the whole slice.
+    unscheduleThread(threadB1);
+    unscheduleThread(threadB2);
+    const U32 chainTurns = cpuA.turns + cpuC.turns;
+    const U64 start = hostTime;
+    runSlice();
+    if (hostTime - start != 9000 || cpuA.turns + cpuC.turns - chainTurns != 180) {
+        testFail("a wake chain alone must not lose a turn: %u us, %u turns",
+            (U32)(hostTime - start), cpuA.turns + cpuC.turns - chainTurns);
+    }
+}
+
 void testSingleThreadSchedulerTimeSlice() {
     extern S32 contextTime;
     extern S32 contextTimeRemaining;

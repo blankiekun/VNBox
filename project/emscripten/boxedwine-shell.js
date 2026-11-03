@@ -173,6 +173,7 @@
             Config.extraZipFiles = getZipFileList("overlay"); //MANUAL:"dlls.zip;fonts.zip";
             Config.appZipFile = getAppZipFile("app"); //MANUAL:"chomp.zip";
             Config.lazyApp = vnboxParam("lazy") || ""; // "opfs:vn/albatross": game folder read lazily (lazyfs.js)
+            requireFrameForGameFolder();
             let cdrom = getCDRom("cdrom"); //MANUAL:{files: ["disc1.iso", "disc2.iso"], drive: "e"}
             Config.cdromISOFiles = cdrom.files;
             Config.cdromDrive = cdrom.drive;
@@ -337,8 +338,12 @@
                 if(property.length > 6) {
                 	if( (property.startsWith("%22") && property.endsWith("%22") )
                 		|| (property.startsWith('%27') && property.endsWith('%27'))){
-                    	let kv = property.substring(3, property.length - 3).split(':');
-                    	return kv[0].trim() + "=" + kv[1].trim();
+                    	let entry = property.substring(3, property.length - 3), colon = entry.indexOf(':');
+                    	if (colon < 0) {
+                    		console.log("ENV property must be NAME:value");
+                    		return '';
+                    	}
+                    	return entry.substring(0, colon).trim() + "=" + entry.substring(colon + 1).trim();
                 	}else{
 	                	console.log("ENV property must be in quoted string");
                 	}
@@ -492,8 +497,8 @@
         // ?jit-record=true switches the WASM JIT into relocatable codegen so
         // compiled blocks can be exported with the Save JIT Cache button. Off
         // by default because relocatable blocks give up the embedded-pointer
-        // dispatch fast paths (~12% throughput). Replay (a server cache zip
-        // being present) activates the same mode implicitly.
+        // dispatch fast paths (~12% throughput). A server cache zip is looked
+        // for only then: without this parameter no zip is fetched or replayed.
         function getJitRecord() {
             var record = getParameter("jit-record");
             if(!allowParameterOverride()){
@@ -573,6 +578,7 @@
                     prog = prog.substring(3, prog.length - 3);
                 }
                 prog = decodeUrlValue(prog);
+                if (Config.lazyApp.length > 0) prog = lazyGameName(prog); // as lazyfs.js names the folder's files; a launcher sends the name as listed
                 console.log("setting program to execute to: "+prog);
             }
             return prog;
@@ -780,6 +786,14 @@
             }
             return filename;
         }
+        // Players run the engine in a frame. A link straight to this page could run p=cmd against a game's folder and saves.
+        // A frame on another site can't reach them: browsers give it separate storage. Local tools run on localhost.
+        function requireFrameForGameFolder() {
+            let local = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+            if (Config.lazyApp.length > 0 && window.top === window && !local) {
+                throw new Error("lazy= is refused on a top-level page: open the game from the player");
+            }
+        }
         // What the URL makes the page fetch or connect to stays on this site: a zip runs with the game's
         // folder and saves mounted and stays in OPFS for later games. Throws before anything is mounted or stored.
         function requireOwnSite(param, url, part) {
@@ -804,7 +818,11 @@
             if (!allowParameterOverride() || baseUrl === "") {
                 return "";
             }
-            baseUrl = decodeURIComponent(baseUrl);
+            try {
+                baseUrl = decodeURIComponent(baseUrl);
+            } catch (e) {
+                throw new Error(param + " is not a valid URL value: " + baseUrl); // shown by bootFailed: a typo, not an endless download
+            }
             if (!baseUrl.endsWith("/")) {
                 baseUrl += "/";
             }
@@ -947,7 +965,7 @@
         function buildCDRomFileSystems(callback) {
 			if(Config.cdromISOFiles.length > 0){
 				loadCDRomDisc(0).then(callback).catch(function(error) {
-					console.log("Unable to load disc 1: " + error);
+					vnboxReport("cdrom", "Unable to load disc 1: " + error);
 					callback();
 				});
             }else{
@@ -957,6 +975,14 @@
         // The files of each disc that has been loaded: an ISO image, or a CUE sheet and
         // the BIN or WAVE files it lists
         var cdromDiscFiles = [];
+        // UTF-8 (a BOM is dropped), or what Japanese Windows writes.
+        function cueSheetText(bytes) {
+            try {
+                return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+            } catch (e) {
+                return new TextDecoder("shift_jis").decode(bytes);
+            }
+        }
         function cueSheetFiles(cue, text) {
             let dir = cue.substring(0, cue.lastIndexOf("/") + 1);
             let files = [];
@@ -1008,7 +1034,7 @@
             return fetch(cdromFileUrl(cue), { method: 'GET' }).then(function(response) {
                 return response.status === 200 ? response.arrayBuffer() : null;
             }).then(function(buffer) {
-                if (!buffer || cueSheetFiles(cue, new TextDecoder().decode(buffer)).length == 0) {
+                if (!buffer || cueSheetFiles(cue, cueSheetText(buffer)).length == 0) {
                     return null;
                 }
                 writeCDRomFile(cue, new Uint8Array(buffer));
@@ -1033,7 +1059,8 @@
                     cdromDiscFiles[index] = [disc];
                     return fetchCDRomFile(disc);
                 }
-                let files = cueSheetFiles(cue, new TextDecoder().decode(FS.readFile("/" + cue)));
+                let text = cueSheetText(FS.readFile("/" + cue)), files = cueSheetFiles(cue, text);
+                FS.writeFile("/" + cue, text); // Boxedwine reads the sheet as UTF-8, and these names are what gets written below
                 // a BIN read through its CUE sheet is normally one of the files it lists
                 cdromDiscFiles[index] = [disc, cue].concat(files).filter(function(file, i, all) {
                     return all.indexOf(file) === i;
@@ -1135,7 +1162,7 @@
                         });
                     });
                 } else {
-                    console.log("Unable to insert disc " + (index + 1) + ": " + disc);
+                    vnboxReport("cdrom", "Unable to insert disc " + (index + 1) + ": " + disc);
                 }
                 cdromLoading = -1;
                 updateCDRomControls();
@@ -1151,7 +1178,7 @@
                     finish(inserted);
                 }
             }).catch(function(error) {
-                console.log("Unable to load disc " + (index + 1) + ": " + disc + " error: " + error);
+                vnboxReport("cdrom", "Unable to load disc " + (index + 1) + ": " + disc + " error: " + error);
                 cdromLoading = -1;
                 updateCDRomControls();
             });
@@ -1359,8 +1386,12 @@
             }
 
             // preRun executes after the WASM exports have been installed. Only
-            // JIT builds export this persistence latch and can use the cache.
-            if (typeof Module._wasm_jit_set_persistence_active === 'function') {
+            // JIT builds export this persistence latch and can use the cache,
+            // and only a recording (?jit-record=true) opens it: a plain start
+            // needs no IndexedDB, no zip fetch and nothing to wait for, and the
+            // EM_JS cache code is not reached without persistence mode.
+            if (Config.recordJITCache === true &&
+                    typeof Module._wasm_jit_set_persistence_active === 'function') {
                 // Create /tmp-jit-modules so the JIT cache import path is valid.
                 try { FS.mkdir('/tmp-jit-modules'); } catch(e) {}
 
@@ -2464,7 +2495,11 @@
           // As a default initial behavior, pop up an alert when webgl context is lost. To make your
           // application robust, you may want to override this behavior before shipping!
           // See http://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15.2
-          canvas.addEventListener("webglcontextlost", function(e) { alert('WebGL context lost. You will need to reload the page.'); e.preventDefault(); }, false);
+          canvas.addEventListener("webglcontextlost", function(e) {
+            vnboxReport('webgl', 'WebGL context lost');
+            gameFailed('Graphics were lost. Reload the page.');
+            e.preventDefault();
+          }, false);
           var originalGetContext = canvas.getContext.bind(canvas);
           canvas.getContext = function(type, attributes) {
             if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {
@@ -2535,14 +2570,17 @@
         var reason = event && event.reason;
         Module.printErr('Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : reason));
         if (typeof vnboxReport === 'function') vnboxReport('error', 'Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : reason));
-        bootFailed('Unable to start: ' + (reason && reason.message ? reason.message : reason)); // preRun and fetches land here
+        // preRun and fetches land here, and the loader's new WebAssembly.Suspending on a browser without JSPI
+        var noJspi = typeof boxedwineJspiReads !== 'undefined' && typeof WebAssembly.Suspending !== 'function';
+        bootFailed(noJspi ? 'This browser cannot run this build: it needs WebAssembly JSPI (Chrome 137+, Firefox 153+).'
+                          : 'Unable to start: ' + (reason && reason.message ? reason.message : reason));
       };
 function createFile(dir, name, buf) {
     try {
         FS.createDataFile(dir, name, buf, true, true);
         console.log("File created:" + dir + "/" + name);
     } catch(e) {
-        console.log("Unable to create file:" + dir + "/" + name + "  error:" + e);
+        vnboxReport("boot", "Unable to create file:" + dir + "/" + name + "  error:" + e);
     }
 }
 // The log textarea shows the last OUTPUT_KEPT_LINES lines, rewritten at most every 250 ms:
@@ -2563,10 +2601,21 @@ function flushOutput() {
     element.value = outputLines.join("\n") + "\n";
     element.scrollTop = element.scrollHeight;
 }
+// Called by the engine (startupArgs.cpp) instead of running without a root or overlay zip.
+function vnboxZipFailed(zip) {
+    var name = zip.split("/").pop(), text = "Unable to read " + name + ": it is damaged or not a zip. Reload to try again.";
+    lazyForgetUnlistedZip(name);
+    vnboxReport("lazyfs", text);
+    isRunning = false;
+    bootFailed(text);
+}
 // A boot that cannot go on says why, in place of "Preparing...". textContent: the reason can hold file names.
 var bootFailure = false;
 function bootFailed(text) {
-    if (isRunning) return;
+    if (!isRunning) gameFailed(text);
+}
+// The same once the game has started: a dead tick, lost graphics, a guest that could not start. Stays over its last frame.
+function gameFailed(text) {
     bootFailure = true;
     statusElement.textContent = text;
     spinnerElement.style.display = 'none';
@@ -2637,7 +2686,14 @@ function initWasmJitCache(callback) {
         updateSaveJitButton();
         callback();
     };
-    var req = indexedDB.open('boxedwine-wasm-jit', 1);
+    var req;
+    try {
+        req = indexedDB.open('boxedwine-wasm-jit', 1);
+    } catch (e) {
+        console.warn('[WASM JIT] IndexedDB unavailable, JIT cache disabled');
+        done();
+        return;
+    }
     req.onupgradeneeded = function(e) {
         e.target.result.createObjectStore('blocks');
     };
@@ -2653,7 +2709,8 @@ function initWasmJitCache(callback) {
         tx.oncomplete = function() {
             fetchServerJitCache(done);
         };
-        tx.onerror = function() {
+        // Not onerror as well: an abort follows every error, and one at commit (a full disk) comes with no error event.
+        tx.onabort = function() {
             fetchServerJitCache(done);
         };
     };
