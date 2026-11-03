@@ -173,6 +173,7 @@
             Config.extraZipFiles = getZipFileList("overlay"); //MANUAL:"dlls.zip;fonts.zip";
             Config.appZipFile = getAppZipFile("app"); //MANUAL:"chomp.zip";
             Config.lazyApp = vnboxParam("lazy") || ""; // "opfs:vn/albatross": game folder read lazily (lazyfs.js)
+            requireFrameForGameFolder();
             let cdrom = getCDRom("cdrom"); //MANUAL:{files: ["disc1.iso", "disc2.iso"], drive: "e"}
             Config.cdromISOFiles = cdrom.files;
             Config.cdromDrive = cdrom.drive;
@@ -779,6 +780,14 @@
                 console.log("setting " + param + " zip file to: "+filename);
             }
             return filename;
+        }
+        // Players run the engine in a frame. A link straight to this page could run p=cmd against a game's folder and saves.
+        // A frame on another site can't reach them: browsers give it separate storage. Local tools run on localhost.
+        function requireFrameForGameFolder() {
+            let local = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+            if (Config.lazyApp.length > 0 && window.top === window && !local) {
+                throw new Error("lazy= is refused on a top-level page: open the game from the player");
+            }
         }
         // What the URL makes the page fetch or connect to stays on this site: a zip runs with the game's
         // folder and saves mounted and stays in OPFS for later games. Throws before anything is mounted or stored.
