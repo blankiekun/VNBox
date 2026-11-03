@@ -1,0 +1,39 @@
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -7044,3 +7044,17 @@
+     free( params );
+     return ret;
+ }
++
++/* VNBox: Boxedwine runs these functions as host code (hostglyphm.cpp) when every glyph they ask for already has its
++ * metrics in font->gm and no matrix (the GGO_METRICS cache hits of get_glyph_outline), with font_lock free; it
++ * reads the structures through these link addresses and offsets, and leaves anything else to this code.
++ * Version first: bump it when an entry's meaning changes. */
++__attribute__((visibility("default"))) const UINT_PTR vnbox_glyphm[] =
++{
++    1, (UINT_PTR)font_GetTextExtentExPoint, (UINT_PTR)font_GetTextExtentExPointI, (UINT_PTR)font_GetGlyphOutline,
++    (UINT_PTR)&font_lock, (UINT_PTR)&font_funcs, offsetof(struct font_physdev, font),
++    offsetof(struct gdi_font, entry), offsetof(struct gdi_font, gm_size), offsetof(struct gdi_font, gm),
++    offsetof(struct gdi_font, private), offsetof(struct gdi_font, child_fonts), offsetof(struct gdi_font, lf.lfFaceName),
++    offsetof(struct gdi_font, otm.otmpFamilyName), GM_BLOCK_SIZE, sizeof(struct glyph_metrics),
++    offsetof(struct glyph_metrics, gm), offsetof(struct glyph_metrics, abc), offsetof(struct glyph_metrics, init)
++};
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -4121,6 +4121,16 @@
+     return &font_funcs;
+ }
+ 
++/* VNBox: Boxedwine answers the cached text-measuring lookups of font.c's vnbox_glyphm functions as host code
++ * (hostglyphm.cpp); it maps a char to a glyph through the char_index cache with these offsets, and leaves any
++ * other charmap or a char not cached yet to this code. Version first: bump it when an entry's meaning changes. */
++__attribute__((visibility("default"))) const UINT_PTR vnbox_glyphm_ft[] =
++{
++    1, (UINT_PTR)&font_funcs, offsetof(struct font_private_data, ft_face),
++    offsetof(struct font_private_data, char_index), offsetof(FT_FaceRec, charmap), offsetof(FT_CharMapRec, encoding),
++    FT_ENCODING_NONE, FT_ENCODING_MS_SYMBOL
++};
++
+ #else /* SONAME_LIBFREETYPE */
+ 
+ const struct font_backend_funcs *init_freetype_lib(void)

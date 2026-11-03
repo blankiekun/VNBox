@@ -25,6 +25,7 @@ void testWasmJitMtGroupedOomBlock();
 #else
 void testWasmJitStBoundedDispatch();
 void testWasmJitHotGroups();
+void testWasmJitInlineCall();
 void testWasmJitRuntimeGrouping();
 void testWasmJitPendingLifecycle();
 void testWasmJitTinyAnonymousPromotion();

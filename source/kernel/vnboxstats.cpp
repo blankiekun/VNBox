@@ -37,12 +37,24 @@ bool vnboxProfOn = false;
 unsigned vnboxProfTick = 0;
 std::unordered_map<unsigned long long, VnboxProfEntry> vnboxProfBlocks;
 
+static unsigned long long statsThreadKey(KThread* thread) {
+    return ((unsigned long long)thread->process->id << 24) | (thread->id & 0xFFFFFF);
+}
+
+static double statsNowMs() {
+#ifdef __EMSCRIPTEN__
+    return emscripten_get_now();
+#else
+    return 0;
+#endif
+}
+
 void vnboxStatSliceRecord(KThread* thread, U64 diff, U64 sysCallTime) {
     vnboxStats.sliceMs += diff / 1000.0;
     vnboxStats.sysMs += sysCallTime / 1000.0;
     vnboxStats.instr += thread->cpu->blockInstructionCount;
     if (thread->process->name == "wineserver") vnboxStats.wineserverMs += diff / 1000.0;
-    unsigned long long key = ((unsigned long long)thread->process->id << 24) | (thread->id & 0xFFFFFF);
+    unsigned long long key = statsThreadKey(thread);
     vnboxStats.threadMs[key] += diff / 1000.0;
     vnboxStats.threadRuns[key]++;
     if (!vnboxStats.processNames.count(thread->process->id)) vnboxStats.processNames[thread->process->id] = thread->process->name;
@@ -71,8 +83,32 @@ void vnboxStatSyscallRecord(CPU* cpu, U32 statsNo, U32 statsArg2, U32 statsLen, 
     vnboxStats.sysPadInstr += padInstr;
     // wineserver reads each request's fixed 64-byte header with one read()
     if (statsNo == 3 && statsLen == 64 && result == 64 && cpu->thread->process->name == "wineserver") vnboxStats.wineserverRequests++;
+    // A blocked call runs again when the thread wakes: from the block to the retry is time spent blocked.
+    static std::unordered_map<unsigned long long, double> blockedSince; // kept across windows
+    unsigned long long key = statsThreadKey(cpu->thread);
+    auto since = blockedSince.find(key);
+    if (since != blockedSince.end()) {
+        vnboxStats.threadBlockedMs[key] += statsNowMs() - since->second;
+        blockedSince.erase(since);
+    }
+    if (result == (U32)(-K_WAIT)) blockedSince[key] = statsNowMs();
     if (result == (U32)(-K_WAIT)) vnboxStats.sysBlocked[statsNo]++;
     else if ((statsNo == 4 || statsNo == 146) && result < 0x80000000) statsClientRequest(cpu, statsNo, statsArg2, statsLen);
+}
+
+void vnboxStatPutRecord(KThread* thread) {
+    vnboxStats.threadPuts[statsThreadKey(thread)]++;
+    if (!vnboxStats.processNames.count(thread->process->id)) vnboxStats.processNames[thread->process->id] = thread->process->name;
+}
+
+void vnboxStatSleepRecord(KThread* thread, bool yield, S64 ms) {
+    unsigned long long key = statsThreadKey(thread);
+    if (yield) vnboxStats.threadYields[key]++;
+    else if (!ms) vnboxStats.threadSleep0[key]++;
+    else {
+        vnboxStats.threadSleepN[key]++;
+        if (ms > 0) vnboxStats.threadSleepNMs[key] += (double)ms;
+    }
 }
 
 void vnboxStatGl(CPU* cpu, void (*fn)(CPU*), int kind) {
@@ -217,6 +253,39 @@ static BString statsBusyThreads(const VnboxStats& s, double sec) {
     return out.length() ? out : B(" -");
 }
 
+// stats=1 [frames] line: for the 3 threads that put the most frames, per second of the window their guest work, time
+// blocked in syscalls (waiting for a timer, an event, a message) and the rest (runnable while other threads or the
+// browser ran), the same per shown frame, and their sleeps (select with no fds: 0 ms, > 0 ms) and sched_yield calls;
+// then the same calls for all threads. Wine's Sleep(n > 0) is a yield then a select; Sleep(0) only the yield. A game whose work per frame fills its frame time never sleeps by itself.
+static void statsFramesLine(const VnboxStats& s, double sec) {
+    std::vector<std::pair<unsigned, unsigned long long>> putters;
+    for (auto& e : s.threadPuts) putters.push_back({e.second, e.first});
+    std::sort(putters.rbegin(), putters.rend());
+    double shown = (s.presentsSw + s.presentsGl) / sec;
+    auto get = [](const auto& m, unsigned long long key) -> double { auto it = m.find(key); return it != m.end() ? (double)it->second : 0.0; };
+    BString out;
+    char item[400];
+    for (size_t k = 0; k < putters.size() && k < 3; k++) {
+        unsigned long long key = putters[k].second;
+        unsigned pid = (unsigned)(key >> 24), tid = (unsigned)(key & 0xFFFFFF);
+        auto name = s.processNames.find(pid);
+        double work = get(s.threadMs, key) / sec, blocked = get(s.threadBlockedMs, key) / sec;
+        double sleepN = get(s.threadSleepN, key);
+        snprintf(item, sizeof(item), "%s %s:%u/%u puts/s=%.1f work=%.0f blocked=%.0f other=%.0f ms/s, per shown frame work=%.1f blocked=%.1fms,"
+            " sleep0ms/s=%.0f sleep/s=%.1f (asked avg %.1fms) yields/s=%.0f", k ? " ;" : "", name != s.processNames.end() ? name->second.c_str() : "?",
+            pid, tid, putters[k].first / sec, work, blocked, std::max(0.0, 1000.0 - work - blocked), shown ? work / shown : 0, shown ? blocked / shown : 0,
+            get(s.threadSleep0, key) / sec, sleepN / sec, sleepN ? get(s.threadSleepNMs, key) / sleepN : 0, get(s.threadYields, key) / sec);
+        out += item;
+    }
+    double sleep0 = 0, sleepN = 0, sleepNMs = 0, yields = 0;
+    for (auto& e : s.threadSleep0) sleep0 += e.second;
+    for (auto& e : s.threadSleepN) sleepN += e.second;
+    for (auto& e : s.threadSleepNMs) sleepNMs += e.second;
+    for (auto& e : s.threadYields) yields += e.second;
+    klog_fmt("[frames] %.1fs shown/s=%.1f |%s | all threads sleep0ms/s=%.0f sleep/s=%.1f (asked avg %.1fms) yields/s=%.0f", sec, shown,
+        out.length() ? out.c_str() : " no puts", sleep0 / sec, sleepN / sec, sleepN ? sleepNMs / sleepN : 0, yields / sec);
+}
+
 // stats=1: how a tick waited (asked vs real), then every ~2 s one console line with the counters.
 static void statsTickStart(int asked) {
     double now = emscripten_get_now();
@@ -268,6 +337,7 @@ static void statsTickStart(int asked) {
 #if defined(BOXEDWINE_WASM_JIT_HOPCOUNT) && !defined(BOXEDWINE_MULTI_THREADED)
         { extern void hopStatsPrint(double); hopStatsPrint(sec); } // HOPCOUNT
 #endif
+        statsFramesLine(s, sec);
         s = VnboxStats();
         s.on = true;
         statsLastLog = now;

@@ -1498,9 +1498,24 @@ void KMemory::prepareCodeInvalidation(U32 address, U32 len) {
             }
             return false;
         };
+        // Blocks that inlined code from a removed range (wasm leaf-call inlining) go with it.
+        std::vector<std::pair<U32, DecodedOp*>> dependents;
+        auto addDependents = [&](U32 rangeAddress, U32 rangeLen) {
+            dependents.clear();
+            if (!jitCollectDependentBlocks(this, rangeAddress, rangeLen, dependents)) {
+                return;
+            }
+            for (const auto& dependent : dependents) {
+                if (dependent.second->blockOpCount && !isPreparedBlock(dependent.second)) {
+                    preparedCodeBlocks.push_back({dependent.first, dependent.second, {}, {}, nullptr});
+                }
+            }
+        };
+        addDependents(address, len);
         for (size_t blockIndex = 0; blockIndex < preparedCodeBlocks.size(); ++blockIndex) {
             DecodedOp* blockStart = preparedCodeBlocks[blockIndex].blockStart;
             U32 opAddress = preparedCodeBlocks[blockIndex].address;
+            addDependents(opAddress, blockStart->blockLen);
             DecodedOp* current = blockStart;
             for (U32 i = 0; i < blockStart->blockOpCount && current && current->inst != Done; ++i) {
                 DecodedOp* owner = current->blockStart;
@@ -1783,6 +1798,10 @@ void KMemory::removeCode(KThread* thread, U32 address, U32 len, bool becauseOfWr
 #if defined(BOXEDWINE_JIT)
     bool hasCodeBlock = false;
     data->opCache.iterateOps(address, len, findCodeBlock, &hasCodeBlock);
+    if (!hasCodeBlock) {
+        std::vector<std::pair<U32, DecodedOp*>> dependents;
+        hasCodeBlock = jitCollectDependentBlocks(this, address, len, dependents);
+    }
     if (hasCodeBlock) {
         // Overlapping wasm JIT blocks share ops, so collect every block that
         // overlaps the range before removing any of their ops.
