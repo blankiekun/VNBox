@@ -16,6 +16,7 @@
 // game's own copy, which IDBFS persists); files restored from IndexedDB win over the folder's.
 // Untouched game files are kept out of IndexedDB (lazyPristine, see lazyMountOverlay).
 // Errors go to the console and to a same-origin parent page as {type: "vnbox-error", source, message}.
+// After source "saves", {type: "vnbox-saves-ok"} says every store that failed works again.
 // shortcut: a deleted or renamed game file comes back on reload under its old name; add a deleted list if a game needs it.
 var LAZY_BLOCK = 1 << 16;
 var LAZY_READAHEAD = 4 * LAZY_BLOCK; // read past the requested range when reads are sequential
@@ -30,13 +31,18 @@ window.__lazyStats = lazyStats;
 var lazyCache = new Map(); // "file:block" → Uint8Array, insertion order = LRU order
 var lazyFiles = []; // jspi mode: File objects by index
 var lazyEagerLeft = LAZY_EAGER_BUDGET;
+var lazyFailingStores = new Set(); // mount points reported as failing, until a persist works again
 var lazyBase = typeof document !== "undefined" && document.currentScript ? new URL(".", document.currentScript.src).href : ""; // this file's folder, not the page's
 
 function vnboxReport(source, error) {
     var message = String(error && error.stack || error);
     console.error("[" + source + "] " + message);
+    vnboxPost({ type: "vnbox-error", source: source, message: message });
+}
+
+function vnboxPost(message) {
     try {
-        if (window.parent !== window) window.parent.postMessage({ type: "vnbox-error", source: source, message: message }, location.origin);
+        if (window.parent !== window) window.parent.postMessage(message, location.origin);
     } catch (e) { }
 }
 
@@ -339,7 +345,10 @@ function lazyPersistFailed(mount, err) {
     }
     var vanished = err.name === "ErrnoError";
     console.warn("Persist of " + mount.mountpoint + " failed: " + (vanished ? "errno " + err.errno : err));
-    if (!vanished && ++mount.lazyPersistFails === 2) vnboxReport("saves", "Saves could not be stored: " + err);
+    if (!vanished && ++mount.lazyPersistFails === 2) {
+        lazyFailingStores.add(mount.mountpoint);
+        vnboxReport("saves", "Saves could not be stored: " + err);
+    }
     if (!mount.lazyRetry) {
         mount.lazyRetry = setTimeout(() => {
             mount.lazyRetry = 0;
@@ -362,7 +371,10 @@ function lazyPatchIdbfs() {
         syncfs(mount, populate, err => {
             if (populate) mount.lazyRestoring = !!err;
             else if (err) lazyPersistFailed(mount, err);
-            else mount.lazyPersistFails = 0;
+            else {
+                mount.lazyPersistFails = 0;
+                if (lazyFailingStores.delete(mount.mountpoint) && !lazyFailingStores.size) vnboxPost({ type: "vnbox-saves-ok" });
+            }
             done(err);
         });
     };
