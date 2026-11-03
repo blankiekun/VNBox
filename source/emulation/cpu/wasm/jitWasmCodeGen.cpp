@@ -13712,8 +13712,8 @@ void JitWasmCodeGen::JumpIfCondition(JitConditional cond, U32 address) {
         m_manifestJumpTarget = address - cpu->seg[CS].address;
     }
     emitDirectLoopBackedge(address);
-    DecodedOp* targetOp = cpu->memory->getDecodedOp(address);
     if (wasmJitPersistenceActive()) {
+        DecodedOp* targetOp = cpu->memory->getDecodedOp(address);
         // Relocatable variant: the target DecodedOp* comes from a reloc slot
         // instead of an embedded i32.const. The slot is 0 when the target
         // isn't decoded yet (or the module was instantiated without a slot
@@ -13741,19 +13741,31 @@ void JitWasmCodeGen::JumpIfCondition(JitConditional cond, U32 address) {
         m_emitter.emitEnd();
         freeScratch(targetLocal);
         blockExit();
-    } else if (targetOp) {
+    } else {
+        // Read the target from its cache slot on every exit. The op decoded now
+        // can go back to the pool when the target's code is rewritten, and come
+        // back as the op of another address, so it can't be kept in the code.
+        materializeFpuCache();
         syncDirtyRegsToHost();
         writeEip(address - cpu->seg[CS].address);
+        U32 targetLocal = allocScratch();
+        m_emitter.emitI32Const((S32)(uintptr_t)cpu->memory->getDecodedOpLocation(address));
+        m_emitter.emitI32Load(0);
+        m_emitter.emitLocalTee(targetLocal);
+        m_emitter.emitIf();
 #ifdef BOXEDWINE_WASM_JIT_PROFILE
         emitProfileSampledCall(HELPER_PROFILE_EXIT_JUMP);
 #endif
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-        m_emitter.emitI32Const((S32)(uintptr_t)targetOp);
+        m_emitter.emitLocalGet(targetLocal);
         m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
-        WASM_JIT_HOP_KIND(0) emitChainReturn(-1, targetOp);
-    } else {
-        writeEip(address - cpu->seg[CS].address);
-        blockExit();
+        WASM_JIT_HOP_KIND(0) emitChainToNextOp(targetLocal);
+        m_emitter.emitElse();
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitCall(m_helperGetNextOpIdx);
+        m_emitter.emitEnd();
+        m_emitter.emitReturn();
+        freeScratch(targetLocal);
     }
     EndIf();
 }
@@ -13834,10 +13846,10 @@ void JitWasmCodeGen::emitFunctionReturn() {
     m_emitter.emitReturn();
 }
 
-void JitWasmCodeGen::emitChainReturn(S32 targetLocal, DecodedOp* targetOp) {
+void JitWasmCodeGen::emitChainReturn(S32 targetLocal) {
     materializeFpuCache();
     syncDirtyRegsToHost();
-    emitChainToNextOp(targetLocal, targetOp);
+    emitChainToNextOp(targetLocal);
     m_emitter.emitReturn();
 }
 
@@ -13847,22 +13859,20 @@ void JitWasmCodeGen::emitChainReturn(S32 targetLocal, DecodedOp* targetOp) {
 // other case returns to the dispatcher. The budget check also bounds a chain
 // that never returns, and nextOp stays set for the dispatcher either way.
 // A caller that just stored a known non-null target into cpu->nextOp passes
-// it (a local or a constant op): the sequence then reads the op through it
-// instead of reloading cpu->nextOp per field, and skips the null check.
-void JitWasmCodeGen::emitChainToNextOp(S32 targetLocal, DecodedOp* targetOp) {
+// its local: the sequence then reads the op through it instead of reloading
+// cpu->nextOp per field, and skips the null check.
+void JitWasmCodeGen::emitChainToNextOp(S32 targetLocal) {
 #ifndef BOXEDWINE_MULTI_THREADED
     if (!m_chainBlocks) {
         return;
     }
-    bool known = targetLocal >= 0 || targetOp;
+    bool known = targetLocal >= 0;
     if (jitCheapHopDisabled()) {
         known = false;
     }
-    auto nextOp = [this, known, targetLocal, targetOp](U32 field, bool half = false) {
-        if (known && targetLocal >= 0) {
+    auto nextOp = [this, known, targetLocal](U32 field, bool half = false) {
+        if (known) {
             m_emitter.emitLocalGet((U32)targetLocal);
-        } else if (known) {
-            m_emitter.emitI32Const((S32)(uintptr_t)targetOp);
         } else {
             m_emitter.emitLocalGet(WASM_CPU_LOCAL);
             m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));

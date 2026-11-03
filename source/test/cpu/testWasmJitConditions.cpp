@@ -1483,6 +1483,96 @@ void testWasmJitConditionalSideExits() {
     }
 }
 
+#ifndef BOXEDWINE_MULTI_THREADED
+void testWasmJitSideExitTargetRewritten() {
+    // Bug this catches: a side exit that bakes its target's DecodedOp* into the
+    // block. After the target's bytes change and the writing thread exits, the
+    // op goes back to the pool; once it is reused for other code, the side exit
+    // runs that code with EIP at the target.
+    extern void startNewJIT(CPU*, U32, DecodedOp*);
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    contextTimeRemaining = 0x7fffffff; // leave through the hop, not through testRun's dispatcher
+    testNewInstruction(0);
+    auto& context = testContext();
+    CPU* cpu = context.cpu;
+    KMemory* memory = context.memory;
+    const U32 a = TEST_CODE_ADDRESS, t = a + 0x200, x = a + 0x400;
+    testPushCode8(0x85); testPushCode8(0xc0); // test eax,eax
+    testPushCode8(0x0f); testPushCode8(0x84); testPushCode32(t - context.codeIp - 4); // jz t
+    emitMov(7, 0x1111);
+    testPushCode8(0xcd); testPushCode8(0x97);
+    while (context.codeIp < t) testPushCode8(0x90);
+    emitMov(3, 0x2222);
+    testPushCode8(0xcd); testPushCode8(0x97);
+    while (context.codeIp < x) testPushCode8(0x90);
+    emitMov(3, 0xbad);
+    testPushCode8(0xcd); testPushCode8(0x97);
+
+    auto compile = [&](U32 address) {
+        DecodedOp* op = cpu->getOp(address, 0);
+        startNewJIT(cpu, address, op);
+        if (!op->pfnJitCode || op->pfn != context.process->startJITOp) {
+            testFail("side exit test requires a compiled block at %x", address);
+        }
+        op->runCount = JIT_RUN_COUNT + 1;
+        return op;
+    };
+    DecodedOp* targetOp = compile(t);
+    DecodedOp* blockA = compile(a);
+    auto runA = [&]() {
+        cpu->eip.u32 = 0;
+        cpu->reg[0].u32 = 0;
+        cpu->reg[3].u32 = 0;
+        cpu->nextOp = blockA;
+        cpu->yield = false;
+        cpu->blockInstructionCount = 0;
+        do {
+            cpu->run();
+        } while (!cpu->nextOp || cpu->nextOp->inst != TestEnd);
+    };
+    runA();
+    if (cpu->reg[3].u32 != 0x2222) {
+        testFail("side exit did not reach its compiled target");
+    }
+
+    memory->writed(t + 1, 0x3333);
+    if (memory->getDecodedOp(t) || !blockA->pfnJitCode) {
+        testFail("side exit test expects the write to drop the target and keep the block");
+    }
+    // What the writing thread's exit does: its removed ops return to the pool.
+    memory->threadCleanup(context.thread->id);
+    // The pool is first-in first-out. Take everything ahead of the old target
+    // op twice, so it is the next one handed out, then return the rest.
+    std::vector<DecodedOp*> held;
+    for (U32 pass = 0; pass < 2; ++pass) {
+        for (DecodedOp* op = DecodedOp::alloc(); op != targetOp; op = DecodedOp::alloc()) {
+            held.push_back(op);
+        }
+        targetOp->dealloc();
+    }
+    for (DecodedOp* op : held) {
+        op->dealloc();
+    }
+    if (compile(x) != targetOp) {
+        testFail("side exit test expects the old target op to be reused");
+    }
+    runA();
+    if (cpu->reg[3].u32 != 0x3333) {
+        testFail("side exit ran %x instead of the rewritten target", cpu->reg[3].u32);
+    }
+
+    // Now the target has code of its own again: the side exit must find it.
+    compile(t);
+    runA();
+    if (cpu->reg[3].u32 != 0x3333) {
+        testFail("side exit lost the recompiled target: %x", cpu->reg[3].u32);
+    }
+    contextTimeRemaining = savedBudget;
+    cpu->nextOp = nullptr;
+}
+#endif
+
 void testWasmJitSseCompareConditions() {
     struct CompareCase { U64 lhs, rhs; U32 flags; };
     const CompareCase doubles[] = {
