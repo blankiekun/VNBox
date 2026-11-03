@@ -32,7 +32,8 @@
 // trunc(x * 32767) clamped, as its x87 loop does. Differences: the driver builds the Vorbis headers from the
 // format (mode 3) and skips the stream's own; the host decoder reads the stream's headers, so a stream is only
 // taken when its first convert holds all three valid headers matching the format. libvorbis 1.3.7 vs 1.0 may
-// round samples differently.
+// round samples differently. And when the destination fills exactly at a block end, the packets left in that page
+// come out on the next call even if no new page does; the driver looks only for a new page, so END loses them there.
 //
 // A stream is decided at its first convert, before anything is written: taken (host from then on) or left to
 // the guest for its whole life. ACMDM_STREAM_CLOSE frees the host state, then runs the guest's close.
@@ -46,6 +47,7 @@
 #endif
 
 static const U64 HOST_ACM_TEXT_HASH = 0xd5578a8339d19269ull; // FNV-1a 64 of vorbis.acm's .text (信天翁航海録's copy)
+static const U32 HOST_ACM_TEXT_SIZE = 176128; // that .text's SizeOfRawData: any other is not this build, and isn't read
 
 struct HostAcmModule { BString path; U32 driverProc; }; // file offset of DriverProc's first byte
 static std::vector<HostAcmModule> hostAcmModules;
@@ -79,7 +81,7 @@ static U32 hostAcmParse(KFile* file) {
     bool haveText = false;
     for (U32 i = 0; i < count && !haveText; i++) {
         const U8* s = &sections[i * 40];
-        if (memcmp(s, ".text\0\0\0", 8) || !read(acm32(s + 20), text, acm32(s + 16))) continue;
+        if (memcmp(s, ".text\0\0\0", 8) || acm32(s + 16) != HOST_ACM_TEXT_SIZE || !read(acm32(s + 20), text, HOST_ACM_TEXT_SIZE)) continue;
         for (U8 b : text) hash = (hash ^ b) * 0x100000001b3ull;
         haveText = true;
     }
@@ -272,6 +274,8 @@ static void hostAcmConvert(HostAcmStream& s, const U8* src, U32 srcLen, U32& src
             continue;
         }
         if (feed()) continue;
+        // No new page: packets of the last one still wait when the destination filled exactly at a block end.
+        if (s.streamInit && !packets()) break;
         if (!end) break;
         s.endSeen = true;
     }
@@ -310,7 +314,7 @@ bool hostAcmRun(CPU* cpu) {
     bool buffersOk = srcUsed <= srcLen && dstUsed <= dstLen && memory->canRead(pbSrc + srcUsed, srcLen - srcUsed) &&
         memory->canWrite(pbDst + dstUsed, dstLen - dstUsed) && (U64)pbSrc + srcLen <= 0x100000000ull && (U64)pbDst + dstLen <= 0x100000000ull;
     static thread_local std::vector<U8> src, dst;
-    src.resize(srcLen - std::min(srcUsed, srcLen));
+    src.resize(buffersOk ? srcLen - srcUsed : 0); // a bad length may not cost a host allocation of that size
     if (buffersOk) memory->memcpy(src.data(), pbSrc + srcUsed, (U32)src.size());
     if (it == hostAcmStreams.end()) { // first convert of this stream: take it or leave it to the guest for good
         bool take = !cpu->debugTrapActive && buffersOk && memory->readw(wfxSrc) == VORBIS_MODE3PLUS && memory->readw(wfxDst) == WAVE_FORMAT_PCM &&
