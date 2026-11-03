@@ -17,6 +17,10 @@
 #include "testHostLibc.h"
 #include "testCPU.h"
 #include "ksignal.h"
+#include "../../emulation/softmmu/kmemory_soft.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 U32 hostLibcFnId(const char* name);
 bool hostLibcRun(CPU* cpu, U32 fn);
@@ -26,6 +30,8 @@ bool hostClockRun(CPU* cpu, U32 fn); // hostclock.cpp, fn: 1 NtQueryPerformanceC
 #define memory (testContext().memory)
 
 extern thread_local U32 hostLibcTestAddress, hostLibcTestFn;
+extern "C" U32 bw_hook_add(U32 pid, U32 eip); // hosthooks.cpp
+extern "C" void bw_hook_remove(U32 id);
 
 namespace {
 
@@ -396,6 +402,178 @@ void testHostLibcMutex() {
         unlock(false);
         expectMutex("special kind untouched", 1, 0, TID, 5);
     }
+}
+
+// A private file mapping of two pages holding `code` from offset 0: hostHookPatched compares against this file, and its
+// pages start out File (not loaded), then CopyOnWrite once read.
+static void mapFile(U32 address, const U8* code, U32 len) {
+    KProcessPtr process = testContext().process;
+    U32 fd = process->memfd_create(B("hostlibc-test"), 0);
+    if ((S32)fd < 0) testFail("memfd_create failed");
+    std::shared_ptr<KFile> file = std::dynamic_pointer_cast<KFile>(process->getFileDescriptor(fd)->kobject);
+    if (process->ftruncate64(fd, 2 * K_PAGE_SIZE)) testFail("ftruncate failed");
+    if (file->pwriteNative(const_cast<U8*>(code), 0, len) != len) testFail("file write failed");
+    if (memory->mmap(testContext().thread, address, 2 * K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE | K_PROT_EXEC, K_MAP_FIXED | K_MAP_PRIVATE, fd, 0) != address) testFail("mmap failed");
+    process->close(fd);
+}
+
+// Catches: a game's jmp written over a hooked export being ignored (the hook answers, its code never runs), a restored
+// export staying off, and the compare being too wide or too eager and turning hooks off: on bytes past the fifth (Wine's
+// syscall thunk has a relocated address there) or on a page not loaded yet. Uses the real head op from NormalCPU::getOp.
+void testHostHookPatchedExport() {
+    constexpr U32 MAPPED = 0x20000000, CROSS = MAPPED + K_PAGE_SIZE - 2;
+    setup();
+    U8 code[K_PAGE_SIZE];
+    ::memset(code, 0x90, sizeof(code));
+    const U8 mov[] = { 0xB8, 0x44, 0x33, 0x22, 0x11 }; // mov eax, 0x11223344
+    ::memcpy(code, mov, sizeof(mov));
+    mapFile(MAPPED, code, sizeof(code));
+    hostLibcTestFn = hostLibcFnId("strlen");
+    hostLibcTestAddress = MAPPED;
+    cpu->seg[CS].address = 0;
+    cpu->eip.u32 = MAPPED;
+    auto hooked = [](const char* what, bool want, bool flush = true) {
+        if (flush) memory->removeCode(testContext().thread, cpu->eip.u32, 1, false);
+        DecodedOp* op = cpu->getNextOp();
+        if ((op->inst == Custom1) != want) testFail("%s: hooked %d, expected %d", what, op->inst == Custom1, want);
+    };
+    hooked("page not loaded yet", true);
+    hooked("same bytes in RAM", true);
+    memory->writeb(MAPPED + 5, 0xCC);
+    hooked("sixth byte differs", true);
+    memory->writeb(MAPPED, 0xE9);
+    hooked("first byte overwritten, the write itself invalidates", false, false);
+    memory->writeb(MAPPED, 0xB8);
+    hooked("first byte restored, the write itself invalidates", true, false);
+    memory->writeb(MAPPED + 4, 0x12);
+    hooked("fifth byte overwritten", false);
+    memory->writeb(MAPPED + 4, 0x11);
+
+    hostLibcTestAddress = cpu->eip.u32 = CROSS;
+    hooked("five bytes over a page not loaded yet", true);
+    memory->writeb(MAPPED + K_PAGE_SIZE, 0xCC);
+    hooked("overwritten on the next page", false);
+    hostLibcTestFn = 0;
+    memory->unmap(MAPPED, 2 * K_PAGE_SIZE);
+}
+
+// Catches: a change in getOp or the head's fields that breaks hooks while the direct hostLibcRun tests still pass: the head
+// not doing the call and returning (the guest function would run), or a decline not going on with the guest function
+// after its first op (the real op's next, which the head op holds on to). The trap case is testHostLibcDebugTrap.
+void testHostLibcHead() {
+    for (bool decline : { false, true }) {
+        setup();
+        testPushCode8(0xB8); // mov eax, 0x11223344: the guest function's first op
+        for (U8 b : { 0x44, 0x33, 0x22, 0x11 }) testPushCode8(b);
+        testPushCode8(0x43); // inc ebx: its second, then testRunCPU's end op, where the return address points
+        memory->writeb(HEAP + 0x100, 'a');
+        memory->writeb(HEAP + 0x101, 'b');
+        hostLibcTestAddress = TEST_CODE_ADDRESS;
+        hostLibcTestFn = hostLibcFnId("strlen");
+        ESP = STACK;
+        memory->writed(STACK, TEST_CODE_ADDRESS + 6);
+        memory->writed(STACK + 4, decline ? UNMAPPED : HEAP + 0x100);
+        cpu->eip.u32 = TEST_CODE_ADDRESS;
+        testRunCPU();
+        hostLibcTestFn = 0;
+        expect("result", EAX, decline ? 0x11223344 : 2);
+        expect("the guest function's second op", EBX, decline ? 1 : 0);
+        expect("stack", ESP, decline ? STACK : STACK + 4);
+    }
+}
+
+// Catches: removing any test from hostLibcRun's gate or libcRam: a rep movsb with DF set copying forward in the host and
+// backward in the guest, a segment base ignored, a write that skips copy-on-write or a decoded code page's
+// invalidation, a page read before it is loaded. Each must leave the call to the guest with nothing changed.
+void testHostLibcDeclines() {
+    constexpr U32 DST = HEAP + 0x100, SRC = HEAP + 0x200, MAPPED = 0x20000000;
+    setup();
+    memory->memset(SRC, 0x5A, 16);
+    auto bothDecline = [](U32 dst, U32 src) {
+        U8 before[16], after[16];
+        memory->memcpy(before, dst, 16);
+        call("memcpy", dst, src, 16, false);
+        call("memset", dst, 0x77, 16, false);
+        memory->memcpy(after, dst, 16);
+        if (::memcmp(before, after, 16)) testFail("a declined call changed memory at %x", dst);
+    };
+
+    cpu->flags |= DF;
+    bothDecline(DST, SRC);
+    cpu->flags &= ~DF;
+    for (int s : { CS, DS, ES, SS }) {
+        cpu->seg[s].address = 0x1000;
+        bothDecline(DST, SRC);
+        cpu->seg[s].address = 0;
+    }
+    cpu->stackMask = 0xFFFF;
+    bothDecline(DST, SRC);
+    cpu->stackMask = 0xFFFFFFFF;
+
+    testPushCode8(0x90); // a decoded page: a host write would miss the invalidation
+    cpu->eip.u32 = TEST_CODE_ADDRESS;
+    cpu->getNextOp();
+    if (getMemData(memory)->mmu[TEST_CODE_ADDRESS >> K_PAGE_SHIFT].getPageType() != PageType::Code) testFail("the code page isn't PageType::Code");
+    bothDecline(TEST_CODE_ADDRESS + 0x100, SRC);
+
+    U8 data[16];
+    ::memset(data, 0x33, sizeof(data));
+    mapFile(MAPPED, data, sizeof(data));
+    call("memcpy", DST, MAPPED, 16, false); // not loaded: the guest's read loads it
+    call("memset", MAPPED, 0x77, 16, false);
+    expect("page not loaded", (U32)getMemData(memory)->mmu[MAPPED >> K_PAGE_SHIFT].getPageType(), (U32)PageType::File);
+    memory->readb(MAPPED);
+    expect("page loaded", (U32)getMemData(memory)->mmu[MAPPED >> K_PAGE_SHIFT].getPageType(), (U32)PageType::CopyOnWrite);
+    call("memset", MAPPED, 0x77, 16, false); // a host write would land in the file cache's page
+    call("memcpy", MAPPED, SRC, 16, false);
+    expect("copy-on-write page untouched", memory->readb(MAPPED + 8), 0x33);
+    call("memcpy", DST, MAPPED, 16, true); // reading it is fine
+    expect("read from a copy-on-write page", memory->readb(DST + 8), 0x33);
+    memory->unmap(MAPPED, 2 * K_PAGE_SIZE);
+}
+
+// Catches: a Frida hook (bw_hook_add) under TF raising SIGILL, the hook not firing, or more than the one op running: the audit's
+// reading of the head under a trap, on the path testHostLibcDebugTrap's libc head doesn't take (hostHookOp). Serial: hostHooks is a global.
+void testHostHookHeadSingleStep() {
+    constexpr U32 CODE = TEST_CODE_ADDRESS;
+    setup();
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ globalThis.__hookHits = 0; globalThis.boxedwineFrida = { hit: function() { globalThis.__hookHits++; } }; });
+#endif
+    KSigAction& ill = testContext().process->sigActions[K_SIGILL];
+    KSigAction& trap = testContext().process->sigActions[K_SIGTRAP];
+    ill.reset();
+    trap.reset();
+    ill.handlerAndSigAction = trap.handlerAndSigAction = CODE + 0x40;
+    testPushCode8(0x40); // inc eax
+    testPushCode8(0x40); // inc eax: must wait for the next step
+    EAX = 0;
+    ESP = STACK;
+    cpu->eip.u32 = CODE;
+    U32 id = bw_hook_add(testContext().process->id, CODE);
+    cpu->fillFlags();
+    cpu->setFlags(TF, TF);
+    cpu->nextOp = cpu->getNextOp();
+    bool head = cpu->nextOp->inst == Custom1;
+    cpu->run();
+    bw_hook_remove(id);
+    int hits = 1;
+#ifdef __EMSCRIPTEN__
+    hits = EM_ASM_INT({ var hits = globalThis.__hookHits; delete globalThis.boxedwineFrida; delete globalThis.__hookHits; return hits; });
+#endif
+    bool illegal = ill.sigInfo[0] == K_SIGILL, trapped = trap.sigInfo[0] == K_SIGTRAP;
+    U32 context = trapped ? memory->readd(ESP + 12) : 0;
+    U32 eax = trapped ? memory->readd(context + 0x40) : EAX, eip = trapped ? memory->readd(context + 0x4c) : cpu->eip.u32;
+    ill.reset();
+    trap.reset();
+    cpu->debugTrapOnNextInstruction = false;
+    cpu->setFlags(0, TF);
+    if (!head) testFail("no head op at the hooked address");
+    if (illegal) testFail("hooked address under TF raised SIGILL");
+    if (!trapped) testFail("TF over a hooked address: no SIGTRAP");
+    expect("hook fired once", hits, 1);
+    expect("one op ran", eax, 1);
+    expect("trap eip", eip, CODE + 1);
 }
 
 #endif

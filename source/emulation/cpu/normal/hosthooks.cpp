@@ -297,6 +297,16 @@ bool hostFileRead(KFile* file, U64 offset, std::vector<U8>& buf, U32 len) {
     return file->preadNative(buf.data(), (S64)offset, len) == len;
 }
 
+// A hook that pins one root fs build (syscall ids, offsets, hashes, a patched win32u's exports) didn't take: everything
+// still works, only slower, so without this nobody would notice after a root fs rebuild. Goes to the console and the parent page.
+void hostHookOff(const char* what) {
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        if (typeof vnboxReport === 'function') vnboxReport('hooks', UTF8ToString($0) + ' is off: this root fs is not the build it was made for, so that work runs as guest code (slower).');
+    }, what);
+#endif
+}
+
 bool hostMutexWanted(U32 symValue, U32 index); // hostmutex.cpp
 void hostMutexCheck(KFile* file);
 bool hostMutexRun(CPU* cpu, U32 fn, U32 a0, U32& result);
@@ -389,25 +399,32 @@ void hostLibcMapped(KFile* file) {
         lib.state = ok ? 1 : -1;
         if (ok) hostElfAny = true;
         klog_fmt("[vnbox] native %s: %s, %d functions", lib.suffix + 1, path.c_str(), (int)lib.entries.size());
+        if (!ok || (lib.fnId == hostLibcFnId && lib.entries.size() < LIBC_MUTEX_LOCK - 1)) hostHookOff(lib.suffix + 1); // the mutex ones report themselves
         return;
     }
 }
 
-#ifdef __TEST
-thread_local U32 hostLibcTestAddress, hostLibcTestFn; // testHostLibc.cpp: a block address that counts as that export
-#endif
-// LIBC_* (or HOST_ACM, HOST_CLOCK + CLOCK_* - 1, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
-// process, else LIBC_NONE.
-U32 hostLibcAt(CPU* cpu, U32 eip) {
-#ifdef __TEST
-    if (hostLibcTestFn && eip == hostLibcTestAddress) return hostLibcTestFn;
-#endif
-    if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
-    if ((!hostElfAny && !hostAcmAny && !hostClockAny && !hostDibdrvAny && !hostGlyphmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
-    KProcess* process = cpu->thread->process.get();
-    U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
-    if (!offset) return LIBC_NONE;
-    BString name = process->getModuleName(eip);
+// A game overwrote the start of this file-backed export (VirtualProtect + jmp: speed tools, anti-tamper, time hooks), so its
+// code has to run, not the host's. Only a hook's own block decode gets here, never a call. Five bytes: Wine's syscall thunk holds a
+// relocated address from byte 6 on. A page that isn't RAM yet was not written, and looking must not load it (see vbPeek).
+static bool hostHookPatched(CPU* cpu, U32 eip) {
+    MappedFilePtr mapping = cpu->thread->process->getMappedFileForRange(eip, 1);
+    U64 offset;
+    U8 file[5];
+    if (!mapping || !mapping->file || !mapping->tryGetFileOffset(eip - mapping->address, offset) ||
+        mapping->file->preadNative(file, (S64)offset, sizeof(file)) != sizeof(file)) return false;
+    for (U32 i = 0; i < sizeof(file); i++) {
+        MMU& mmu = getMemData(cpu->memory)->mmu[(eip + i) >> K_PAGE_SHIFT];
+        if (mmu.canReadRam && ramPageGet((RamPage)mmu.ramIndex)[(eip + i) & K_PAGE_MASK] != file[i]) {
+            klog_fmt("[vnbox] hooked export at 0x%x was overwritten by the guest, its code runs", eip);
+            return true;
+        }
+    }
+    return false;
+}
+
+// The file-backed hook at this file offset of this path, else LIBC_NONE.
+static U32 hostFileHookAt(const BString& name, U32 offset) {
     for (HostElfLib& lib : hostElfLibs) {
         if (lib.state != 1 || name != lib.path) continue;
         for (auto& e : lib.entries) {
@@ -421,6 +438,24 @@ U32 hostLibcAt(CPU* cpu, U32 eip) {
     }
     if (U32 dib = hostDibdrvAny ? hostDibdrvAt(name, offset) : 0) return HOST_DIBDRV + dib - 1;
     return hostAcmAny && hostAcmAt(name, offset) ? HOST_ACM : LIBC_NONE;
+}
+
+#ifdef __TEST
+thread_local U32 hostLibcTestAddress, hostLibcTestFn; // testHostLibc.cpp: a block address that counts as that export
+#endif
+// LIBC_* (or HOST_ACM, HOST_CLOCK + CLOCK_* - 1, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
+// process, else LIBC_NONE.
+U32 hostLibcAt(CPU* cpu, U32 eip) {
+#ifdef __TEST
+    if (hostLibcTestFn && eip == hostLibcTestAddress) return hostHookPatched(cpu, eip) ? LIBC_NONE : hostLibcTestFn;
+#endif
+    if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
+    if ((!hostElfAny && !hostAcmAny && !hostClockAny && !hostDibdrvAny && !hostGlyphmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
+    KProcess* process = cpu->thread->process.get();
+    U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
+    if (!offset) return LIBC_NONE;
+    U32 fn = hostFileHookAt(process->getModuleName(eip), offset);
+    return fn && !hostHookPatched(cpu, eip) ? fn : LIBC_NONE;
 }
 
 // Guest address as host RAM if its page is plain RAM with that access (the soft MMU's own fast-path test).

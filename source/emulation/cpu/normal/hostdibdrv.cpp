@@ -70,6 +70,7 @@ extern "C" const void* vnbox_dibdrv_host_table(unsigned table);
 U32 hostElf16(const U8* p); // hosthooks.cpp
 U32 hostElf32(const U8* p);
 bool hostFileRead(KFile* file, U64 offset, std::vector<U8>& buf, U32 len);
+void hostHookOff(const char* what); // hosthooks.cpp: tells the page a hook pinned to this root fs did not take
 
 // Reads vnbox_dibdrv_funcs from .dynsym, then the tables it points at from the file (i386 REL: a pointer's link
 // address is stored in place), into file offsets of the hosted functions.
@@ -142,6 +143,7 @@ bool hostDibdrvMapped(KFile* file, std::vector<U32>& offsets) {
     if (ok) dibPath = path;
     dibState = ok ? 1 : -1;
     klog_fmt("[vnbox] native dibdrv: %s, %d functions%s", path.c_str(), (int)dibEntries.size(), ok ? "" : " (no vnbox_dibdrv_funcs export)");
+    if (!ok) hostHookOff("native dibdrv");
     return ok;
 }
 

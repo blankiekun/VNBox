@@ -65,6 +65,7 @@ static const char* gmWhy; // why the last call was left to the guest (logged for
 U32 hostElf16(const U8* p); // hosthooks.cpp
 U32 hostElf32(const U8* p);
 bool hostFileRead(KFile* file, U64 offset, std::vector<U8>& buf, U32 len);
+void hostHookOff(const char* what); // hosthooks.cpp: tells the page a hook pinned to this root fs did not take
 
 // Reads both exports from .dynsym and the file (i386 REL: a pointer's link address is stored in place).
 static bool hostGlyphmParse(KFile* file) {
@@ -132,6 +133,7 @@ bool hostGlyphmMapped(KFile* file, std::vector<U32>& offsets) {
     }
     gmState = ok ? 1 : -1;
     klog_fmt("[vnbox] native glyph metrics: %s%s", path.c_str(), ok ? "" : " (no vnbox_glyphm export)");
+    if (!ok) hostHookOff("native glyph metrics");
     return ok;
 }
 

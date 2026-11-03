@@ -41,6 +41,7 @@ static std::vector<BString> hostClockSeen; // ntdll.dll.so paths already looked 
 U32 hostElf16(const U8* p); // hosthooks.cpp
 U32 hostElf32(const U8* p);
 bool hostFileRead(KFile* file, U64 offset, std::vector<U8>& buf, U32 len);
+void hostHookOff(const char* what); // hosthooks.cpp: tells the page a hook pinned to this root fs did not take
 
 // Wine's i386 syscall thunk: mov eax, id; mov edx, dispatcher; call edx; ret n.
 static bool hostClockThunk(const std::vector<U8>& code, U32 id, U32 ret) {
@@ -127,6 +128,7 @@ bool hostClockMapped(KFile* file, U32* offsets) {
     HostClockModule m = { path, {} };
     if (!hostClockParse(file, m.offsets)) {
         klog_fmt("[vnbox] native clock: %s is not the known Wine 11 ntdll.dll.so layout, left to the guest", path.c_str());
+        hostHookOff("native clock");
         return false;
     }
     hostClockModules.push_back(m);
