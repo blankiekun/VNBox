@@ -573,6 +573,7 @@
                     prog = prog.substring(3, prog.length - 3);
                 }
                 prog = decodeUrlValue(prog);
+                if (Config.lazyApp.length > 0) prog = lazyGameName(prog); // as lazyfs.js names the folder's files; a launcher sends the name as listed
                 console.log("setting program to execute to: "+prog);
             }
             return prog;
@@ -957,6 +958,14 @@
         // The files of each disc that has been loaded: an ISO image, or a CUE sheet and
         // the BIN or WAVE files it lists
         var cdromDiscFiles = [];
+        // UTF-8 (a BOM is dropped), or what Japanese Windows writes.
+        function cueSheetText(bytes) {
+            try {
+                return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+            } catch (e) {
+                return new TextDecoder("shift_jis").decode(bytes);
+            }
+        }
         function cueSheetFiles(cue, text) {
             let dir = cue.substring(0, cue.lastIndexOf("/") + 1);
             let files = [];
@@ -1008,7 +1017,7 @@
             return fetch(cdromFileUrl(cue), { method: 'GET' }).then(function(response) {
                 return response.status === 200 ? response.arrayBuffer() : null;
             }).then(function(buffer) {
-                if (!buffer || cueSheetFiles(cue, new TextDecoder().decode(buffer)).length == 0) {
+                if (!buffer || cueSheetFiles(cue, cueSheetText(buffer)).length == 0) {
                     return null;
                 }
                 writeCDRomFile(cue, new Uint8Array(buffer));
@@ -1033,7 +1042,8 @@
                     cdromDiscFiles[index] = [disc];
                     return fetchCDRomFile(disc);
                 }
-                let files = cueSheetFiles(cue, new TextDecoder().decode(FS.readFile("/" + cue)));
+                let text = cueSheetText(FS.readFile("/" + cue)), files = cueSheetFiles(cue, text);
+                FS.writeFile("/" + cue, text); // Boxedwine reads the sheet as UTF-8, and these names are what gets written below
                 // a BIN read through its CUE sheet is normally one of the files it lists
                 cdromDiscFiles[index] = [disc, cue].concat(files).filter(function(file, i, all) {
                     return all.indexOf(file) === i;
@@ -2562,6 +2572,14 @@ function flushOutput() {
     if (outputLines.length > OUTPUT_KEPT_LINES) outputLines.splice(0, outputLines.length - OUTPUT_KEPT_LINES);
     element.value = outputLines.join("\n") + "\n";
     element.scrollTop = element.scrollHeight;
+}
+// Called by the engine (startupArgs.cpp) instead of running without a root or overlay zip.
+function vnboxZipFailed(zip) {
+    var name = zip.split("/").pop(), text = "Unable to read " + name + ": it is damaged or not a zip. Reload to try again.";
+    lazyForgetUnlistedZip(name);
+    vnboxReport("lazyfs", text);
+    isRunning = false;
+    bootFailed(text);
 }
 // A boot that cannot go on says why, in place of "Preparing...". textContent: the reason can hold file names.
 var bootFailure = false;

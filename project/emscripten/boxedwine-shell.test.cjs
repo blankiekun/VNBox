@@ -785,6 +785,7 @@ async function loadDisc(url, served) {
             stat(file) { if (!files.has(file)) { throw new Error('ENOENT'); } return {}; },
             mkdirTree() {},
             readFile(file) { return files.get(file); },
+            writeFile(file, text) { files.set(file, Buffer.from(text)); },
             createDataFile(dir, name, bytes) { files.set(dir + name, Buffer.from(bytes)); },
         },
         fetch(name) {
@@ -792,7 +793,7 @@ async function loadDisc(url, served) {
             const body = served[name];
             return Promise.resolve({
                 status: body === undefined ? 404 : 200,
-                arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+                arrayBuffer: async () => (typeof body === 'string' ? new TextEncoder().encode(body) : body).buffer,
             });
         },
     });
@@ -809,6 +810,15 @@ test('a BIN is downloaded with the CUE sheet beside it', async () => {
     const disc = await loadDisc('http://localhost/?cdrom=e:game.bin', { 'game.bin': 'data', 'game.cue': gameCue });
     assert.deepEqual(disc.written, ['/game.bin', '/game.cue']);
     assert.deepEqual(disc.discFiles, ['game.bin', 'game.cue']);
+});
+
+// Decoded as UTF-8 the name turns to U+FFFD: the download 404s, and no disc.
+test('a Shift-JIS CUE sheet gets its files under their real names', async () => {
+    const sjis = Uint8Array.from(Buffer.from('FILE "\x83\x51\x81\x5B\x83\x80.bin" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n', 'latin1'));
+    const bin = '\u30b2\u30fc\u30e0.bin';
+    const disc = await loadDisc('http://localhost/?cdrom=e:game.cue', { 'game.cue': sjis, [encodeURIComponent(bin)]: 'data' });
+    assert.deepEqual(disc.discFiles, ['game.cue', bin]);
+    assert.ok(disc.written.includes('/' + bin));
 });
 
 test('a BIN without a CUE sheet is downloaded alone', async () => {

@@ -188,9 +188,10 @@ U32 FsFileOpenNode::readNative(U8* buffer, U32 len) {
         S32 result = this->readAhead.read(buffer, len, position, this->fileNode->getFileIdentity()->dataGeneration,
             [this](U8* dst, S64 offset, U32 n) { return this->readAt(dst, offset, n); });
         this->pos = position;
-        return (U32)result;
+        return result < 0 ? -translateErr(errno) : (U32)result;
     }
-    return (U32)::read(this->handle, buffer, len);
+    S32 result = (S32)::read(this->handle, buffer, len);
+    return result < 0 ? -translateErr(errno) : (U32)result;
 }
 
 S32 FsFileOpenNode::readAt(U8* buffer, S64 offset, U32 len) {
@@ -207,11 +208,14 @@ S32 FsFileOpenNode::readAt(U8* buffer, S64 offset, U32 len) {
 }
 
 U32 FsFileOpenNode::writeNative(U8* buffer, U32 len) {
-    U32 result = (U32)::write(this->handle, buffer, len);
-    if ((S32)result > 0) {
+    S32 result = (S32)::write(this->handle, buffer, len);
+    if (result < 0) {
+        return -translateErr(errno);
+    }
+    if (result > 0) {
         this->fileNode->clearModifiedTimeOverride();
     }
-    return result;
+    return (U32)result;
 }
 
 // In the browser this waits until IndexedDB committed (fd_sync, libwasi.js), and fails if it didn't.

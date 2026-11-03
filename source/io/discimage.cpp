@@ -298,6 +298,46 @@ bool findWaveData(FILE* file, U64& start, U64& size) {
 
 }
 
+// The file a CUE sheet names, when the name does not open as written. A sheet from Windows may differ from the file in
+// case. A Shift-JIS name cannot match the UTF-8 one at all, but with one FILE line and one BIN beside the sheet that is the file.
+// shortcut: a Shift-JIS sheet that lists several files fails; those would need a conversion table.
+static FILE* openCueFile(std::string& name, const std::string& sheetDir, bool onlyBin) {
+    FILE* file = Platform::fopen(name.c_str(), "rb");
+    if (file) {
+        return file;
+    }
+    size_t slash = name.find_last_of('/');
+    std::string folder = slash == std::string::npos ? "." : name.substr(0, slash);
+    std::string wanted = upper(slash == std::string::npos ? name : name.substr(slash + 1));
+    std::vector<Platform::ListNodeResult> nodes;
+    Platform::listNodes(BString::copy(folder.c_str()), nodes);
+    for (const Platform::ListNodeResult& node : nodes) {
+        if (!node.isDirectory && upper(node.name.c_str()) == wanted) {
+            name = folder + "/" + node.name.c_str();
+            return Platform::fopen(name.c_str(), "rb");
+        }
+    }
+    if (!onlyBin) {
+        return nullptr;
+    }
+    nodes.clear();
+    Platform::listNodes(BString::copy((sheetDir.empty() ? "." : sheetDir).c_str()), nodes);
+    std::string bin;
+    for (const Platform::ListNodeResult& node : nodes) {
+        if (!node.isDirectory && node.name.endsWith(".bin", true)) {
+            if (bin.size()) {
+                return nullptr;
+            }
+            bin = node.name.c_str();
+        }
+    }
+    if (bin.empty()) {
+        return nullptr;
+    }
+    name = sheetDir + bin;
+    return Platform::fopen(name.c_str(), "rb");
+}
+
 bool DiscImage::openCue(const BString& path) {
     FILE* cue = Platform::fopen(path.c_str(), "rb");
     if (!cue) {
@@ -311,11 +351,22 @@ bool DiscImage::openCue(const BString& path) {
         text.append(buffer, len);
     }
     fclose(cue);
+    if (!text.compare(0, 3, "\xEF\xBB\xBF")) {
+        text.erase(0, 3);
+    }
 
     // the files a CUE sheet lists are relative to it
     std::string dir = path.c_str();
     size_t slash = dir.find_last_of("/\\");
     dir = (slash == std::string::npos) ? "" : dir.substr(0, slash + 1);
+
+    U32 fileLines = 0;
+    for (size_t at = 0; at < text.size();) {
+        size_t lineEnd = text.find('\n', at);
+        std::vector<std::string> line = cueWords(text.substr(at, lineEnd == std::string::npos ? std::string::npos : lineEnd - at));
+        fileLines += !line.empty() && upper(line[0]) == "FILE";
+        at = lineEnd == std::string::npos ? text.size() : lineEnd + 1;
+    }
 
     std::vector<CueFile> cueFiles;
     CueTrack* track = nullptr;
@@ -342,7 +393,7 @@ bool DiscImage::openCue(const BString& path) {
                 std::replace(name.begin(), name.end(), '\\', '/');
                 name = dir + name;
             }
-            FILE* file = Platform::fopen(name.c_str(), "rb");
+            FILE* file = openCueFile(name, dir, fileLines == 1 && (type == "BINARY" || type == "MOTOROLA"));
             if (!file) {
                 klog_fmt("DiscImage: could not open %s, which %s lists", name.c_str(), path.c_str());
                 return false;

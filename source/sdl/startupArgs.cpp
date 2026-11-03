@@ -49,6 +49,9 @@
 #include "../server/localserver.h"
 #include "../io/fszip.h"
 #include "loader.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten/em_asm.h>
+#endif
 #include "kstat.h"
 #include "knativesystem.h"
 #include "knativeinput.h"
@@ -454,7 +457,7 @@ static void setWineRegValue(const char* file, const std::string& section, const 
     std::string reg;
     U8 buffer[4096];
     U32 len;
-    while ((len = openNode->readNative(buffer, sizeof(buffer))) > 0 && len != (U32)-1) {
+    while ((S32)(len = openNode->readNative(buffer, sizeof(buffer))) > 0) {
         reg.append((const char*)buffer, len);
     }
     openNode->close();
@@ -526,6 +529,16 @@ static void setWineRegValue(const char* file, const std::string& section, const 
     openNode->close();
     delete openNode;
 }
+
+#ifdef BOXEDWINE_ZLIB
+// A root or overlay zip the engine cannot read: going on would run without Wine or without VNBox's Wine parts, with no word to anyone.
+static void zipFailed(const BString& zip) {
+    kwarn_fmt("Could not read zip file: %s", zip.c_str());
+#ifdef __EMSCRIPTEN__
+    MAIN_THREAD_EM_ASM({ if (typeof vnboxZipFailed === "function") vnboxZipFailed(UTF8ToString($0)); }, zip.c_str());
+#endif
+}
+#endif
 
 bool StartUpArgs::apply() {
     // Set before anything below can kpanic. An automation script can't dismiss a dialog, and its
@@ -614,7 +627,10 @@ bool StartUpArgs::apply() {
     for (auto& zip : zips) {
         U64 startTime = KSystem::getMicroCounter();
         std::shared_ptr<FsZip> fsZip = std::make_shared<FsZip>();
-        fsZip->init(zip, B(""));
+        if (!fsZip->init(zip, B(""))) {
+            zipFailed(zip);
+            return false;
+        }
         openZips.push_back(fsZip);
         U64 endTime = KSystem::getMicroCounter();
         klog_fmt("Loaded %s in %d ms", zip.c_str(), (U32)(endTime - startTime) / 1000);
@@ -793,7 +809,10 @@ bool StartUpArgs::apply() {
                 if (!info.localPath.endsWith("/", false)) {
                     info.localPath= info.localPath+"/";
                 }
-                fsZip->init(info.nativePath, info.localPath);
+                if (!fsZip->init(info.nativePath, info.localPath)) {
+                    zipFailed(info.nativePath);
+                    return false;
+                }
                 openZips.push_back(fsZip);
                 U64 endTime = KSystem::getMicroCounter();
                 klog_fmt("Mounted %s in %d ms", info.nativePath.c_str(), (U32)(endTime - startTime) / 1000);
