@@ -33,6 +33,8 @@
 #include "cpu/testHostAcm.h"
 #include "cpu/testHostVorbis.h"
 #include "cpu/testHostFreetype.h"
+#include "cpu/testHostDibdrv.h"
+#include "cpu/testHostGlyphm.h"
 #include "cpu/testHostWined3d.h"
 #include "opengl/testHostWined3dWgl.h"
 #include "cpu/testCMov.h"
@@ -919,10 +921,20 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostLibcMutex, "Test native pthread_mutex_lock/unlock"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
+    {testHostAcmBadFile, "Test a corrupt vorbis.acm can't make the host allocate gigabytes"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
+    {testHostVorbisSeek, "Test native libvorbis restart, trackonly and a second stream on the same objects"},
 #endif
 #ifdef BOXEDWINE_HOST_FREETYPE
     {testHostFreetypeGlyphs, "Test host FreeType faces and glyphs as win32u uses them"},
+    {testHostFreetypeTables, "Test host FreeType's sfnt tables, names and bitmap-font mirrors"},
+#endif
+#ifdef BOXEDWINE_HOST_DIBDRV
+    {testHostDibdrvCopies, "Test host DIB primitives give the bytes of a whole-bitmap run"},
+    {testHostDibdrvDeclines, "Test host DIB primitives leave what they can't do to the guest"},
+#endif
+#ifndef BOXEDWINE_MULTI_THREADED
+    {testHostGlyphmAnswers, "Test host glyph metrics answer as Wine's cache does, or not at all"},
 #endif
 #ifdef BOXEDWINE_HOST_WINED3D
     {testHostWined3dNo3d, "Test host wined3d links and creates a no-3D wined3d", TEST_ENTRY_SERIAL},

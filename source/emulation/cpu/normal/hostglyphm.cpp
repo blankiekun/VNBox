@@ -147,6 +147,15 @@ U32 hostGlyphmAt(const BString& path, U32 offset) {
     return 0;
 }
 
+#ifdef __TEST
+// testHostGlyphm.cpp stands in for hostGlyphmParse: both export tables, or none (no win32u.so mapped).
+void hostGlyphmTestTables(const U32* info, const U32* ft) {
+    if (info) ::memcpy(gmInfo, info, sizeof(gmInfo));
+    if (ft) ::memcpy(gmFt, ft, sizeof(gmFt));
+    gmState = info ? 1 : 0;
+}
+#endif
+
 // Guest memory, plain RAM pages only (the soft MMU's own fast-path test); false leaves the call to the guest.
 struct GmMem {
     KMemory* memory;

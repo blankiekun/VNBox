@@ -11,5 +11,6 @@
 #define __TEST_HOSTACM_H__
 
 void testHostAcmConvert();
+void testHostAcmBadFile();
 
 #endif
