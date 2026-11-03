@@ -172,7 +172,7 @@ addToLibrary({
       audio.resume = function() {
         if (context.state === 'suspended') context.resume().catch(function() {});
       };
-      // Capture runs before the absolute input handlers consume these events.
+      // Capture on window: the absolute input handlers stop these events going further, not other window listeners.
       for (const event of ['pointerdown', 'mousedown', 'keydown', 'touchstart']) {
         window.addEventListener(event, audio.resume, true);
       }

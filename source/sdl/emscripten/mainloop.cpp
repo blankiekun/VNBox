@@ -331,6 +331,7 @@ bool doMainLoop() {
     // Firefox runs a chain of messages ahead of painting (one frame per ~80 ms while the
     // guest is busy, during movies and loads): once a frame is due, the next tick waits for it.
     // Input during an idle wait runs the next tick right after the event's handlers have queued it.
+    // Mouse motion does not: moving over an idle screen would run a tick per event, the next timer takes it.
     // A hidden page gets no frames: the guest and audio keep running, nothing is drawn (vnbox_set_hidden),
     // a tick waiting for a frame goes on at once, and the next tick once visible draws the latest frame.
     EM_ASM({
@@ -351,7 +352,7 @@ bool doMainLoop() {
         };
         document.addEventListener("visibilitychange", visibility);
         visibility(); // a player opened in a background tab
-        "keydown keyup mousedown mouseup mousemove wheel touchstart touchend touchmove".split(" ").forEach(function(type) {
+        "keydown keyup mousedown mouseup wheel touchstart touchend touchmove".split(" ").forEach(function(type) {
             window.addEventListener(type, wake, true);
         });
         var next = function() { tick().then(function(delay) {
