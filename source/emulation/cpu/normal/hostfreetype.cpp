@@ -197,7 +197,8 @@ static U32 hostFtBuffer(CPU* cpu, HostFtFace& f, U32& buf, U32& cap, U32 len) {
         buf = a;
         cap = want;
     }
-    return buf ? buf : hostFtAlloc(cpu, f, 16);
+    if (!buf && (buf = hostFtAlloc(cpu, f, 16))) cap = 16; // an empty array still has a guest address, this one
+    return buf;
 }
 
 static U32 hostFtString(CPU* cpu, HostFtFace& f, const char* s) {
