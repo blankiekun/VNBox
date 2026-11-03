@@ -563,6 +563,7 @@ void clearJitBlock(const std::vector<void*>& jitOps);
 #endif
 
 #ifdef BOXEDWINE_MULTI_THREADED
+#define WASM_JIT_HOP_KIND(k) // the hop counters are single-threaded only
 // Persistent cache key -> WASM bytes. Populated on the main thread before
 // main() runs (Module.onRuntimeInitialized in boxedwine-shell.js calls
 // wasm_jit_mt_register for every entry loaded from the server zip) and

@@ -9,4 +9,4 @@ CPPFLAGS += -DBOXEDWINE_HOST_DIBDRV
 
 $(BUILD_DIR)/wine-dibdrv/%.c.o: $(DIBDRV_DIR)/%.c $(COMPILE_CONFIG)
 	@$(MKDIR_P) $(dir $@)
-	@$(CC) $(OPTIMIZATION_FLAGS) $(TAIL_CALL_FLAG) -DNDEBUG -I$(DIBDRV_DIR) -MMD -MP -c $< -o $@
+	@$(CC) $(OPTIMIZATION_FLAGS) $(TAIL_CALL_FLAG) $(filter -pthread,$(EXTRA_CPP_FLAGS)) -DNDEBUG -I$(DIBDRV_DIR) -MMD -MP -c $< -o $@
