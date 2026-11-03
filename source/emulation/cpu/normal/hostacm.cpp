@@ -201,6 +201,7 @@ static void hostAcmConvert(HostAcmStream& s, const U8* src, U32 srcLen, U32& src
         srcUsed += n;
         return n;
     };
+    auto full = [&]() { return dstLen - dstUsed < align; }; // samples are written whole: less than one fits
     // Writes what fits of the decoded block; its count when the block was used up, 0 when nothing was written.
     auto pcmout = [&]() -> U32 {
         float** pcm;
@@ -246,19 +247,18 @@ static void hostAcmConvert(HostAcmStream& s, const U8* src, U32 srcLen, U32& src
             U32 r2;
             do {
                 r2 = pcmout();
-                if (dstUsed == dstLen) return false;
+                if (full()) return false;
             } while (r2);
         }
     };
     while (!s.eos) {
-        if (s.pcmDone) {
+        if (s.decoding && vorbis_synthesis_pcmout(&s.vd, nullptr) > 0) { // a decoded block waits, none of it written or some
             U32 r;
-            bool full = false;
             do {
                 r = pcmout();
-                if (dstUsed == dstLen) full = true;
-            } while (!full && r);
-            if (full || !packets()) break;
+                if (full()) break;
+            } while (r);
+            if (full() || !packets()) break;
             continue;
         }
         if (s.endSeen) s.eos = true;
@@ -285,7 +285,9 @@ bool hostAcmRun(CPU* cpu) {
 #ifdef BOXEDWINE_HOST_VORBIS
     enum : U32 { ACMDM_STREAM_CLOSE = 0x604d, ACMDM_STREAM_CONVERT = 0x604f, WAVE_FORMAT_PCM = 1, VORBIS_MODE3PLUS = 0x6771 };
     KMemory* memory = cpu->memory;
-    if (cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF || cpu->seg[CS].address || cpu->seg[DS].address ||
+    // A debug trap only matters at a stream's first convert (below). A taken stream stays on the host, since the guest's
+    // decoder saw none of its pages, and its close must still free the host state.
+    if (!cpu->isBig() || cpu->stackMask != 0xFFFFFFFF || cpu->seg[CS].address || cpu->seg[DS].address ||
         cpu->seg[ES].address || cpu->seg[SS].address || !memory->canRead(ESP, 24)) return false;
     U32 msg = memory->readd(ESP + 12), inst = memory->readd(ESP + 16), hdr = memory->readd(ESP + 20);
     if ((msg != ACMDM_STREAM_CONVERT && msg != ACMDM_STREAM_CLOSE) || !memory->canRead(inst, 40)) return false;
@@ -311,7 +313,7 @@ bool hostAcmRun(CPU* cpu) {
     src.resize(srcLen - std::min(srcUsed, srcLen));
     if (buffersOk) memory->memcpy(src.data(), pbSrc + srcUsed, (U32)src.size());
     if (it == hostAcmStreams.end()) { // first convert of this stream: take it or leave it to the guest for good
-        bool take = buffersOk && memory->readw(wfxSrc) == VORBIS_MODE3PLUS && memory->readw(wfxDst) == WAVE_FORMAT_PCM &&
+        bool take = !cpu->debugTrapActive && buffersOk && memory->readw(wfxSrc) == VORBIS_MODE3PLUS && memory->readw(wfxDst) == WAVE_FORMAT_PCM &&
             memory->readw(wfxDst + 14) == 16 && memory->readw(wfxDst + 2) == channels && channels &&
             hostAcmHeadersOk(src.data(), (U32)src.size(), channels, memory->readd(wfxSrc + 4));
         auto stream = std::make_unique<HostAcmStream>();

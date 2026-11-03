@@ -11,6 +11,7 @@
 #define __TEST_HOSTLIBC_H__
 
 void testHostLibcCopy();
+void testHostLibcDebugTrap();
 void testHostLibcCompare();
 void testHostLibcScan();
 void testHostLibcStrtol();

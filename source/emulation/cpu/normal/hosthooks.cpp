@@ -392,9 +392,15 @@ void hostLibcMapped(KFile* file) {
     }
 }
 
+#ifdef __TEST
+thread_local U32 hostLibcTestAddress, hostLibcTestFn; // testHostLibc.cpp: a block address that counts as that export
+#endif
 // LIBC_* (or HOST_ACM, HOST_CLOCK + CLOCK_* - 1, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
 // process, else LIBC_NONE.
 U32 hostLibcAt(CPU* cpu, U32 eip) {
+#ifdef __TEST
+    if (hostLibcTestFn && eip == hostLibcTestAddress) return hostLibcTestFn;
+#endif
     if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
     if ((!hostElfAny && !hostAcmAny && !hostClockAny && !hostDibdrvAny && !hostGlyphmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();
@@ -580,7 +586,7 @@ bool hostLibcRun(CPU* cpu, U32 fn) {
     switch (fn) {
     case LIBC_MEMCPY: // rep movsb
     case LIBC_MEMMOVE: // backward when dst > src, nothing when dst == src
-        if (fn == LIBC_MEMMOVE && a0 == a1) break;
+        if (fn == LIBC_MEMMOVE && a0 == a1) { result = a0; break; }
         if (!libcRange(memory, a1, a2, false) || !libcRange(memory, a0, a2, true)) return false;
         libcCopy(memory, a0, a1, a2, fn == LIBC_MEMMOVE && a0 > a1);
         memory->checkDebugTrapOnMemoryWrite(a0, a2);

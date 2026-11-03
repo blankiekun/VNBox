@@ -1592,9 +1592,18 @@ bool CPU::runNextSingleOp() {
         DecodedOp o = *op;
         lastOp.pfn = onLastOp;
         lastOp.inst = Custom1; // Custom1 has no normalDispatch case, so inst-switch chains fall to default: and call pfn
-        o.next = &lastOp;
-        o.pfn = NormalCPU::getFunctionForOp(op);
-        o.pfn(this, &o);
+        if (op->inst == Custom1) {
+            // A hook's head op (NormalCPU::getOp): its own pfn runs the hook, then the real op it points at. That one is the single step.
+            DecodedOp real = *reinterpret_cast<DecodedOp*>(op->data.nextJump);
+            real.next = &lastOp;
+            real.pfn = NormalCPU::getFunctionForOp(&real);
+            o.data.nextJump = reinterpret_cast<DecodedOp**>(&real);
+            o.pfn(this, &o);
+        } else {
+            o.next = &lastOp;
+            o.pfn = NormalCPU::getFunctionForOp(op);
+            o.pfn(this, &o);
+        }
         if (this->debugTrapActive && this->finishDebugInstruction()) {
             return false;
         }

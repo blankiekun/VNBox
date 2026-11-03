@@ -270,7 +270,9 @@ static void hostVorbisSync(KMemory* memory, U32 vd, const vorbis_dsp_state& v) {
 bool hostVorbisRun(CPU* cpu, U32 fn) {
 #ifdef BOXEDWINE_HOST_VORBIS
     KMemory* memory = cpu->memory;
-    if (cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF || cpu->seg[CS].address || cpu->seg[DS].address ||
+    // A debug trap only matters at a dsp state's first host-only call (below). A stream on the host stays there, since the
+    // guest's state was never advanced, and the mirrored calls have no guest effect. shortcut: host writes don't fire a watchpoint.
+    if (!cpu->isBig() || cpu->stackMask != 0xFFFFFFFF || cpu->seg[CS].address || cpu->seg[DS].address ||
         cpu->seg[ES].address || cpu->seg[SS].address || !memory->canRead(ESP, 16)) return false;
     U64 pid = (U64)cpu->thread->process->id << 32;
     U32 a0 = memory->readd(ESP + 4), a1 = memory->readd(ESP + 8), a2 = memory->readd(ESP + 12);
@@ -365,7 +367,7 @@ bool hostVorbisRun(CPU* cpu, U32 fn) {
             U32 vd = 0;
             for (auto& d : hostVorbisDsps) if (d.second.get() == dsp) vd = (U32)d.first;
             const vorbis_info* vi = dsp->vd.vi;
-            bool ok = vd && memory->canRead(vd, VD_SIZE) && memory->canWrite(vd, VD_SIZE) && memory->readd(vd + VD_VI) == dsp->guestVi &&
+            bool ok = !cpu->debugTrapActive && vd && memory->canRead(vd, VD_SIZE) && memory->canWrite(vd, VD_SIZE) && memory->readd(vd + VD_VI) == dsp->guestVi &&
                 memory->readd(vd + VD_PCM_STORAGE) == (U32)dsp->vd.pcm_storage && infoKey(dsp->guestVi) == dsp->viKey &&
                 memory->readd(dsp->guestVi + VI_CHANNELS) == (U32)vi->channels;
             klog_fmt("[vnbox] native vorbis: stream at vd %x (%d ch, %ld Hz) decoded by the %s", vd, vi->channels, vi->rate, ok ? "host" : "guest");
