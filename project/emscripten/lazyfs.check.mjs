@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 globalThis.window = globalThis;
 const L = new Function(fs.readFileSync(new URL('./lazyfs.js', import.meta.url), 'utf8') +
-    '\nreturn { lazyCopy, lazyCache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX, LAZY_EAGER_MAX, LAZY_EAGER_BUDGET, lazyEagerTake, lazyEscapeName, lazyGameName, lazyOverlayPath, lazyPatchIdbfs };')();
+    '\nreturn { lazyCopy, lazyCache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX, LAZY_EAGER_MAX, LAZY_EAGER_BUDGET, lazyEagerTake, lazyEscapeName, lazyGameName, lazyOverlayPath, lazyPatchIdbfs, vnboxStoreSaves };')();
 const B = L.LAZY_BLOCK, size = 10 * (1 << 20) + 123;
 const file = Uint8Array.from({ length: size }, (_, i) => (i * 7) & 255);
 const reads = [];
@@ -141,6 +141,48 @@ assert.equal(posted.length, reported + 1);
 persistM(); // nothing was failing: no message
 assert.equal(posted.length, reported + 1);
 delete globalThis.parent; delete globalThis.location;
+// A wrapper removes the page once this says true, so it must not while a save is only in memory.
+// The bug: the page went away with a persist running or waiting up to 30 s for its retry, and the save with it.
+timers.length = 0;
+m.lazyRetry = 0;
+m.idbPersistState = 0;
+let stored = 'none';
+const storeSaves = ms => { stored = 'none'; L.vnboxStoreSaves(ms).then(v => { stored = v; }); };
+const settled = () => new Promise(resolve => setImmediate(resolve));
+storeSaves(0);
+await settled();
+assert.equal(stored, true); // nothing pending: no wait
+m.idbPersistState = 'idb';
+storeSaves(1e6);
+await settled();
+assert.equal(stored, 'none');
+m.idbPersistState = 0;
+timers.pop()[0]();
+await settled();
+assert.equal(stored, true);
+// Waiting on a failed persist's retry: it goes at once, and the answer waits for it.
+fail(new Error('closed'));
+assert.ok(m.lazyRetry);
+timers.length = 0;
+const asked = persists.length;
+const queuePersist = IDBFS.queuePersist;
+IDBFS.queuePersist = mount => { persists.push(mount); mount.idbPersistState = 'idb'; };
+storeSaves(1e6);
+await settled();
+assert.equal(persists.length, asked + 1);
+assert.equal(m.lazyRetry, 0);
+assert.equal(stored, 'none');
+m.idbPersistState = 0;
+timers.pop()[0]();
+await settled();
+assert.equal(stored, true);
+IDBFS.queuePersist = queuePersist;
+// Time out with the save still only in memory: says so.
+m.idbPersistState = 'idb';
+storeSaves(0);
+await settled();
+assert.equal(stored, false);
+m.idbPersistState = 0;
 // A truncate must change the time even within the same millisecond, or the persist skips the file.
 const ops = memRoot.node_ops, future = Date.now() + 1e6, cut = { mtime: future };
 const before = persists.length;

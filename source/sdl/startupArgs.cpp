@@ -583,7 +583,8 @@ bool StartUpArgs::apply() {
 #endif
 
     klog_fmt("Using root directory: %s", root.c_str());
-#ifdef BOXEDWINE_ZLIB
+// VNBox names every zip it uses and none has these files; each look walks a whole zip, read lazily.
+#if defined(BOXEDWINE_ZLIB) && !defined(BOXEDWINE_JSPI)
     std::vector<BString> fullfilled;
     for (auto& zip : zips) {
         BString fullfills;

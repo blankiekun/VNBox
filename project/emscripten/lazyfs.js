@@ -17,6 +17,7 @@
 // Untouched game files are kept out of IndexedDB (lazyPristine, see lazyMountOverlay).
 // Errors go to the console and to a same-origin parent page as {type: "vnbox-error", source, message}.
 // After source "saves", {type: "vnbox-saves-ok"} says every store that failed works again.
+// A same-origin parent calls window.vnboxStoreSaves(ms) before it removes this page.
 // shortcut: a deleted or renamed game file comes back on reload under its old name; add a deleted list if a game needs it.
 var LAZY_BLOCK = 1 << 16;
 var LAZY_READAHEAD = 4 * LAZY_BLOCK; // read past the requested range when reads are sequential
@@ -33,6 +34,7 @@ var lazyFiles = []; // jspi mode: File objects by index
 var lazyHandles = []; // jspi mode: their file handles, for a new File when one went stale
 var lazyEagerLeft = LAZY_EAGER_BUDGET;
 var lazyFailingStores = new Set(); // mount points reported as failing, until a persist works again
+var lazyPersistStores = new Set(); // the autoPersist mounts
 var lazyBase = typeof document !== "undefined" && document.currentScript ? new URL(".", document.currentScript.src).href : ""; // this file's folder, not the page's
 
 function vnboxReport(source, error) {
@@ -418,6 +420,27 @@ function lazyPersistFailed(mount, err) {
     }
 }
 
+// For a wrapper about to remove this page, which takes with it what is only in memory: answers true once no persist
+// is queued, running or waiting to retry (that one goes now: a file gone mid-persist works the second time), false if ms ran out.
+function vnboxStoreSaves(ms) {
+    var end = Date.now() + ms;
+    return new Promise(resolve => {
+        var look = () => {
+            lazyPersistStores.forEach(mount => {
+                if (!mount.lazyRetry) return;
+                clearTimeout(mount.lazyRetry);
+                mount.lazyRetry = 0;
+                IDBFS.queuePersist(mount);
+            });
+            if (![...lazyPersistStores].some(mount => mount.idbPersistState)) resolve(true);
+            else if (Date.now() >= end) resolve(false);
+            else setTimeout(look, 20);
+        };
+        look();
+    });
+}
+window.vnboxStoreSaves = vnboxStoreSaves;
+
 // What saves need from IDBFS, which calls all of these by name.
 function lazyPatchIdbfs() {
     if (IDBFS.lazyPatched) return;
@@ -447,6 +470,7 @@ function lazyPatchIdbfs() {
         var root = mountIdbfs(mount);
         if (!mount.opts?.autoPersist) return root;
         mount.lazyPersistFails = 0;
+        lazyPersistStores.add(mount);
         var ops = root.node_ops, setattr = ops.setattr, rename = ops.rename; // ops is what every node of the mount shares
         // MEMFS leaves the time on a truncate, and a persist compares only times.
         ops.setattr = (node, attr) => {
