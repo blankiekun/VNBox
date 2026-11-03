@@ -92,6 +92,9 @@ public:
     // backend can honor profile-guided split hints that want a hot interior
     // target compiled as its own block-start entry.
     virtual bool shouldStopBlockBefore(U32 eip, DecodedOp* op) { return false; }
+    // Consulted for each call while calculateLongestBlock extends a block. True: the backend compiles the callee
+    // into this block, so the block continues with the instruction after the call (its return site).
+    virtual bool canInlineCall(U32 eip, DecodedOp* op) { return false; }
     // Permit conditional exits without ending the compiled fall-through path.
     virtual bool supportsConditionalSideExit(U32 sourceEip, U32 targetEip) const { return false; }
     virtual void readMMU(RegPtr dest, RegPtr index, U32 offset = 0) = 0;

@@ -19,6 +19,7 @@
 
 U32 hostLibcFnId(const char* name);
 bool hostLibcRun(CPU* cpu, U32 fn);
+bool hostClockRun(CPU* cpu, U32 fn); // hostclock.cpp, fn: 1 NtQueryPerformanceCounter, 2 NtQuerySystemTime, 3 RtlGetSystemTimePrecise
 
 #define cpu (testContext().cpu)
 #define memory (testContext().memory)
@@ -39,7 +40,7 @@ void setup() {
 }
 
 // Calls fn(a0, a1, a2) the way a guest `call` arrives; checks the registers for a done or a declined call.
-U32 call(const char* name, U32 a0, U32 a1, U32 a2, bool expectNative) {
+U32 call(const char* name, U32 a0, U32 a1, U32 a2, bool expectNative, U32 eip = 0x1000) {
     U32 fn = hostLibcFnId(name);
     if (!fn) testFail("%s is not a wrapped function", name);
     ESP = STACK;
@@ -48,11 +49,11 @@ U32 call(const char* name, U32 a0, U32 a1, U32 a2, bool expectNative) {
     memory->writed(STACK + 8, a1);
     memory->writed(STACK + 12, a2);
     EAX = 0xDEADBEEF;
-    cpu->eip.u32 = 0x1000;
+    cpu->eip.u32 = eip;
     bool ran = hostLibcRun(cpu, fn);
     if (ran != expectNative) testFail("%s(%x, %x, %x): native %d, expected %d", name, a0, a1, a2, ran, expectNative);
     if (ran && (ESP != STACK + 4 || cpu->eip.u32 != RET)) testFail("%s did not return like `ret`", name);
-    if (!ran && (ESP != STACK || cpu->eip.u32 != 0x1000 || EAX != 0xDEADBEEF)) testFail("%s changed registers before falling back", name);
+    if (!ran && (ESP != STACK || cpu->eip.u32 != eip || EAX != 0xDEADBEEF)) testFail("%s changed registers before falling back", name);
     return EAX;
 }
 
@@ -193,6 +194,152 @@ void testHostLibcStrtol() {
     memory->strcpy(HEAP, "123");
     expect("strtol without endptr", call("strtol", HEAP, 0, 10, true), 123);
     call("strtol", HEAP, UNMAPPED, 10, false); // endptr store would fault
+}
+
+
+// Native clock (hostclock.cpp) must give the values Wine's unix side computed from the clock_gettime64 syscall
+// (ticks = 100 ns; QPC from CLOCK_BOOTTIME, system time from CLOCK_REALTIME since 1601), return like `ret 8` /
+// `ret 4` / `ret`, and leave an unwritable pointer to the guest. Catches a wrong unit (us vs 100 ns), a missing
+// 1601 epoch, a stdcall return that doesn't pop the arguments, and a write before the fallback.
+void testHostClock() {
+    auto clockTicks = [](U32 clockId) { // what Wine computes from the syscall: tv_sec * 10^7 + tv_nsec / 100
+        U32 ts = HEAP + 0x900;
+        KSystem::clock_gettime64(testContext().thread, clockId, ts);
+        return memory->readq(ts) * 10000000 + memory->readd(ts + 8) / 100;
+    };
+    auto run = [](U32 fn, U32 a0, U32 a1, bool expectNative, U32 pop) {
+        ESP = STACK;
+        memory->writed(STACK, RET);
+        memory->writed(STACK + 4, a0);
+        memory->writed(STACK + 8, a1);
+        EAX = 0xDEADBEEF;
+        cpu->eip.u32 = 0x1000;
+        bool ran = hostClockRun(cpu, fn);
+        if (ran != expectNative) testFail("clock %d: native %d, expected %d", fn, ran, expectNative);
+        if (ran && (ESP != STACK + 4 + pop || cpu->eip.u32 != RET)) testFail("clock %d did not return like `ret %d`", fn, pop);
+        if (!ran && (ESP != STACK || cpu->eip.u32 != 0x1000 || EAX != 0xDEADBEEF)) testFail("clock %d changed registers before falling back", fn);
+    };
+    setup();
+    U32 counter = HEAP + 0x100, freq = HEAP + 0x108;
+    U64 before = clockTicks(7); // CLOCK_BOOTTIME
+    run(1, counter, freq, true, 8);
+    U64 after = clockTicks(7);
+    U64 qpc = memory->readq(counter);
+    if (qpc < before || qpc > after) testFail("QPC %llu not within the syscall's %llu..%llu", qpc, before, after);
+    expect("QPC status", EAX, 0);
+    if (memory->readq(freq) != 10000000) testFail("QPC frequency %llu", memory->readq(freq));
+    memory->writeq(freq, 0);
+    run(1, counter, 0, true, 8); // no frequency asked
+    if (memory->readq(freq) != 0) testFail("QPC wrote a null frequency pointer");
+    run(1, UNMAPPED, freq, false, 0);
+    run(1, counter, UNMAPPED, false, 0);
+    if (memory->readq(freq) != 0) testFail("QPC wrote before falling back");
+
+    U32 time = HEAP + 0x110;
+    before = clockTicks(5) + 116444736000000000ull; // CLOCK_REALTIME_COARSE, the clock NtQuerySystemTime picks
+    run(2, time, 0, true, 4);
+    after = clockTicks(5) + 116444736000000000ull;
+    U64 t = memory->readq(time);
+    if (t < before || t > after) testFail("system time %llu not within the syscall's %llu..%llu", t, before, after);
+    run(2, UNMAPPED, 0, false, 0);
+
+    before = clockTicks(0) + 116444736000000000ull; // CLOCK_REALTIME
+    run(3, 0, 0, true, 0);
+    t = ((U64)EDX << 32) | EAX;
+    after = clockTicks(0) + 116444736000000000ull;
+    if (t < before || t > after) testFail("precise system time %llu not within the syscall's %llu..%llu", t, before, after);
+}
+
+// Native mutexes (hostmutex.cpp). The functions find libc's data from their own address: these eips put
+// __pthread_force_elision of that libc build into the test heap.
+namespace {
+constexpr U32 SYM_LOCK = 0x721f5, SYM_UNLOCK = 0x737b3, FORCE_ELISION = 0x19391c;
+constexpr U32 ELISION_AT = HEAP + 0x8000, TCB = HEAP + 0xA000, MTX = HEAP + 0xC000;
+constexpr U32 TID = 4242;
+constexpr U32 LOCK_EIP = ELISION_AT - FORCE_ELISION + SYM_LOCK, UNLOCK_EIP = ELISION_AT - FORCE_ELISION + SYM_UNLOCK;
+
+void mutexSetup(U32 kind, U32 lock, U32 count, U32 owner) {
+    setup();
+    cpu->seg[GS].address = TCB;
+    memory->writed(TCB + 0x68, TID); // tid
+    memory->writed(MTX, lock);
+    memory->writed(MTX + 4, count);
+    memory->writed(MTX + 8, owner);
+    memory->writed(MTX + 12, kind);
+    memory->writed(MTX + 16, 5); // __nusers
+}
+
+void expectMutex(const char* what, U32 lock, U32 count, U32 owner, U32 nusers) {
+    expect(what, memory->readd(MTX), lock);
+    expect(what, memory->readd(MTX + 4), count);
+    expect(what, memory->readd(MTX + 8), owner);
+    expect(what, memory->readd(MTX + 16), nusers);
+}
+
+U32 lock(bool native) { return call("pthread_mutex_lock", MTX, 0, 0, native, LOCK_EIP); }
+U32 unlock(bool native) { return call("pthread_mutex_unlock", MTX, 0, 0, native, UNLOCK_EIP); }
+}
+
+// Catches: a lock taken when the word isn't free (the guest has to futex-wait), an unlock that zeroes a word
+// with waiters (their wake-up is lost), a recursive count or owner/nusers bookkeeping that differs from glibc,
+// errorcheck/recursive error codes, and a fast path taken for a kind glibc handles differently (pshared,
+// robust, PI, elision forced) or past glibc's owner assertion. A declined call must write nothing.
+void testHostLibcMutex() {
+    for (U32 kind : { 0u, 3u }) { // normal, adaptive
+        mutexSetup(kind, 0, 0, 0);
+        expect("lock free", lock(true), 0);
+        expectMutex("locked", 1, 0, TID, 6);
+        lock(false); // held (by us: a normal mutex deadlocks in glibc too)
+        expectMutex("relock declined", 1, 0, TID, 6);
+        expect("unlock", unlock(true), 0);
+        expectMutex("unlocked", 0, 0, 0, 5);
+        mutexSetup(kind, 2, 0, TID);
+        unlock(false);
+        expectMutex("unlock with waiters declined", 2, 0, TID, 5);
+        mutexSetup(kind, 0, 0, 77);
+        lock(false);
+        expectMutex("owner set on a free word declined", 0, 0, 77, 5);
+    }
+    mutexSetup(0, 0, 0, 0);
+    memory->writed(ELISION_AT, 1);
+    lock(false);
+    expectMutex("forced elision declined", 0, 0, 0, 5);
+
+    mutexSetup(1, 0, 0, 0); // recursive
+    expect("rlock", lock(true), 0);
+    expectMutex("rlocked", 1, 1, TID, 6);
+    expect("rlock again", lock(true), 0);
+    expectMutex("rlocked twice", 1, 2, TID, 6);
+    expect("runlock", unlock(true), 0);
+    expectMutex("still held", 1, 1, TID, 6);
+    expect("runlock last", unlock(true), 0);
+    expectMutex("runlocked", 0, 0, 0, 5);
+    mutexSetup(1, 1, 1, 99);
+    expect("runlock not owner", unlock(true), 1);
+    lock(false); // held by another thread
+    expectMutex("other owner untouched", 1, 1, 99, 5);
+    mutexSetup(1, 1, 0xFFFFFFFF, TID);
+    expect("rlock count overflow", lock(true), 11);
+    mutexSetup(1, 2, 1, TID);
+    unlock(false);
+    expectMutex("runlock with waiters declined", 2, 1, TID, 5);
+
+    mutexSetup(2, 1, 0, TID); // errorcheck
+    expect("relock errorcheck", lock(true), 35);
+    expect("eunlock", unlock(true), 0);
+    expectMutex("eunlocked", 0, 0, 0, 4); // set up locked with __nusers 5
+    expect("eunlock unlocked", unlock(true), 1);
+    mutexSetup(2, 1, 0, 99);
+    expect("eunlock not owner", unlock(true), 1);
+    expectMutex("errorcheck untouched", 1, 0, 99, 5);
+
+    for (U32 kind : { 0x80u, 0x81u, 0x10u, 0x20u, 0x40u, 0x100u }) { // pshared, robust, PI, PP, elision
+        mutexSetup(kind, 0, 0, 0);
+        lock(false);
+        mutexSetup(kind, 1, 0, TID);
+        unlock(false);
+        expectMutex("special kind untouched", 1, 0, TID, 5);
+    }
 }
 
 #endif

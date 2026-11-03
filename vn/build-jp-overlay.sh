@@ -76,13 +76,15 @@ printf 'wineboot.exe.so, explorer.exe.so, quartz.dll.so and dsound.dll.so in opt
 
 # ntsync: the root fs's ntdll.so and wineserver rebuilt with linux/ntsync.h, so event, mutex and
 # semaphore waits skip wineserver once the kernel has /dev/ntsync (falls back to the server without).
+# ntdll also gets vn/wine/ntdll-*.patch: Sleep(n > 0) and timed-out waits no longer yield, a yield (Sleep(0), empty
+# PeekMessage) skips its two getrusage calls, and SleepEx(n, TRUE) waits on the thread's ntsync alert, not wineserver.
 "$here/build-wine-ntsync.sh" "$work/ntsync"
 mv "$work/ntsync/ntdll.so" "$work/opt/wine/lib/wine/i386-unix/"
 mkdir -p "$work/opt/wine/bin"
 mv "$work/ntsync/wineserver" "$work/opt/wine/bin/"
 mv "$work/ntsync/patches" "$work/opt/wine/share/wine/vnbox-patches/rootfs"
 rm -r "$work/ntsync"
-printf '\nntdll.so (i386-unix) and wineserver (bin) are Wine 11.0 with the root fs patches in rootfs/\n(tools/buildWine/wine_builds.json), configured with Linux 6.14'"'"'s include/uapi/linux/ntsync.h,\nbuilt by vn/build-wine-ntsync.sh in https://github.com/blankiekun/VNBox.\n' \
+printf '\nntdll.so (i386-unix) and wineserver (bin) are Wine 11.0 with the root fs patches in rootfs/\n(tools/buildWine/wine_builds.json) and ntdll-*.patch, configured with Linux 6.14'"'"'s include/uapi/linux/ntsync.h,\nbuilt by vn/build-wine-ntsync.sh in https://github.com/blankiekun/VNBox.\n' \
   >> "$work/opt/wine/share/wine/vnbox-patches/README"
 
 # Glyph cache: the root fs's win32u.so rebuilt with vn/wine/win32u-*.patch, so GetGlyphOutline bitmaps
