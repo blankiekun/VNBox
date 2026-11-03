@@ -111,6 +111,23 @@ m.lazyRetry = 0;
 IDBFS.syncfs(m, false, () => { }); syncs.pop()(null);
 fail(new Error('again')); fail(new Error('again'));
 assert.equal(reports.length, 2);
+// The player's warning clears on this message, so it must wait for every store that failed: saves are still only in memory otherwise.
+const posted = [];
+globalThis.parent = { postMessage: p => posted.push(p) };
+globalThis.location = { origin: 'o' };
+const other = { mountpoint: '/other', lazyPersistFails: 0 };
+const persistOther = err => { IDBFS.syncfs(other, false, () => { }); syncs.pop()(err); }, persistM = () => { IDBFS.syncfs(m, false, () => { }); syncs.pop()(null); };
+persistOther(new Error('full')); persistOther(new Error('full'));
+assert.equal(posted.at(-1).source, 'saves');
+const reported = posted.length;
+persistM();
+assert.equal(posted.length, reported);
+persistOther(null);
+assert.deepEqual(posted.at(-1), { type: 'vnbox-saves-ok' });
+assert.equal(posted.length, reported + 1);
+persistM(); // nothing was failing: no message
+assert.equal(posted.length, reported + 1);
+delete globalThis.parent; delete globalThis.location;
 // A truncate must change the time even within the same millisecond, or the persist skips the file.
 const ops = memRoot.node_ops, future = Date.now() + 1e6, cut = { mtime: future };
 const before = persists.length;
