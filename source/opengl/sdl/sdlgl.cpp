@@ -1132,6 +1132,7 @@ void KOpenGLSdl::glSwapBuffers(KThread* thread, const std::shared_ptr<XDrawable>
 #ifdef __EMSCRIPTEN__
         if (vnboxStats.on) {
             vnboxStats.presentsGl++;
+            vnboxStatPut(thread);
             vnboxStats.presentGlMs += emscripten_get_now() - swapStart;
         }
         if (thread && thread->cpu) {
