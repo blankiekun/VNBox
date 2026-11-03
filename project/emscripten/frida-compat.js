@@ -49,12 +49,19 @@
     };
 
     // ---- guest memory --------------------------------------------------------------------
+    const MAX_READ = 1 << 24; // hook set: 64 KiB at most (libLuna's image reads)
     let scratch = 0, scratchSize = 0;
+    // len can come from guest data (a DLL's export count, a script's length), and the wasm exports take it as an
+    // i32: a negative or over-large len must never reach them, or bw_read writes guest bytes over the emulator.
     function buffer(len) {
+        if (!(len >= 0 && len <= MAX_READ)) throw new Error('bad read length ' + len);
         if (len > scratchSize) {
             if (scratch) F.api.free(scratch);
-            scratchSize = Math.max(len, 65536);
-            scratch = F.api.malloc(scratchSize);
+            scratchSize = 0;
+            const size = Math.max(len, 65536);
+            scratch = F.api.malloc(size);
+            if (!scratch) throw new Error('out of memory reading ' + len + ' bytes');
+            scratchSize = size;
         }
         return scratch;
     }

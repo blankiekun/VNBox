@@ -9,9 +9,15 @@ const lines = [];
 const trans = F.test.makeTrans((s) => lines.push(s));
 const mem = new Uint8Array(0x3000), heap = new Uint8Array(1 << 20);
 let top = 16;
-F.api = {
-    malloc: (n) => { const p = top; top += n; return p; }, free() {}, heap: () => heap,
-    read: (pid, addr, buf, len) => { const n = Math.max(0, Math.min(len, 0x2000 - addr)); heap.set(mem.subarray(addr, addr + n), buf); return n; }, // 0x2000+ unreadable
+const blocks = new Map(), wild = [];
+F.api = { // the sizes arrive as the wasm exports get them: an i32, read as unsigned
+    malloc: (n) => { n >>>= 0; if (n >= 1 << 24) return 0; const p = top; top += n; blocks.set(p, n); return p; },
+    free: (p) => blocks.delete(p), heap: () => heap,
+    read: (pid, addr, buf, len) => {
+        const n = Math.max(0, Math.min(len >>> 0, 0x2000 - addr)); // 0x2000+ unreadable
+        if (!(n <= blocks.get(buf))) { wild.push([buf, n]); return n; }
+        heap.set(mem.subarray(addr, addr + n), buf); return n;
+    },
 };
 mem.set([0x93, 0xfa, 0x96, 0x7b, 0x5e, 0x6e, 0], 0x100); // 日本^n in Shift-JIS
 mem.set(new TextEncoder().encode('héllo\0'), 0x200);
@@ -33,6 +39,14 @@ const handler = trans.send((s) => s, '200+');
 handler('a'); handler('a'); handler('b');
 await new Promise((r) => setTimeout(r, 300));
 assert.deepEqual(lines, ['a\nb']);
+// Bug caught: a bad length (guest data, a script's junk) spoils the scratch buffer's size, and that read or a later one
+// writes guest bytes at wasm address 0 or past the block (`wild`). 2^24 stands for a malloc that really fails.
+mem.set([1, 2, 3, 4], 0x600);
+for (const n of [-1, 2 ** 31, (1 << 24) + 1]) assert.throws(() => ptr(0x600).readByteArray(n), /bad read length/, String(n));
+for (const n of [-1, 0x200000004]) assert.throws(() => F.hexdump(ptr(0x600), { length: n }), /bad read length/, String(n)); // exportsOf's count * 4
+assert.throws(() => ptr(0x600).readByteArray(1 << 24), /out of memory/);
+assert.deepEqual([...new Uint8Array(ptr(0x600).readByteArray(4))], [1, 2, 3, 4]);
+assert.deepEqual(wild, []);
 console.log('frida-compat self-check ok');
 // script URL guard: same-origin blob: or under the page's parent folder, nothing else
 const page = 'https://ex.org/vn/vnbox/boxedwine.html?frida=x';
