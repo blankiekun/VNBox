@@ -81,6 +81,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "cheapAsyncKey",
+      "label": "Cheap key polling",
+      "description": "GetAsyncKeyState and other input checks read Wine's queue state once per call, not four times; input is seen just as soon.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "hotGroup",
       "label": "Hot code groups",
       "description": "Compiles code that runs hot together into one module, so it runs faster.",

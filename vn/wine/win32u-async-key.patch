@@ -1,0 +1,143 @@
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -800,12 +800,15 @@ SHORT WINAPI NtUserGetAsyncKeyState( INT key )
+ 
+     if (key < 0 || key >= 256) return 0;
+ 
+-    check_for_events( QS_ALLINPUT );
++    if (!async_key_no_events( key, &state ))
++    {
++        check_for_events( QS_ALLINPUT );
+ 
+-    while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
+-        state = desktop_shm->keystate[key];
++        while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
++            state = desktop_shm->keystate[key];
+ 
+-    if (status) return 0;
++        if (status) return 0;
++    }
+     if (!(state & 0x40)) return (state & 0x80) << 8;
+ 
+     /* Need to make a server call to reset the last pressed bit */
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3240,10 +3240,48 @@ static BOOL check_internal_bits( UINT mask )
+     return signaled;
+ }
+ 
++/* VNBox: 0 when WINE_VNBOX_ASYNC_KEY=0 (URL option cheapAsyncKey=0): every check in process_driver_events reads the
++ * shared memory on its own again, as upstream does. */
++static BOOL one_queue_read(void)
++{
++    static int one = -1;
++    if (one == -1)
++    {
++        const char *env = getenv( "WINE_VNBOX_ASYNC_KEY" );
++        one = !env || strcmp( env, "0" );
++    }
++    return one;
++}
++
++/* VNBox: process_driver_events' questions to the queue's shared memory (driver events? masks as wanted and refreshed
++ * less than 3 s ago? internal hardware messages?) from one read of it, all asked on every call. TRUE: there is nothing
++ * to do. Exactly check_queue_masks' test of the tick, without its 64-bit division, a libgcc call in 32-bit code. */
++static inline BOOL poll_has_no_work( const struct shared_queue_poll *poll, UINT wake_mask, UINT changed_mask )
++{
++    return !(poll->internal_bits & (QS_DRIVER | QS_HARDWARE)) &&
++           poll->wake_mask == wake_mask && poll->changed_mask == changed_mask &&
++           poll->access_time - (get_tick_count() - 2999) * 10000 < 3000 * 10000;
++}
++
++/* VNBox: check_for_events( QS_ALLINPUT ) (which never flushes: QS_ALLINPUT has QS_PAINT) when it would have nothing to
++ * do, and the key's state as it would read it next. FALSE: call check_for_events and read the state. */
++BOOL async_key_no_events( INT key, BYTE *state )
++{
++    struct shared_queue_poll poll;
++
++    if (!one_queue_read() || !read_shared_queue_poll( &poll, key ) || !poll_has_no_work( &poll, 0, 0 )) return FALSE;
++    *state = poll.key_state;
++    return TRUE;
++}
++
+ static BOOL process_driver_events( UINT events_mask, UINT wake_mask, UINT changed_mask )
+ {
++    struct shared_queue_poll poll;
+     BOOL drained = FALSE;
+ 
++    if (one_queue_read() && read_shared_queue_poll( &poll, -1 ) && poll_has_no_work( &poll, wake_mask, changed_mask ))
++        return (poll.wake_bits & poll.wake_mask) || (poll.changed_bits & poll.changed_mask);
++
+     if (check_internal_bits( QS_DRIVER )) drained = user_driver->pProcessEvents( events_mask );
+ 
+     if (drained || !check_queue_masks( wake_mask, changed_mask ))
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -216,6 +216,7 @@ extern BOOL is_cache_dc( HDC hdc );
+ 
+ /* message.c */
+ extern void check_for_events( UINT flags );
++extern BOOL async_key_no_events( INT key, BYTE *state );
+ 
+ /* systray.c */
+ extern LRESULT system_tray_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *data );
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -248,6 +248,15 @@ extern NTSTATUS get_shared_desktop( struct object_lock *lock, const desktop_shm_
+ extern NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_shm );
+ extern NTSTATUS get_shared_input( UINT tid, struct object_lock *lock, const input_shm_t **input_shm );
+ 
++/* VNBox: see read_shared_queue_poll in winstation.c */
++struct shared_queue_poll
++{
++    UINT64 access_time;
++    UINT wake_mask, wake_bits, changed_mask, changed_bits, internal_bits;
++    BYTE key_state;
++};
++extern BOOL read_shared_queue_poll( struct shared_queue_poll *poll, INT key );
++
+ extern BOOL is_virtual_desktop(void);
+ extern BOOL is_service_process(void);
+ 
+--- a/dlls/win32u/winstation.c
++++ b/dlls/win32u/winstation.c
+@@ -267,6 +267,39 @@ NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_s
+     return STATUS_SUCCESS;
+ }
+ 
++/* VNBox: one seqlock read of the calling thread's queue and, for key >= 0, one of its desktop's key state, with one
++ * thread data lookup (NtCurrentTeb -> pthread_getspecific) where get_shared_queue and get_shared_desktop do one per
++ * call. FALSE until get_shared_queue / get_shared_desktop have found the objects. */
++BOOL read_shared_queue_poll( struct shared_queue_poll *poll, INT key )
++{
++    const struct session_thread_data *data = get_session_thread_data();
++    const shared_object_t *object = data->shared_queue;
++    const queue_shm_t *queue_shm;
++    UINT64 seq;
++
++    if (!object) return FALSE;
++    queue_shm = &object->shm.queue;
++    do
++    {
++        shared_object_acquire_seqlock( object, &seq );
++        poll->access_time = queue_shm->access_time;
++        poll->wake_mask = queue_shm->wake_mask;
++        poll->wake_bits = queue_shm->wake_bits;
++        poll->changed_mask = queue_shm->changed_mask;
++        poll->changed_bits = queue_shm->changed_bits;
++        poll->internal_bits = queue_shm->internal_bits;
++    } while (!shared_object_release_seqlock( object, seq ));
++
++    if (key < 0) return TRUE;
++    if (!(object = data->shared_desktop)) return FALSE;
++    do
++    {
++        shared_object_acquire_seqlock( object, &seq );
++        poll->key_state = object->shm.desktop.keystate[key];
++    } while (!shared_object_release_seqlock( object, seq ));
++    return TRUE;
++}
++
+ static NTSTATUS try_get_shared_input( UINT tid, struct object_lock *lock, const input_shm_t **input_shm,
+                                       struct shared_input_cache *cache )
+ {
