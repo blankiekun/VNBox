@@ -27,6 +27,7 @@ function launcher(url) {
             },
         },
         console: { log() {}, error() {}, warn() {} },
+        URL,
         URLSearchParams,
         location: { search: new URL(url).search },
         IDBFS: {},
@@ -124,6 +125,7 @@ function dialogShell(tree, url = 'http://localhost/') {
             body: { appendChild() {}, removeChild() {} },
         },
         console: { log() {}, error() {}, warn() {} },
+        URL,
         URLSearchParams,
         location: { search: new URL(url).search },
         TextEncoder, TextDecoder, Blob, Response, CompressionStream, DecompressionStream,
@@ -775,6 +777,7 @@ async function loadDisc(url, served) {
         window: { location: { href: url }, addEventListener() {} },
         document: { addEventListener() {}, getElementById() { return { style: {}, value: '', addEventListener() {}, getContext() {}, contains() { return false; } }; } },
         console: { log() {}, error() {}, warn() {} },
+        URL,
         URLSearchParams,
         location: { search: new URL(url).search },
         TextDecoder,
@@ -825,4 +828,123 @@ test('an upper case BIN looks for an upper case CUE sheet, other images for none
     assert.deepEqual(upper.requests, ['GAME.CUE', 'GAME.BIN']);
     const iso = await loadDisc('http://localhost/?cdrom=e:game.iso', { 'game.iso': 'data' });
     assert.deepEqual(iso.requests, ['game.iso']);
+});
+
+// The page before boot: real shell code, a DOM of plain objects. Records what embedders are told.
+function bootShell(url, syncError = null) {
+    const elements = new Map();
+    const reports = [];
+    const window = { location: new URL(url), addEventListener() {}, parent: { postMessage(message) { reports.push(message); } } };
+    const context = vm.createContext({
+        window,
+        document: {
+            addEventListener() {},
+            getElementById(id) {
+                if (!elements.has(id)) {
+                    elements.set(id, { style: {}, value: '', addEventListener() {}, getContext() {}, contains() { return false; } });
+                }
+                return elements.get(id);
+            },
+        },
+        console: { log() {}, error() {}, warn() {} },
+        setTimeout() {},
+        URL,
+        URLSearchParams,
+        location: { search: new URL(url).search, origin: new URL(url).origin },
+        IDBFS: {},
+        FS: { mkdirTree() {}, mount() {}, syncfs(populate, callback) { callback(syncError); } },
+    });
+    vm.runInContext(source, context);
+    return { context, window, reports, element: (id) => elements.get(id) };
+}
+const page = 'https://site.example/vn/vnbox.html?';
+
+// The bug: a crafted link fetches a zip from another site, runs it with the game's saves mounted, and
+// the copy stays in OPFS for later games. The hostile ones cover what a check of base or file alone misses.
+test('zips from the URL stay on the page\'s origin', () => {
+    for (const query of [
+        'rootBase=https://evil.example/',
+        'root=https://evil.example/a.zip',
+        'root=//evil.example/a.zip',
+        'root=\\\\evil.example/a.zip', // backslashes are slashes in a URL
+        'rootBase=/&root=/evil.example/a.zip', // "/" + "/evil.example/a.zip" is another host
+        'root=data:application/zip;base64,AAAA.zip',
+        'overlayBase=https://evil.example/&overlay=jp.zip',
+        'overlay=jp.zip;https://evil.example/a.zip',
+        'appBase=https://evil.example/&app=game.zip',
+        'app=https://evil.example/game.zip',
+        'cdrom=//evil.example/disc.iso',
+    ]) {
+        assert.throws(() => bootShell(page + query).context.setConfiguration(), /must be on this site/, query);
+    }
+    for (const query of [
+        // What the chimimouryou player sends
+        'root=TinyCore15Wine11.0-web&rootBase=vnbox&overlay=jp.zip&overlayBase=vnbox&lazy=opfs%3Avnbox%2Fg1&cdrom=opfs%3Avnbox%2Fg1%2Fdisc.iso',
+        // The default root beside the page, and bases that name this site
+        'overlay=jp.zip&lazy=opfs%3Avnbox%2Fg1',
+        'rootBase=https://site.example/other/&root=a.zip',
+        'rootBase=../up/&app=game.zip&appBase=/apps/',
+    ]) {
+        bootShell(page + query).context.setConfiguration();
+    }
+});
+
+// The bug: the zip travels in the link itself, past the origin check, with the game's saves mounted.
+test('a payload in the URL is refused only with a game folder', () => {
+    for (const param of ['app-payload', 'overlay-payload']) {
+        assert.throws(() => bootShell(page + `lazy=opfs%3Avnbox%2Fg1&${param}=AAAA`).context.setConfiguration(), /refused with lazy=/);
+        bootShell(page + `${param}=AAAA`).context.setConfiguration();
+    }
+});
+
+// The bug: the attacker's program gets a way out to the attacker's gateway.
+test('the network gateway stays on the page\'s host', () => {
+    const gateway = (host, base = page) => bootShell(base + 'network=websocket&networkGateway=' + host).context.setConfiguration();
+    assert.throws(() => gateway('wss://evil.example/'), /must be on this site/);
+    assert.throws(() => gateway('wss://site.example.evil.example/'), /must be on this site/);
+    assert.throws(() => gateway('wss://user@evil.example/'), /must be on this site/);
+    gateway('wss://site.example:8001/boxedwine-network'); // the default's shape
+    gateway('ws://127.0.0.1:8001/boxedwine-network', 'http://127.0.0.1:8000/boxedwine.html?'); // the README's
+    bootShell(page + 'network=websocket').context.setConfiguration();
+});
+
+// The bug: a failed storage load left the spinner going and told nobody; going on could overwrite the saves.
+test('a failed IndexedDB load stops the boot and says so', () => {
+    const shell = bootShell(page + 'lazy=opfs%3Avnbox%2Fg1', new Error('storage blocked'));
+    shell.context.setConfiguration();
+    let continued = false;
+    shell.context.initBrowserFilesystem(() => { continued = true; });
+    assert.equal(continued, false);
+    assert.match(shell.element('status').textContent, /browser storage: Error: storage blocked/);
+    assert.equal(shell.element('spinner').style.display, 'none');
+    assert.deepEqual(shell.reports.map((report) => report.source), ['lazyfs']);
+});
+
+// The bug: preRun throws and fetch rejections land here, and the page kept saying "Preparing...".
+test('a failure during boot stays on the page; one after boot leaves it alone', () => {
+    const shell = bootShell(page);
+    const name = '<img src=x onerror=alert(1)>.zip';
+    shell.window.onunhandledrejection({ reason: new Error(name) });
+    assert.equal(shell.element('status').textContent, 'Unable to start: ' + name); // as text: no innerHTML below
+    assert.equal(shell.element('status').innerHTML, 'Downloading...');
+    assert.equal(shell.element('spinner').style.display, 'none');
+    shell.context.Module.setStatus('Preparing... (1/3)');
+    assert.equal(shell.element('status').textContent, 'Unable to start: ' + name);
+
+    const running = bootShell(page);
+    vm.runInContext('isRunning = true', running.context);
+    running.window.onunhandledrejection({ reason: new Error('late') });
+    assert.equal(running.element('status').textContent, undefined);
+});
+
+// The bug: a rejection that does not stop the boot would leave its message over a running game.
+test('the boot going on after a stray rejection clears the message', () => {
+    const shell = bootShell(page);
+    shell.window.onunhandledrejection({ reason: new Error('stray') });
+    shell.context.Module.arguments = [];
+    shell.context.Module.removeRunDependency = () => shell.context.Module.setStatus('');
+    vm.runInContext('Config.networking = { enabled: false }', shell.context);
+    shell.context.setConfiguration();
+    shell.context.startEmulator();
+    assert.equal(shell.element('status').innerHTML, '');
 });

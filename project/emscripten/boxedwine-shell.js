@@ -176,6 +176,7 @@
             let cdrom = getCDRom("cdrom"); //MANUAL:{files: ["disc1.iso", "disc2.iso"], drive: "e"}
             Config.cdromISOFiles = cdrom.files;
             Config.cdromDrive = cdrom.drive;
+            requireOwnSiteZips();
             Config.appPayload = getPayload("app-payload"); 
             Config.extraPayload = getPayload("overlay-payload"); 
             Config.Program = getExecutable(); //MANUAL:"CHOMP.EXE";
@@ -318,6 +319,9 @@
                 var protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
                 var hostname = window.location.hostname || "127.0.0.1";
                 gatewayUrl = protocol + "//" + hostname + ":8001/boxedwine-network";
+            } else {
+                // By host, not origin: the gateway is its own server, by default on this host's port 8001.
+                requireOwnSite("networkGateway", gatewayUrl, "hostname");
             }
             console.log("networking enabled through gateway: " + gatewayUrl);
             return {
@@ -446,6 +450,9 @@
             var payload =  getParameter(param);
             if(!allowParameterOverride()){
                 payload = "";
+            }
+            if (payload.length > 0 && Config.lazyApp.length > 0) {
+                throw new Error(param + " is refused with lazy=: it would run with that game's folder and saves");
             }
             return payload;
         }
@@ -773,6 +780,24 @@
             }
             return filename;
         }
+        // What the URL makes the page fetch or connect to stays on this site: a zip runs with the game's
+        // folder and saves mounted and stays in OPFS for later games. Throws before anything is mounted or stored.
+        function requireOwnSite(param, url, part) {
+            let page = new URL(window.location.href), target = null;
+            try { target = new URL(url, page); } catch (e) { }
+            if (!target || target[part] !== page[part]) {
+                throw new Error(param + " must be on this site, refused: " + url);
+            }
+        }
+        // Checks each base + file as fetched: neither alone shows that "/" + "/evil.example/a.zip" leaves the site.
+        function requireOwnSiteZips() {
+            requireOwnSite("root", Config.locateRootBaseUrl + Config.rootZipFile, "origin");
+            Config.extraZipFiles.forEach((file) => requireOwnSite("overlay", Config.locateOverlayBaseUrl + file, "origin"));
+            if (Config.appZipFile.length > 0) {
+                requireOwnSite("app", Config.locateAppBaseUrl + Config.appZipFile, "origin");
+            }
+            Config.cdromISOFiles.forEach((file) => requireOwnSite("cdrom", cdromFileUrl(file), "origin"));
+        }
         function getBaseUrl(param) {
 
             var baseUrl = getParameter(param);
@@ -865,6 +890,8 @@
     				});
       			} else {
       				console.log('Unable to load:' + filename + ' error:' + response.status);
+      				vnboxReport('lazyfs', 'Unable to load ' + filename + ': HTTP ' + response.status);
+      				bootFailed('Unable to load ' + filename + ': HTTP ' + response.status);
       			}
 			});
 		}
@@ -877,7 +904,10 @@
                 loadFile(pathPrefix, filename, (bytes) => { createFile("/", filename, bytes); callback(); });
                 return;
             }
-            lazyAddCachedFile("/", filename, pathPrefix + filename).then(callback, (e) => vnboxReport("lazyfs", "Unable to load " + filename + ": " + e));
+            lazyAddCachedFile("/", filename, pathPrefix + filename).then(callback, (e) => {
+                vnboxReport("lazyfs", "Unable to load " + filename + ": " + e);
+                bootFailed("Unable to load " + filename + ": " + e);
+            });
         }
         function buildAppFileSystem(callback) {
             if (Config.lazyApp.startsWith("opfs:")) {
@@ -885,7 +915,10 @@
                 mountLazyApp(getLazyAppMount(), name, lazyOpfsDir(path)).then(() => {
                     Config.appSubfolder = name;
                     callback();
-                }, (e) => vnboxReport("lazyfs", "Unable to mount lazy game folder " + path + ": " + e));
+                }, (e) => {
+                    vnboxReport("lazyfs", "Unable to mount lazy game folder " + path + ": " + e);
+                    bootFailed("Unable to open the game folder " + path + ": " + e);
+                });
             }else if(Config.appPayload.length > 0){
             	let uint8Array = getBase64Data(Config.appPayload);
             	createFile("/", Config.payloadZipFile, uint8Array);
@@ -1175,7 +1208,9 @@
             if (mountedPersistentFileSystem) {
                 FS.syncfs(true, function (err) {
                     if (err) {
-                        console.log('unable to sync browser storage');
+                        // No going on: a run on an empty prefix could overwrite the saved one.
+                        vnboxReport("lazyfs", "Unable to read saved data from browser storage: " + err);
+                        bootFailed("Unable to read saved data from browser storage: " + err);
                     } else {
                         callback();
                     }
@@ -1260,6 +1295,7 @@
             document.getElementById('startbtn').textContent = "Running...";
             setupCDRomControls();
             awaitingStart = false;
+            bootFailure = false; // that failure did not stop the boot: the status clears below, as usual
             Module["removeRunDependency"]("setupBoxedWine");
         }
         function isPointerLockEnabled() {
@@ -2450,6 +2486,7 @@
           return canvas;
         })(),
         setStatus: function(text) {
+          if (bootFailure) return; // the reason stays on the page
           if (!Module.setStatus.last) Module.setStatus.last = { time: Date.now(), text: '' };
           if (text === Module.setStatus.last.text) return;
           var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
@@ -2498,6 +2535,7 @@
         var reason = event && event.reason;
         Module.printErr('Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : reason));
         if (typeof vnboxReport === 'function') vnboxReport('error', 'Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : reason));
+        bootFailed('Unable to start: ' + (reason && reason.message ? reason.message : reason)); // preRun and fetches land here
       };
 function createFile(dir, name, buf) {
     try {
@@ -2524,6 +2562,16 @@ function flushOutput() {
     if (outputLines.length > OUTPUT_KEPT_LINES) outputLines.splice(0, outputLines.length - OUTPUT_KEPT_LINES);
     element.value = outputLines.join("\n") + "\n";
     element.scrollTop = element.scrollHeight;
+}
+// A boot that cannot go on says why, in place of "Preparing...". textContent: the reason can hold file names.
+var bootFailure = false;
+function bootFailed(text) {
+    if (isRunning) return;
+    bootFailure = true;
+    statusElement.textContent = text;
+    spinnerElement.style.display = 'none';
+    progressElement.hidden = true;
+    toggleConsole();
 }
 function toggleConsole() {
     var el = document.getElementById('showConsole');
