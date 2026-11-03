@@ -162,10 +162,9 @@ static bool fastFxsave(CPU* cpu, U32 address) {
     memcpy(p + 24, &mxcsr, 4);
     memcpy(p + 28, &mxcsrMask, 4);
     for (U32 i = 0; i < 8; i++) {
-        U32 index = (fpu.GetTop() - i) & 7; // same slot order as the per-field path
-        extFloat80_t& f80 = fpu.getReg(i);
-        memcpy(p + 32 + index * 16, &f80.signif, 8);
-        memcpy(p + 40 + index * 16, &f80.signExp, 2);
+        extFloat80_t& f80 = fpu.getReg(fpu.STV(i)); // slot i holds ST(i), same as the per-field path
+        memcpy(p + 32 + i * 16, &f80.signif, 8);
+        memcpy(p + 40 + i * 16, &f80.signExp, 2);
     }
     for (U32 i = 0; i < 8; i++) {
         memcpy(p + 160 + i * 16, &cpu->xmm[i].pi.u64[0], 8);
@@ -190,12 +189,11 @@ static bool fastFxrstor(CPU* cpu, U32 address) {
     cpu->fpu.SetTagFromAbridged(p[4]);
     cpu->setMxcsr(mxcsr);
     for (U32 i = 0; i < 8; i++) {
-        U32 index = (cpu->fpu.GetTop() - i) & 7;
         U64 low;
         U16 high;
-        memcpy(&low, p + 32 + index * 16, 8);
-        memcpy(&high, p + 40 + index * 16, 2);
-        cpu->fpu.LD80(i, low, high);
+        memcpy(&low, p + 32 + i * 16, 8);
+        memcpy(&high, p + 40 + i * 16, 2);
+        cpu->fpu.LD80(cpu->fpu.STV(i), low, high);
     }
     for (U32 i = 0; i < 8; i++) {
         memcpy(&cpu->xmm[i].pi.u64[0], p + 160 + i * 16, 8);
@@ -224,8 +222,7 @@ void common_fxsave(CPU* cpu, U32 address) {
     cpu->memory->writed(address + 28, 0xFFFF); // mxcsr mask
 
     for (int i=0;i<8;i++) {
-        U32 index = (cpu->fpu.GetTop() - i) & 7;
-        cpu->fpu.ST80(cpu, address+32+index*16, i);
+        cpu->fpu.ST80(cpu, address+32+i*16, cpu->fpu.STV(i)); // slot i holds ST(i), like FSAVE
     }
     for (int i=0;i<8;i++) {
         cpu->memory->writeq(address+160+i*16, cpu->xmm[i].pi.u64[0]);
@@ -242,8 +239,7 @@ void common_fxrstor(CPU* cpu, U32 address) {
     cpu->fpu.SetTagFromAbridged(cpu->memory->readb(address+4));
     cpu->setMxcsr(cpu->memory->readd(address + 24));
     for (int i=0;i<8;i++) {
-        U32 index = (cpu->fpu.GetTop() - i) & 7;
-        cpu->fpu.LD80(i, cpu->memory->readq(address + 32 + index * 16), cpu->memory->readw(address + 40 + index * 16));
+        cpu->fpu.LD80(cpu->fpu.STV(i), cpu->memory->readq(address + 32 + i * 16), cpu->memory->readw(address + 40 + i * 16));
     }
     for (int i=0;i<8;i++) {
         cpu->xmm[i].pi.u64[0] = cpu->memory->readq(address+160+i*16);
