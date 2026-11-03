@@ -913,11 +913,35 @@ void KNativeScreenSDL::buildCursor(KThread* thread, const std::shared_ptr<XCurso
     if (KSystem::videoOption == VIDEO_NO_WINDOW) {
         return;
     }
-    U8* buffer = thread->memory->lockReadOnlyMemory(pixelsAddress, width * height * 4);
-    SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(buffer, width, height, 32, width * 4, 0xff0000, 0xff00, 0xff, 0xff000000);
+    // X cursor images are premultiplied ARGB (Xcursor; winex11 draws them with DrawIconEx onto black), SDL
+    // and the browser want straight alpha: divide it out, or every half-transparent pixel comes out darker.
+    std::vector<U32> pixels(width * height);
+    thread->memory->memcpy(pixels.data(), pixelsAddress, width * height * 4);
+    for (U32& p : pixels) {
+        U32 a = p >> 24;
+        if (a && a != 255) {
+            auto c = [a](U32 v) { return std::min<U32>(255, (v * 255 + a / 2) / a); };
+            p = (a << 24) | (c((p >> 16) & 0xff) << 16) | (c((p >> 8) & 0xff) << 8) | c(p & 0xff);
+        }
+    }
+    SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(pixels.data(), width, height, 32, width * 4, 0xff0000, 0xff00, 0xff, 0xff000000);
+#ifdef __EMSCRIPTEN__
+    // Browsers ignore CSS cursor images over 128x128 (the page arrow shows instead): scale big ones down.
+    if (surface && (width > 128 || height > 128)) {
+        U32 big = std::max(width, height);
+        S32 w = std::max<S32>(1, width * 128 / big), h = std::max<S32>(1, height * 128 / big);
+        SDL_Surface* small = SDL_CreateRGBSurface(0, w, h, 32, 0xff0000, 0xff00, 0xff, 0xff000000);
+        if (small) {
+            SDL_SetSurfaceBlendMode(surface, SDL_BLENDMODE_NONE);
+            SDL_BlitScaled(surface, nullptr, small, nullptr);
+            SDL_FreeSurface(surface);
+            surface = small;
+            xHot = std::min<S32>(w - 1, xHot * 128 / (S32)big);
+            yHot = std::min<S32>(h - 1, yHot * 128 / (S32)big);
+        }
+    }
+#endif
     SDL_Cursor* sdlCursor = SDL_CreateColorCursor(surface, xHot, yHot);
-
-    thread->memory->unlockMemory(buffer);
     SDL_FreeSurface(surface);
 
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);

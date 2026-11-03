@@ -528,7 +528,7 @@
         }
 
         function getDisableHideCursor() {
-            var disableHideCursor = getParameter("disableHideCursor");
+            var disableHideCursor = vnboxParam("disableHideCursor");
             if (!allowParameterOverride()) {
                 disableHideCursor = DEFAULT_DISABLE_HIDE_CURSOR;
             } else if (disableHideCursor == "true") {
@@ -1238,9 +1238,8 @@
             isRunning = true;
 
             document.getElementById('startbtn').style.display = 'none';
-            if (!isPointerLockEnabled()) {
-                Config.disableHideCursor = true;
-            }
+            // A cursor the game hides (ShowCursor FALSE) stays hidden without pointer lock too, as on Windows;
+            // disableHideCursor=true shows the arrow instead (upstream forced that whenever pointer lock was off).
 
             var params = getEmulatorParams();
             if (!Module['arguments']) {

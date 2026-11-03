@@ -222,7 +222,9 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 	return Success;
 }
 
-int XDrawable::copy(KThread* thread, const std::shared_ptr<XGC>& gc, const std::shared_ptr<XDrawable>& srcDrawable, S32 srcX, S32 srcY, U32 width, U32 height, S32 dstX, S32 dstY) {
+static U32 readPixel(const U8* row, U32 x, U32 bits);
+
+int XDrawable::copy(KThread* thread,const std::shared_ptr<XGC>& gc, const std::shared_ptr<XDrawable>& srcDrawable, S32 srcX, S32 srcY, U32 width, U32 height, S32 dstX, S32 dstY) {
 	if (srcDrawable->visual->bits_per_rgb != this->visual->bits_per_rgb) {
 		return BadMatch;
 	}
@@ -246,6 +248,22 @@ int XDrawable::copy(KThread* thread, const std::shared_ptr<XGC>& gc, const std::
 	}
 	U32 copyPerLine = (this->visual->bits_per_rgb * width + 7) / 8;
 
+	if (this->visual->bits_per_rgb == 1) {
+		// Bitmaps (cursor masks: winex11 builds them with GXandReverse/GXorReverse/GXand/GXor copies at 1-pixel
+		// offsets): byte copies would ignore the GC function and shift by whole bytes. Pixel by pixel through the
+		// GC, from a copy of the source rows so a copy within one bitmap reads the original bits.
+		if (srcX < 0 || srcY < 0 || (U32)srcX >= srcDrawable->w || (U32)srcY >= srcDrawable->h) return Success;
+		width = std::min(width, srcDrawable->w - srcX);
+		height = std::min(height, srcDrawable->h - srcY);
+		std::vector<U8> rows(srcDrawable->data + srcDrawable->bytes_per_line * srcY, srcDrawable->data + srcDrawable->bytes_per_line * (srcY + height));
+		for (U32 y = 0; y < height; y++) {
+			for (U32 x = 0; x < width; x++) {
+				drawPixel(*gc, dstX + x, dstY + y, readPixel(rows.data() + y * srcDrawable->bytes_per_line, srcX + x, 1));
+			}
+		}
+		setDirty();
+		return Success;
+	}
 	for (U32 y = 0; y < height; y++) {
 		memcpy(dst, src, copyPerLine);
 		src += srcDrawable->bytes_per_line;

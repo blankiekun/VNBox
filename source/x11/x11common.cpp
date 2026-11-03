@@ -1524,11 +1524,14 @@ static void x11_ListPixelFormats(CPU* cpu) {
     U32 ndepths = X11_READD(Screen, screenAddress, ndepths);
     U32 count_return = ARG2;
 
+    // Every X server lists the depth 1 (bitmap) format too: winex11 needs it for any 1 bpp pixmap it fills
+    // with XPutImage (mono cursors, 1 bpp pattern brushes); without it those pixmaps fail to create.
     if (count_return) {
-        memory->writed(count_return, ndepths);
+        memory->writed(count_return, ndepths + 1);
     }
-    U32 listAddress = thread->process->alloc(thread, sizeof(XPixmapFormatValues) * ndepths);
+    U32 listAddress = thread->process->alloc(thread, sizeof(XPixmapFormatValues) * (ndepths + 1));
     EAX = listAddress;
+    listAddress += XPixmapFormatValues::write(memory, listAddress, 1, 1, 32);
 
     U32 depthsAddress = X11_READD(Screen, screenAddress, depths);
     for (U32 i = 0; i < ndepths; i++) {
@@ -1737,6 +1740,43 @@ static void x11_CreatePixmapCursor(CPU* cpu) {
     XCursorPtr cursor = std::make_shared<XCursor>(pixmap, mask, fg, bg, ARG6, ARG7);
     server->addCursor(cursor);
     EAX = cursor->id;
+    // winex11 makes every 1 bpp Windows cursor this way (no Xcursor for mono): give it its picture, source bit
+    // = fg, else bg, where the mask is set. A cursor with no pixel shown (Wine's empty cursor for ShowCursor
+    // FALSE) keeps the shape-0 path, which hides it.
+    if (!pixmap || pixmap->getDepth() != 1 || (mask && mask->getDepth() != 1)) {
+        return;
+    }
+    U32 width = pixmap->width(), height = pixmap->height();
+    if (mask) {
+        width = std::min(width, mask->width());
+        height = std::min(height, mask->height());
+    }
+    if (!width || !height) {
+        return;
+    }
+    auto bit = [](const XPixmapPtr& p, U32 x, U32 y) {
+        return (p->getData()[y * p->getBytesPerLine() + x / 8] >> (x & 7)) & 1;
+    };
+    auto argb = [](const XColor& c) {
+        return 0xff000000 | ((U32)(c.red >> 8) << 16) | ((U32)(c.green >> 8) << 8) | (U32)(c.blue >> 8);
+    };
+    std::vector<U32> pixels(width * height);
+    bool shown = false;
+    for (U32 y = 0; y < height; y++) {
+        for (U32 x = 0; x < width; x++) {
+            if (mask && !bit(mask, x, y)) continue;
+            pixels[y * width + x] = bit(pixmap, x, y) ? argb(fg) : argb(bg);
+            shown = true;
+        }
+    }
+    if (!shown) {
+        return;
+    }
+    KThread* thread = cpu->thread;
+    U32 address = thread->process->alloc(thread, width * height * 4);
+    memory->memcpy(address, pixels.data(), width * height * 4);
+    KNativeSystem::getScreen()->buildCursor(thread, cursor, address, width, height, ARG6, ARG7);
+    thread->process->free(address);
 }
 
 // Cursor XCreateFontCursor(Display* display, unsigned int shape)
