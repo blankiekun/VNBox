@@ -1570,6 +1570,8 @@ bool CPU::runNextSingleOp() {
             this->thread->seg_instructionFetch(getEipAddress(), false);
             this->nextOp = getNextOp();
         }
+    } catch (const std::bad_alloc&) {
+        throw; // not a guest fault: nothing here can retry it
     } catch (...) {
         // at this point the previous getNextOp threw an exception and the eip is now pointing to the signal handler
         op = getNextOp();
@@ -1607,6 +1609,8 @@ bool CPU::runNextSingleOp() {
         if (this->debugTrapActive && this->finishDebugInstruction()) {
             return false;
         }
+    } catch (const std::bad_alloc&) {
+        throw;
     } catch (...) {
         // motorhead 3dfx will trigger this when pressing enter to start a new game
         this->nextOp = getNextOp();

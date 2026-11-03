@@ -787,7 +787,16 @@ std::vector<U8*> allocatedPages4kChunk;
 std::vector<AlignedU8*> allocatedPages;
 #define CHUNK_SIZE_4K 8
 
+#ifdef __TEST
+bool ramPageTestFailNextAlloc = false;
+#endif
 RamPage ramPageAlloc() {
+#ifdef __TEST
+    if (ramPageTestFailNextAlloc) {
+        ramPageTestFailNextAlloc = false;
+        throw std::bad_alloc();
+    }
+#endif
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(ramMutex);
     while (freeIndexes.size()) {
         RamPage found;

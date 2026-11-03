@@ -26,6 +26,7 @@
 #include "vnboxparam.h"
 #include "../../x11/x11.h"
 #include <algorithm>
+#include <new>
 #include "kdspaudio_math.h"
 
 #ifdef BOXEDWINE_MULTI_THREADED
@@ -190,8 +191,15 @@ bool isMainthread() {
     return true;
 }
 
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+void wasmJitOomTick(); // jitWasmCodeGen.cpp
+#endif
+
 void mainloop() {
     vnboxStatsTick(mainLoopTimingMode == EM_TIMING_SETTIMEOUT ? mainLoopTimingValue : -1); // stats=1 / prof=1
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+    wasmJitOomTick();
+#endif
     U64 startTime = KSystem::getMicroCounter();
     checkBrowserSocketEvents();
     bool idle = false;
@@ -202,6 +210,16 @@ void mainloop() {
         bool ran;
         try {
             ran = runSlice();
+        } catch (const std::bad_alloc&) {
+            // The heap is full (a page fault's RAM, a decoded op): the next tick would fail at the same eip for good,
+            // frozen and silent. Stop the guest. A JS exception ends the tick loop (BOXEDWINE_JSPI) or the main loop.
+            // Written files stay safe: IDBFS persists them from JS, without ticks.
+            recoverRunSliceException();
+            EM_ASM({
+                var message = "VNBox ran out of memory and stopped the game. Reload the page to go on; files the game has already saved are kept.";
+                if (typeof vnboxReport === "function") vnboxReport("player", message);
+                throw new Error(message);
+            });
         } catch (...) {
             if (!recoverRunSliceException()) {
                 throw;

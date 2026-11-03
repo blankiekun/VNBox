@@ -1271,8 +1271,9 @@ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
 #endif
 #ifdef BOXEDWINE_WASM_JIT
     // Callback ops store the callback address in pfn, so dispatch warmup ops
-    // through the normal table until the op is replaced with startJITOp.
-    if (!executePendingNormally && op->pfn == cpu->thread->process->startJITOp) {
+    // through the normal table until the op is replaced with startJITOp. An op with no
+    // code (still pending) goes that way too: startJITOp would return without running it.
+    if (!executePendingNormally && op->pfn == cpu->thread->process->startJITOp && op->pfnJitCode) {
         op->pfn(cpu, op);
     } else {
         OpCallback pfn = NormalCPU::getFunctionForOp(op);
