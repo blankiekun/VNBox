@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..c1c3c06
 --- /dev/null
 +++ b/dlls/quartz/browsermovie.c
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,545 @@
 +/*
 + * VNBox: movies played by the browser page
 + *
@@ -64,7 +64,8 @@ index 0000000..c1c3c06
 +
 +static void send_command(struct browser_movie *movie, const char *format, ...)
 +{
-+    char line[1024];
++    /* Aligned so it can't cross a page: VNBox's device gets one call per guest page and takes each as one command. */
++    char line[1024] __attribute__((aligned(1024)));
 +    DWORD written;
 +    va_list args;
 +    int len;
