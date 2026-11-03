@@ -897,6 +897,28 @@ test('a payload in the URL is refused only with a game folder', () => {
     }
 });
 
+// The bug: every start opened IndexedDB and fetched a zip no release ships (a 404), and a file at that URL
+// silently turned on the slower replay mode. Only a recording may touch the cache.
+test('a plain start leaves the JIT cache alone; a recording opens it', () => {
+    const start = (query) => {
+        const shell = bootShell(page + query);
+        const calls = [];
+        Object.assign(shell.context, {
+            indexedDB: { open(name) { calls.push('open ' + name); return {}; } },
+            fetch(url) { calls.push('fetch ' + url); return new Promise(() => {}); },
+        });
+        Object.assign(shell.context.Module, {
+            _wasm_jit_set_persistence_active() {},
+            addRunDependency(name) { calls.push('wait ' + name); },
+        });
+        vm.runInContext('loadPersistedHostFolderHandle = () => new Promise(() => {})', shell.context);
+        shell.context.initialSetup();
+        return calls;
+    };
+    assert.deepEqual(start(''), ['wait setupBoxedWine']);
+    assert.deepEqual(start('jit-record=true'), ['wait wasm-jit-cache', 'open boxedwine-wasm-jit', 'wait setupBoxedWine']);
+});
+
 // The bug: the attacker's program gets a way out to the attacker's gateway.
 test('the network gateway stays on the page\'s host', () => {
     const gateway = (host, base = page) => bootShell(base + 'network=websocket&networkGateway=' + host).context.setConfiguration();

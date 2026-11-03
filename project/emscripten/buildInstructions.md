@@ -153,6 +153,10 @@ The current cache version is `v6`. Record new cache ZIPs with this build;
 in `boxedwine-shell.js`, `jitWasmCodeGen.cpp`, and the offline cache pipeline
 in sync whenever generated modules become incompatible with the runtime.
 
+The cache is opt-in: only a page opened with `?jit-record=true` opens its
+IndexedDB store and looks for a cache ZIP. Any other start does neither, and
+ignores a ZIP at that URL.
+
 Run `node testJitCacheVersion.mjs` to check old-cache rejection, current-cache
 imports in ST/MT loaders, and flat-to-grouped pipeline round trips. The test
 uses `binaryen_js.js` from this directory, or accepts its path as an argument.
