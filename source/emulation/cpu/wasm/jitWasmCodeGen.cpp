@@ -3065,10 +3065,14 @@ EM_JS(int, boxedwine_wasm_lookup_cached,
             if (Module.vnboxJit) { Module.vnboxJit.ms += performance.now() - statsT; Module.vnboxJit.n++; }
         }
 
-        var helpers = {};
-        var view = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
-        for (var i = 0; i < importCount; i++) {
-            helpers['fn_' + i] = wasmTable.get(view[i]);
+        var helpers = Module.wasmJitHelpers;
+        if (!helpers) {
+            helpers = {};
+            var view = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
+            for (var i = 0; i < importCount; i++) {
+                helpers['fn_' + i] = wasmTable.get(view[i]);
+            }
+            Module.wasmJitHelpers = helpers;
         }
         inst = new WebAssembly.Instance(mod, {
             'env':     { 'memory': wasmMemory, 'table': wasmTable },
@@ -3181,10 +3185,14 @@ EM_JS(int, boxedwine_wasm_lookup_cached,
             if (!Module.wasmJitCompiledCache) Module.wasmJitCompiledCache = new Map();
             Module.wasmJitCompiledCache.set(key, mod);
         }
-        var helpers = {};
-        var view = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
-        for (var i = 0; i < importCount; i++) {
-            helpers['fn_' + i] = wasmTable.get(view[i]);
+        var helpers = Module.wasmJitHelpers;
+        if (!helpers) {
+            helpers = {};
+            var view = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
+            for (var i = 0; i < importCount; i++) {
+                helpers['fn_' + i] = wasmTable.get(view[i]);
+            }
+            Module.wasmJitHelpers = helpers;
         }
         var inst = new WebAssembly.Instance(mod, {
             'env':     { 'memory': wasmMemory, 'table': wasmTable },
