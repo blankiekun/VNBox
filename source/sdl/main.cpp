@@ -19,6 +19,7 @@
 #include "boxedwine.h"
 
 #include "startupArgs.h"
+#include "vnboxparam.h"
 #ifndef BOXEDWINE_DISABLE_UI
 #include "../ui/mainui.h"
 #include "../ui/data/boxedwineData.h"
@@ -140,6 +141,7 @@ int boxedmain(int argc, const char **argv) {
     // currently to fake sound, we really need to play it and just silence it right before it goes to speaker, 
     // this way the timing of the callback to get the audio from wine are correct.  Without this timing, things can hange.
     if (!KNativeSystem::init(startupArgs.videoOption, true/* startupArgs.soundEnabled */)) {
+        vnboxStartFailed("the display could not be set up");
         return 1;
     }
 #ifdef BOXEDWINE_NATIVE_RUNTIME
@@ -169,6 +171,7 @@ int boxedmain(int argc, const char **argv) {
 #endif
     if (!startupArgs.shouldStartUI()) {
         if (!startupArgs.apply()) {
+            vnboxStartFailed("the game's files could not be set up");
             return 1;
         }
     } else {
