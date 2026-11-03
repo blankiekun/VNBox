@@ -17,6 +17,7 @@
 #include "testAsmJit.h"
 #include "ksignal.h"
 #include "../../emulation/cpu/common/common_other.h"
+#include "../../emulation/softmmu/kmemory_soft.h"
 
 #define cpu (testContext().cpu)
 #define memory (testContext().memory)
@@ -2241,16 +2242,155 @@ void testBswap_0x3c8_0x3cf() {
     runBswapCases("bswap 3c8-3cf");
 }
 
+// cheapFxsave: FXSAVE/FXRSTOR through one host pointer must match the per-field path exactly. Catches a fast path that
+// writes a field at the wrong offset, misses an x87 register still cached as a double (f64 -> f80), gets the abridged
+// tag wrong (empty slots, MMX mode, zero/NaN values that are "valid" there), or restores state that differs.
+extern int g_cheapFxsave;
+
+static U32 fxRandState;
+static U32 fxRand() {
+    fxRandState ^= fxRandState << 13; fxRandState ^= fxRandState >> 17; fxRandState ^= fxRandState << 5;
+    return fxRandState;
+}
+static U64 fxRand64() {
+    return ((U64)fxRand() << 32) | fxRand();
+}
+
+// Case k: a deterministic x87/SSE state mixing raw 80-bit values and cached doubles, incl. NaN, denormal, inf, -0,
+// unnormal, empty tags, every top, MMX mode and odd CW/SW/MXCSR values.
+static void setFxsaveCaseState(U32 k) {
+    static const U64 F80_SIGNIF[] = {0, 0x8000000000000000ULL, 0xc000000000000000ULL, 0xa000000000000001ULL, 1,
+        0x4000000000000000ULL, 0xffffffffffffffffULL, 0xc90fdaa22168c235ULL};
+    static const U16 F80_EXP[] = {0, 0x7fff, 0xffff, 0x8000, 0x3fff, 0x0001, 0x7ffe, 0x4000};
+    static const U64 F64[] = {0x3ff8000000000000ULL, 1, 0x8000000000000000ULL, 0x7ff0000000000000ULL,
+        0x7ff8123456789abcULL, 0xfff4000000000001ULL, 0x000fffffffffffffULL, 0};
+    static const U16 CW[] = {0x037f, 0x027f, 0x007f, 0x0f7f, 0x1372, 0x0a7a};
+    static const U32 MXCSR[] = {0x1f80, 0x3f80, 0x0000, 0x7fbf, 0x1f81, 0x9fc0};
+    fxRandState = 0x9e3779b9u * (k + 1);
+    cpu->fpu.FINIT();
+    cpu->fpu.SetCW(CW[k % 6]);
+    cpu->fpu.SetSW((U16)(((k & 7) << 11) | (fxRand() & 0x47ff)));
+    for (U32 i = 0; i < 8; i++) {
+        U32 r = fxRand();
+        if (r & 1) {
+            cpu->fpu.regCache[i].l = (r & 2) ? F64[(r >> 4) & 7] : fxRand64();
+            cpu->fpu.isRegCached[i] = true;
+        } else {
+            cpu->fpu.LD80(i, (r & 2) ? F80_SIGNIF[(r >> 4) & 7] : fxRand64(), (r & 4) ? F80_EXP[(r >> 8) & 7] : (U16)fxRand());
+        }
+        cpu->fpu.tags[i] = (U8)((r >> 12) & 3);
+        cpu->xmm[i].pi.u64[0] = fxRand64();
+        cpu->xmm[i].pi.u64[1] = fxRand64();
+    }
+    cpu->fpu.isMMXInUse = (k % 5) == 4;
+    cpu->setMxcsr(MXCSR[k % 6]);
+}
+
+static void verifyFxsaveFastMatchesPerField(U32 k) {
+    constexpr U32 FAST = MEM_BASE + 0x2100;
+    constexpr U32 SLOW = MEM_BASE + 0x3100;
+    U32 fast = cpu->seg[DS].address + FAST;
+    U32 slow = cpu->seg[DS].address + SLOW;
+    initializeFxsaveImage(FAST);
+    initializeFxsaveImage(SLOW);
+    if (!memory->directRamPtr(fast, 288, true)) {
+        failed("fxsave fast path: test page is not direct RAM, so the fast path would never run");
+        return;
+    }
+    setFxsaveCaseState(k);
+    g_cheapFxsave = 0;
+    common_fxsave(cpu, slow);
+    setFxsaveCaseState(k);
+    g_cheapFxsave = 1;
+    common_fxsave(cpu, fast);
+    char name[64];
+    snprintf(name, sizeof(name), "fxsave fast path case %u", k);
+    verifyFxsaveImage(FAST, SLOW, name);
+}
+
+struct FxState {
+    U32 cw, sw, top, round, mxcsr, fpuDirtyFlags;
+    bool divExceptionsUnmasked, isMMXInUse;
+    U32 sseDivExceptionsUnmasked;
+    U8 tags[8];
+    bool isRegCached[8];
+    U64 signif[8];
+    U16 signExp[8];
+    U64 xmm[16];
+};
+
+static FxState captureFxState() {
+    FxState s;
+    memset(&s, 0, sizeof(s)); // padding too: states are compared with memcmp
+    s.cw = cpu->fpu.cw; s.sw = cpu->fpu.sw; s.top = cpu->fpu.top; s.round = cpu->fpu.round;
+    s.mxcsr = cpu->mxcsr; s.fpuDirtyFlags = cpu->fpuDirtyFlags;
+    s.divExceptionsUnmasked = cpu->fpu.divExceptionsUnmasked; s.isMMXInUse = cpu->fpu.isMMXInUse;
+    s.sseDivExceptionsUnmasked = cpu->sseDivExceptionsUnmasked ? 1 : 0;
+    for (U32 i = 0; i < 8; i++) {
+        s.tags[i] = cpu->fpu.tags[i]; s.isRegCached[i] = cpu->fpu.isRegCached[i];
+        s.signif[i] = cpu->fpu.regs[i].signif; s.signExp[i] = cpu->fpu.regs[i].signExp;
+        s.xmm[i * 2] = cpu->xmm[i].pi.u64[0]; s.xmm[i * 2 + 1] = cpu->xmm[i].pi.u64[1];
+    }
+    return s;
+}
+
+static void verifyFxrstorFastMatchesPerField(U32 k) {
+    constexpr U32 SOURCE = MEM_BASE + 0x4100;
+    U32 source = cpu->seg[DS].address + SOURCE;
+    fxRandState = 0x85ebca6bu * (k + 1);
+    for (U32 i = 0; i < 512; i++) {
+        memory->writeb(source + i, (U8)fxRand());
+    }
+    if (k & 1) { // a saved image (tags/values consistent) instead of random bytes
+        setFxsaveCaseState(k);
+        g_cheapFxsave = 0;
+        common_fxsave(cpu, source);
+    }
+    clearFxrstorState();
+    g_cheapFxsave = 0;
+    common_fxrstor(cpu, source);
+    FxState slow = captureFxState();
+    clearFxrstorState();
+    g_cheapFxsave = 1;
+    common_fxrstor(cpu, source);
+    FxState fast = captureFxState();
+    if (memcmp(&slow, &fast, sizeof(FxState))) {
+        const U8* a = (const U8*)&slow;
+        const U8* b = (const U8*)&fast;
+        U32 i = 0;
+        while (a[i] == b[i]) i++;
+        failed("fxrstor fast path case %u: state differs at FxState byte %u (per-field %02x, fast %02x)", k, i, a[i], b[i]);
+    }
+}
+
+static void runFxsaveFastPathCases() {
+    newInstruction(0);
+    for (U32 k = 0; k < 200; k++) {
+        verifyFxsaveFastMatchesPerField(k);
+    }
+    g_cheapFxsave = 1;
+}
+
+static void runFxrstorFastPathCases() {
+    newInstruction(0);
+    for (U32 k = 0; k < 200; k++) {
+        verifyFxrstorFastMatchesPerField(k);
+    }
+    g_cheapFxsave = 1;
+}
+
 void testFxsave_0x3ae() {
     runFxsaveSamePage();
     runFxsaveCrossPage();
     runFxsaveReadOnlyPage();
+    runFxsaveFastPathCases();
 }
 
 void testFxrstor_0x3ae() {
     runFxrstorSamePage();
     runFxrstorCrossPage();
     runFxrstorUnreadablePage();
+    runFxrstorFastPathCases();
 }
 
 #endif

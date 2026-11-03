@@ -135,6 +135,19 @@ inline U32 KMemory::readdInline(U32 address) {
     return readb(address) | (readb(address + 1) << 8) | (readb(address + 2) << 16) | (readb(address + 3) << 24);
 }
 
+inline U8* KMemory::directRamPtr(U32 address, U32 len, bool write) {
+#if !defined(UNALIGNED_MEMORY)
+    U32 offset = address & K_PAGE_MASK;
+    if (len <= K_PAGE_SIZE - offset) {
+        MMU& mmu = data->mmu[address >> K_PAGE_SHIFT];
+        if (write ? mmu.canWriteRam : mmu.canReadRam) {
+            return &ramPageGet((RamPage)mmu.ramIndex)[offset];
+        }
+    }
+#endif
+    return nullptr;
+}
+
 inline void KMemory::writedInline(U32 address, U32 value) {
     if ((address & 0xFFF) < 0xFFD) {
         U32 index = address >> 12;
