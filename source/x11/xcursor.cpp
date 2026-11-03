@@ -18,6 +18,7 @@
 
 #include "boxedwine.h"
 #include "x11.h"
+#include "knativesystem.h"
 
 void XcursorImage::read(KMemory* memory, U32 address) {
 	version = memory->readd(address);
@@ -49,8 +50,16 @@ void XcursorImages::write(KMemory* memory, U32 address, U32 nimage, U32 imageAdd
 	memory->writed(address + 4, imageAddress);
 }
 
-XCursor::XCursor(const XPixmapPtr& pixmap, const XPixmapPtr& mask, const XColor& fg, const XColor& bg, U32 x, U32 y) : id(XServer::getNextId()), pixmap(pixmap), mask(mask), fg(fg), bg(bg), x(x), y(y) {
+XCursor::XCursor(const XColor& fg, const XColor& bg, U32 x, U32 y) : id(XServer::getNextId()), fg(fg), bg(bg), x(x), y(y) {
 }
 
 XCursor::XCursor(U32 shape) : id(XServer::getNextId()), shape(shape) {
+}
+
+// The last reference is gone: no X id, no window, and not the cursor on the page (the screen holds that one).
+XCursor::~XCursor() {
+    KNativeScreenPtr screen = KNativeSystem::getScreen();
+    if (screen) {
+        screen->freeCursor(id);
+    }
 }

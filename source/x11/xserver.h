@@ -96,6 +96,7 @@ public:
 	
 	void addCursor(const XCursorPtr& cursor);
 	XCursorPtr getCursor(U32 id);
+	void removeCursor(U32 id); // XFreeCursor: the id goes, the cursor lives on while a window or the page uses it
 	void updateCursor(const XWindowPtr& wnd);
 
 	void iterateEventMask(U32 wndId, U32 mask, std::function<void(const DisplayDataPtr& data)> callback);
@@ -155,6 +156,8 @@ public:
 	void iterateFbConfigs(std::function<bool(const CLXFBConfigPtr& cfg)> callback);
 
 private:
+	void destroyWindowsOfDisplays(const std::vector<DisplayDataPtr>& gone);
+
 	BOXEDWINE_MUTEX inputFocusMutex;
 	XWindowPtr inputFocus;
 	bool inputFocusIsPointerRoot = false;

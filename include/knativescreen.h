@@ -61,6 +61,7 @@ public:
 
 	virtual void setCursor(const std::shared_ptr<XCursor>& cursor) = 0;
 	// frame > 0 adds a frame to an animated cursor (frame 0 starts it); delayMs = time to the next frame, 0 = not animated
+	virtual void freeCursor(U32 id) = 0; // an XCursor is gone: release what setCursor and buildCursor keep for its id
 	virtual void buildCursor(KThread* thread, const std::shared_ptr<XCursor>& cursor, U32 pixelsAddress, U32 width, U32 height, S32 xHot, S32 yHot, U32 frame = 0, U32 delayMs = 0) = 0;
 
 	virtual void warpMouse(int x, int y) = 0;

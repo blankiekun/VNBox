@@ -1740,7 +1740,7 @@ static void x11_CreatePixmapCursor(CPU* cpu) {
     bg.read(memory, ARG5);
     XPixmapPtr pixmap = server->getPixmap(ARG2);
     XPixmapPtr mask = server->getPixmap(ARG3);
-    XCursorPtr cursor = std::make_shared<XCursor>(pixmap, mask, fg, bg, ARG6, ARG7);
+    XCursorPtr cursor = std::make_shared<XCursor>(fg, bg, ARG6, ARG7);
     server->addCursor(cursor);
     EAX = cursor->id;
     // winex11 makes every 1 bpp Windows cursor this way (no Xcursor for mono): give it its picture, source bit
@@ -1803,8 +1803,10 @@ static void x11_DefineCursor(CPU* cpu) {
     EAX = Success;
 }
 
+// int XFreeCursor(Display* display, Cursor cursor)
 static void x11_FreeCursor(CPU* cpu) {
-    kwarn("x11_FreeCursor");
+    XServer::getServer()->removeCursor(ARG2);
+    EAX = Success;
 }
 
 // int XSetFunction(Display* display, GC gc, int function)

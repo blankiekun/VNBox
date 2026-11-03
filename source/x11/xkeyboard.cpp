@@ -327,8 +327,6 @@ static U16 maxKeyCode;
 #define MODIFIER_NUM_LOCK 0x10
 #define MODIFIER_SCROLL_LOCK 0x20
 
-#define IS_SHIFT(x) ((x & 2) != 0 && (x & 2) != 3)
-
 // shift, caps, control, alt, num, scroll
 static U8 modifiers[16] = { 0x32, 0x42, 0x25, 0x40, 0x4d, 0x4e, 0, 0 };
 
@@ -424,7 +422,12 @@ U32 XKeyboard::translate(U32& keysym, U32 modifiers, char* buffer, U32 bufferLen
 		keysym = info->keySymWithNum;
 		return len;
 	}
-	if (IS_SHIFT(modifiers) || keysym == info->keySymWithShift) {
+	// Caps Lock turns Shift around for letters, and only for letters: with it on, 1 is still 1.
+	bool shifted = keysym == info->keySymWithShift;
+	if ((modifiers & LockMask) && info->keySym >= XK_a && info->keySym <= XK_z) {
+		shifted = !(modifiers & ShiftMask);
+	}
+	if (shifted) {
 		if (info->chShift) {
 			len = (U32)strlen(info->chShift);
 			if (bufferLen) {

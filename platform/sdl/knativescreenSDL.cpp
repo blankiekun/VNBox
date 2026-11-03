@@ -648,8 +648,11 @@ bool KNativeScreenSDL::presentedSinceLastCheck() {
 }
 
 void KNativeScreenSDL::clearTextureCache(U32 id) {
-    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(wndCacheMutex);
-    wndCache.clear();
+    // on the main thread: the entry can hold an SDL texture
+    DISPATCH_MAIN_THREAD_BLOCK_THIS_BEGIN
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(wndCacheMutex);
+        wndCache.remove(id);
+    DISPATCH_MAIN_THREAD_BLOCK_END
 }
 
 bool KNativeScreenSDL::canBltToScreen() {
@@ -1051,6 +1054,35 @@ void KNativeScreenSDL::setCursor(const std::shared_ptr<XCursor>& cursor) {
 #ifdef __APPLE__
         macCursorUpdate();
 #endif
+    DISPATCH_MAIN_THREAD_BLOCK_END
+    // Only now, with the page on the new cursor, can the old one be freed (at the end of this function, outside the lock).
+    std::shared_ptr<XCursor> previous = cursor;
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);
+    shownCursor.swap(previous);
+}
+
+void KNativeScreenSDL::freeCursor(U32 id) {
+    SDL_Cursor* sdlCursor;
+    KNativeInputSDL::CursorFramesPtr frames;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);
+        sdlCursor = cursors.get(id);
+        frames = cursorFrames.get(id);
+        cursors.remove(id);
+        cursorFrames.remove(id);
+    }
+    if (!sdlCursor && !frames) {
+        return;
+    }
+    DISPATCH_MAIN_THREAD_BLOCK_BEGIN
+        if (frames) {
+            // frame 0 is sdlCursor too
+            for (const auto& frame : *frames) {
+                SDL_FreeCursor(frame.cursor);
+            }
+        } else {
+            SDL_FreeCursor(sdlCursor);
+        }
     DISPATCH_MAIN_THREAD_BLOCK_END
 }
 
