@@ -552,7 +552,8 @@ KMemory::KMemory(KProcess* process) : process(process) {
 
 KMemory::~KMemory() {
     if (data) {
-#if defined(BOXEDWINE_WASM_JIT) && defined(BOXEDWINE_MULTI_THREADED)
+#if defined(BOXEDWINE_WASM_JIT)
+        // Native JITs lose their code with KMemoryData; wasm code lives in the table until its slot is freed.
         std::vector<void*> jitOps;
         data->opCache.collectAllJitBlocks(jitOps);
         jitMemoryInvalidated(this, jitOps);
@@ -569,7 +570,8 @@ KMemory::~KMemory() {
 void KMemory::cleanup() {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex);
     if (data) {
-#if defined(BOXEDWINE_WASM_JIT) && defined(BOXEDWINE_MULTI_THREADED)
+#if defined(BOXEDWINE_WASM_JIT)
+        // Native JITs lose their code with KMemoryData; wasm code lives in the table until its slot is freed.
         std::vector<void*> jitOps;
         data->opCache.collectAllJitBlocks(jitOps);
         jitMemoryInvalidated(this, jitOps);

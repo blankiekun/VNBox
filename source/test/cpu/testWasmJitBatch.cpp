@@ -204,6 +204,159 @@ void testWasmJitHotGroups() {
     wasmJitTestResetRuntimeBatching();
 }
 
+// Catches: a hot group that hits "out of memory" freeing the blocks' working code and leaving them sealed, which ran
+// nothing and hung the main thread, on the first attempt or the retry; and any other op with startJITOp and no code
+// doing the same in firstDynamicOp.
+void testWasmJitHotGroupOom() {
+    testNewInstruction(0);
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    constexpr U32 blockCount = 4;
+    constexpr U32 blockBytes = 8;
+    constexpr U32 hotEntries = 4;
+    wasmJitTestResetRuntimeBatching();
+    boxedwine_wasm_test_reset_oom_state();
+    struct ResetOom {
+        ~ResetOom() { boxedwine_wasm_test_reset_oom_state(); }
+    } resetOom;
+    wasmJitTestSetHotGroups(hotEntries, 1e12); // entries per period; the period never ends here: flush below
+    for (U32 i = 0; i < blockCount; ++i) {
+        testPushCode8(0x43); // inc ebx
+        testPushCode8(0xb8); testPushCode32((i + 1) * blockBytes); // mov eax,next
+        testPushCode8(0xff); testPushCode8(0xe0); // jmp eax: separate blocks
+    }
+    testPushCode8(0xcd); testPushCode8(0x97);
+    std::vector<DecodedOp*> blocks;
+    std::vector<void*> tier1;
+    for (U32 i = 0; i < blockCount; ++i) {
+        U32 address = TEST_CODE_ADDRESS + i * blockBytes;
+        DecodedOp* op = cpu->getOp(address, 0);
+        startNewJIT(cpu, address, op);
+        if (!op->pfnJitCode || op->pfn != context.process->startJITOp) {
+            testFail("hot group OOM test requires compiled block entries");
+            wasmJitTestResetRuntimeBatching();
+            return;
+        }
+        op->runCount = JIT_RUN_COUNT + 1;
+        blocks.push_back(op);
+        tier1.push_back(op->pfnJitCode);
+    }
+    auto runOnce = [&]() {
+        cpu->eip.u32 = 0;
+        cpu->reg[3].u32 = 0;
+        cpu->nextOp = blocks[0];
+        cpu->yield = false;
+        for (U32 i = 0; i < 4 * blockCount && cpu->nextOp->inst != TestEnd; ++i) {
+            cpu->blockInstructionCount = 0;
+            cpu->run();
+        }
+        return cpu->reg[3].u32 == blockCount && cpu->nextOp->inst == TestEnd;
+    };
+    auto queueAll = [&]() {
+        for (U32 i = 0; i < hotEntries; ++i) {
+            if (!runOnce()) testFail("hot group OOM: blocks must run the chain");
+        }
+        wasmJitTestClearHotCounts();
+        if (wasmJitTestHotQueueSize() != blockCount) {
+            testFail("hot group OOM: every block must queue");
+        }
+    };
+    queueAll();
+    // Twice: the first attempt, and the retry that freeing the old slots used to make.
+    boxedwine_wasm_test_force_next_module_oom();
+    boxedwine_wasm_test_force_next_module_oom();
+    wasmJitTestHotFlush(cpu);
+    boxedwine_wasm_test_clear_forced_module_oom();
+    if (!runOnce()) {
+        testFail("hot group OOM: the guest must keep running");
+    }
+    for (U32 i = 0; i < blockCount; ++i) {
+        DecodedOp* op = blocks[i];
+        if (op->pfnJitCode != tier1[i] || !(op->flags & OP_FLAG_JIT) || op->pfn != context.process->startJITOp ||
+                (op->flags2 & OP_FLAG2_WASM_JIT_PENDING) || op->runCount != JIT_RUN_COUNT + 1) {
+            testFail("hot group OOM: a block must keep its old code");
+        }
+    }
+    if (wasmJitTestPendingCount() != 0 || wasmJitTestSealedCount() != 0 || !wasmJitCompilationPaused()) {
+        testFail("hot group OOM: no block stays pending, and compiling is paused");
+    }
+    // The pause ends by time, with no slot freed; the blocks then make their hot group.
+    wasmJitTestOomTick(1000);
+    wasmJitTestOomTick(1000 + 5000);
+    if (wasmJitCompilationPaused()) {
+        testFail("hot group OOM: the retry must end the pause");
+    }
+    queueAll();
+    wasmJitTestHotFlush(cpu);
+    if (!runOnce()) {
+        testFail("hot group OOM: the group must run after the retry");
+    }
+    for (U32 i = 0; i < blockCount; ++i) {
+        if (!blocks[i]->pfnJitCode || blocks[i]->pfnJitCode == tier1[i]) {
+            testFail("hot group OOM: a block must be published at its new slot after the retry");
+        }
+    }
+    // firstDynamicOp with startJITOp and no code: the op must run, not return with eip unmoved.
+    DecodedOp* op = blocks[0];
+    void* slot = op->pfnJitCode;
+    decltype(op->runCount) runCount = op->runCount;
+    op->pfnJitCode = nullptr;
+    op->runCount = JIT_RUN_COUNT;
+    cpu->eip.u32 = 0;
+    cpu->reg[3].u32 = 0;
+    cpu->nextOp = op;
+    cpu->yield = false;
+    cpu->blockInstructionCount = 0;
+    cpu->run();
+    op->pfnJitCode = slot;
+    op->runCount = runCount;
+    if (cpu->reg[3].u32 == 0) {
+        testFail("hot group OOM: an op without code must run through the normal table");
+    }
+    cpu->nextOp = nullptr;
+    for (U32 i = 0; i < blockCount; ++i) {
+        context.memory->removeCodeBlock(TEST_CODE_ADDRESS + i * blockBytes, blocks[i], false);
+    }
+    wasmJitTestResetRuntimeBatching();
+}
+
+// Catches: a heap allocation failure in an instruction run through runNextSingleOp (cold ops in compiled blocks) being
+// handled as a guest fault, so the guest retries it for ever and the main loop never gets to stop and report it.
+extern bool ramPageTestFailNextAlloc;
+void testWasmJitSingleOpOomPropagates() {
+    testNewInstruction(0);
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    // A page no test has written: past the heap segment's mapped pages, reached through DS.
+    const U32 offset = (32 + 1) << K_PAGE_SHIFT; // the test maps 32 pages per segment
+    const U32 page = TEST_HEAP_ADDRESS + offset;
+    if (context.memory->mmap(context.thread, page, K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE, K_MAP_FIXED | K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0) != page) {
+        testFail("single op OOM: mapping a fresh page");
+        return;
+    }
+    testPushCode8(0xa3); testPushCode32(offset); // mov [page],eax
+    testPushCode8(0xcd); testPushCode8(0x97);
+    cpu->eip.u32 = 0;
+    cpu->nextOp = cpu->getNextOp();
+    ramPageTestFailNextAlloc = true;
+    bool threw = false;
+    try {
+        cpu->runNextSingleOp();
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    bool hookUsed = !ramPageTestFailNextAlloc;
+    ramPageTestFailNextAlloc = false;
+    if (!hookUsed) {
+        testFail("single op OOM: the write must allocate the page");
+    }
+    if (!threw) {
+        testFail("single op OOM: bad_alloc must leave runNextSingleOp");
+    }
+    context.memory->unmap(page, K_PAGE_SIZE);
+    cpu->nextOp = nullptr;
+}
+
 // Leaf-call inlining: `call rel32` to a short callee is compiled into the caller's block. Catches: an inlined call
 // that skips the guest push/pop of the return address (stack contents or esp differ), a forward jcc inside the callee
 // taking the wrong path, a callee that changes its return address returning to the call site anyway, a write to the
@@ -1958,14 +2111,35 @@ void testWasmJitPendingLifecycle() {
     if (!(teardownOp->flags2 & OP_FLAG2_WASM_JIT_PENDING) || wasmJitTestPendingCount() != 1) {
         testFail("pending lifecycle teardown setup remains pending");
     }
+    // Published code of the exiting process too: nothing could reach it again. Catches its slots and group staying
+    // in the table and JS for the rest of the session.
+    U32 publishedAddress = testContext().codeIp;
+    testPushCode8(0x41); // inc ecx
+    testPushCode8(0x42); // inc edx
+    testPushCode8(0x43); // inc ebx
+    testPushCode8(0x46); // inc esi
+    testPushCode8(0xcd);
+    testPushCode8(0x97);
+    DecodedOp* publishedOp = compile(publishedAddress);
+    for (U32 i = 0; i < limits.urgentPendingHits && !publishedOp->pfnJitCode; ++i) {
+        wasmJitHandlePendingHit(testContext().cpu, publishedOp);
+    }
+    if (!publishedOp->pfnJitCode || wasmJitTestRuntimeGroupCount() == 0) {
+        testFail("pending lifecycle teardown setup publishes a runtime group");
+    }
+    U32 groupsReleased = wasmJitTestRuntimeGroupReleaseCount();
     testContext().memory->cleanup();
     bool teardownCancelledPending = wasmJitTestPendingCount() == 0;
+    bool teardownFreedCode = wasmJitTestRuntimeGroupCount() == 0 && wasmJitTestRuntimeGroupReleaseCount() > groupsReleased;
     testContext().memory->execvReset(true);
     // Match the CPU reset that follows memory replacement in production exec.
     testContext().cpu->reset();
     restoreMappings();
     if (!teardownCancelledPending) {
         testFail("pending lifecycle teardown cancels pending block");
+    }
+    if (!teardownFreedCode) {
+        testFail("process exit frees the process's published JIT code");
     }
 }
 
@@ -2094,6 +2268,79 @@ void testWasmJitTinyAnonymousPromotion() {
     }
 
     testContext().memory->removeCodeBlock(oomTinyAddress, oomTiny, false);
+}
+
+// Catches: a pause lasting until some slot happens to be freed (an idle screen frees none, compiling stays off for the
+// rest of the session), a retry per tick instead of per probe period, and requests behind a retried one staying sealed
+// (they also hold back the hot groups) until yet another release.
+void testWasmJitOomProbe() {
+    testNewInstruction(0);
+    wasmJitTestResetRuntimeBatching();
+    boxedwine_wasm_test_reset_oom_state();
+    struct ResetBatching {
+        ~ResetBatching() {
+            wasmJitTestResetRuntimeBatching();
+            boxedwine_wasm_test_reset_oom_state();
+        }
+    } reset;
+    WasmJitBatchLimits limits;
+    limits.maxBlocks = 2;
+    limits.maxBatchBytes = 1024 * 1024;
+    limits.urgentPendingHits = 8;
+    limits.maxProcessOpenBytes = 4 * 1024 * 1024;
+    wasmJitTestSetBatchLimits(limits);
+    wasmJitTestSetMappedFileKeyOverride(101);
+    wasmJitTestEnableRuntimeBatching(true);
+
+    U32 addresses[4];
+    for (U32 i = 0; i < 4; ++i) {
+        addresses[i] = testContext().codeIp;
+        testPushCode8(0x40 + i);
+        testPushCode8(0xcd);
+        testPushCode8(0x97);
+    }
+    DecodedOp* ops[4];
+    auto compile = [&](U32 i) {
+        ops[i] = testContext().cpu->getOp(addresses[i], 0);
+        startNewJIT(testContext().cpu, addresses[i], ops[i]);
+    };
+    auto installed = [&](U32 i) {
+        return ops[i]->pfnJitCode && !(ops[i]->flags2 & OP_FLAG2_WASM_JIT_PENDING);
+    };
+    boxedwine_wasm_test_force_next_module_oom();
+    for (U32 i = 0; i < 4; ++i) {
+        compile(i);
+    }
+    U32 attempts = wasmJitTestRuntimeModuleAttemptCount();
+    if (!wasmJitCompilationPaused() || wasmJitTestSealedCount() != 2 || wasmJitTestPendingCount() != 4) {
+        testFail("OOM probe setup: two sealed groups and a pause");
+    }
+    double start = 1000;
+    wasmJitTestOomTick(start); // the tick that first sees the pause starts its period
+    wasmJitTestOomTick(start + 4999);
+    if (wasmJitTestRuntimeModuleAttemptCount() != attempts || !wasmJitCompilationPaused()) {
+        testFail("OOM probe: no attempt before the period ends");
+    }
+    boxedwine_wasm_test_force_next_module_oom();
+    wasmJitTestOomTick(start + 5000);
+    if (wasmJitTestRuntimeModuleAttemptCount() != attempts + 1 || !wasmJitCompilationPaused() || wasmJitTestSealedCount() != 2) {
+        testFail("OOM probe: a failed retry pauses again and keeps the requests");
+    }
+    wasmJitTestOomTick(start + 9999);
+    if (wasmJitTestRuntimeModuleAttemptCount() != attempts + 1) {
+        testFail("OOM probe: a failed retry waits for the next period");
+    }
+    wasmJitTestOomTick(start + 10000);
+    if (wasmJitTestRuntimeModuleAttemptCount() != attempts + 2 || wasmJitCompilationPaused() || !installed(0) || !installed(1) || wasmJitTestSealedCount() != 1) {
+        testFail("OOM probe: the retry publishes the oldest request with no slot released");
+    }
+    wasmJitTestOomTick(start + 10001); // not paused: the next request needs no wait
+    if (wasmJitTestRuntimeModuleAttemptCount() != attempts + 3 || !installed(2) || !installed(3) || wasmJitTestSealedCount() != 0 || wasmJitTestPendingCount() != 0) {
+        testFail("OOM probe: requests behind the retried one follow without a release");
+    }
+    for (U32 i = 0; i < 4; ++i) {
+        testContext().memory->removeCodeBlock(addresses[i], ops[i], false);
+    }
 }
 
 void testWasmJitGroupedOomRecovery() {

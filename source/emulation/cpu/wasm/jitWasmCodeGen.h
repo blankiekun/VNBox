@@ -1351,6 +1351,7 @@ extern "C" void boxedwine_wasm_free_block(int tableIndex);
 void wasmJitHandlePendingHit(CPU* cpu, DecodedOp* op);
 #ifndef BOXEDWINE_MULTI_THREADED
 bool wasmJitCompilationPaused();
+void wasmJitOomTick();
 #endif
 
 #ifdef __TEST
@@ -1362,6 +1363,7 @@ void wasmJitTestSetFailInvalidationPreparation(bool fail);
 
 #if defined(__TEST) && !defined(BOXEDWINE_MULTI_THREADED)
 extern "C" void boxedwine_wasm_test_force_next_module_oom();
+extern "C" void boxedwine_wasm_test_clear_forced_module_oom();
 extern "C" void boxedwine_wasm_test_reset_oom_state();
 
 struct WasmJitBatchLimits;
@@ -1374,8 +1376,10 @@ extern "C" void wasmJitTestFailBatchAfterSlots(S32 slotCount);
 void wasmJitTestResetRuntimeBatching();
 U32 wasmJitTestPendingCount();
 void wasmJitTestSetHotGroups(U32 entries, double waitMs);
+void wasmJitTestClearHotCounts();
 U32 wasmJitTestHotQueueSize();
 void wasmJitTestHotFlush(CPU* cpu);
+void wasmJitTestOomTick(double nowMs); // one main loop tick of the OOM retry at this host time
 U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
 U64 wasmJitTestInlinedCalls();

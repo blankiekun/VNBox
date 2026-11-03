@@ -416,6 +416,11 @@ static std::deque<WasmJitSealedRequest> g_wasmJitSealedRequests;
 static bool g_wasmJitCompilationPaused = false;
 // A release while paused unlocks exactly one browser compilation probe. The first standalone, grouped, or tiny attempt consumes this token.
 static bool g_wasmJitOomRetryProbePending = false;
+// A pause may only last until the browser collects dead modules, and nothing may free a slot for hours (an idle
+// screen): while paused, one compile is retried per this much host time. It paces that retry, never the guest.
+#define WASM_JIT_OOM_PROBE_MS 5000.0
+static double g_wasmJitOomNextProbeMs = 0; // 0: no pause seen yet
+static bool g_wasmJitOomPauseReported = false;
 #define WASM_JIT_TINY_ADDITIONAL_HITS (3 * JIT_RUN_COUNT)
 
 struct WasmJitRuntimeStats {
@@ -2522,8 +2527,8 @@ EM_JS(int, boxedwine_wasm_instantiate,
     try {
 #ifdef __TEST
         Module.wasmJitStandaloneModuleAttemptCount = (Module.wasmJitStandaloneModuleAttemptCount || 0) + 1;
-        if (Module.wasmJitTestForceNextModuleOom) {
-            Module.wasmJitTestForceNextModuleOom = false;
+        if (Module.wasmJitTestForceNextModuleOom > 0) {
+            Module.wasmJitTestForceNextModuleOom--;
             throw new Error('out of memory');
         }
 #endif
@@ -2576,7 +2581,7 @@ EM_JS(int, boxedwine_wasm_instantiate,
             var newlyPaused = Module.wasmJitOomGeneration === undefined;
             Module.wasmJitOomGeneration = Module.wasmJitReleaseGeneration;
             if (newlyPaused) {
-                console.warn('[WASM JIT] module compilation paused after out of memory; waiting for JIT code release');
+                console.warn('[WASM JIT] module compilation paused after out of memory; retrying when JIT code is released or after a few seconds');
             }
         }
         console.error('boxedwine_wasm_instantiate failed:', e);
@@ -2591,6 +2596,15 @@ static constexpr int WASM_JIT_BATCH_OK = 1;
 
 EM_JS(int, boxedwine_wasm_jit_compilation_paused, (), {
     return Module.wasmJitOomGeneration !== undefined && Module.wasmJitOomGeneration === Module.wasmJitReleaseGeneration;
+});
+
+// The next compile may try again, as after a slot release.
+EM_JS(void, boxedwine_wasm_jit_allow_oom_retry, (), {
+    Module.wasmJitReleaseGeneration = (Module.wasmJitReleaseGeneration || 0) + 1;
+});
+
+EM_JS(void, boxedwine_wasm_jit_report_oom_pause, (), {
+    if (typeof vnboxReport === 'function') vnboxReport('jit', 'The browser refused to compile more game code (out of memory). The game goes on, slower, while new code is interpreted; compiling is retried every few seconds.');
 });
 
 EM_JS(void, boxedwine_wasm_log_runtime_stats, (U64 compiledBlocks, U64 browserModules, U64 translatedFileBacked, U64 translatedAnonymous, U64 standaloneModules, U64 groupedModules, U64 groupedFunctions, U64 rawInputBytes, U64 mergedBytes, U64 countFlushes, U64 byteFlushes, U64 urgentFlushes, U64 processCapFlushes, U64 cancelledEntries, U64 permanentFailures, U64 tinyDeferred, U64 tinyPromoted, U64 oomPauses, U64 blockedAttempts, U64 oomRetries, U64 oomResumptions, U64 functionsPerGroup, U64 functionsPerGroupTenth), {
@@ -2632,8 +2646,8 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int siz
     try {
         Module.wasmJitRuntimeModuleAttemptCount = (Module.wasmJitRuntimeModuleAttemptCount || 0) + 1;
 #ifdef __TEST
-        if (Module.wasmJitTestForceNextModuleOom) {
-            Module.wasmJitTestForceNextModuleOom = false;
+        if (Module.wasmJitTestForceNextModuleOom > 0) {
+            Module.wasmJitTestForceNextModuleOom--;
             throw new Error('out of memory');
         }
 #endif
@@ -2702,11 +2716,15 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int siz
 
 #if defined(__TEST) && !defined(BOXEDWINE_MULTI_THREADED)
 EM_JS(void, boxedwine_wasm_test_force_next_module_oom, (), {
-    Module.wasmJitTestForceNextModuleOom = true;
+    Module.wasmJitTestForceNextModuleOom = (Module.wasmJitTestForceNextModuleOom || 0) + 1;
+});
+
+EM_JS(void, boxedwine_wasm_test_clear_forced_module_oom, (), {
+    Module.wasmJitTestForceNextModuleOom = 0;
 });
 
 EM_JS(void, boxedwine_wasm_test_reset_oom_state, (), {
-    Module.wasmJitTestForceNextModuleOom = false;
+    Module.wasmJitTestForceNextModuleOom = 0;
     Module.wasmJitReleaseGeneration = 0;
     delete Module.wasmJitOomGeneration;
 });
@@ -2753,7 +2771,7 @@ EM_JS(void, boxedwine_wasm_test_reset_runtime_batching_js, (), {
     Module.wasmJitRuntimeGroupsCreated = 0;
     Module.wasmJitRuntimeGroupsReleased = 0;
     Module.wasmJitTestFailBatchAfterSlots = -1;
-    Module.wasmJitTestForceNextModuleOom = false;
+    Module.wasmJitTestForceNextModuleOom = 0;
     Module.wasmJitReleaseGeneration = 0;
     delete Module.wasmJitOomGeneration;
 });
@@ -5466,8 +5484,18 @@ static void wasmJitHotFlush(CPU* cpu) {
         (e.memory == cpu->memory ? mine : others).push_back(e);
     }
     g_wasmJitHotQueue.swap(others);
+    // What a block needs to go back to its old slot.
+    struct OldBlock {
+        WasmJitBatchEntryId id;
+        DecodedOp* op;
+        void* slot;
+        U16 blockOpCount;
+        U16 blockLen;
+        decltype(DecodedOp::runCount) runCount;
+        U32 memArrays;
+    };
     std::vector<WasmJitBatchEntryId> ids;
-    std::vector<void*> oldSlots;
+    std::vector<OldBlock> oldBlocks;
     for (const WasmJitHotEntry& e : mine) {
         DecodedOp* op = e.op;
         // Still the block that queued itself? (A cleared slot already dropped its entry.)
@@ -5476,6 +5504,7 @@ static void wasmJitHotFlush(CPU* cpu) {
             continue;
         }
         g_wasmJitHotSubmittedId = 0;
+        OldBlock old = {0, op, op->pfnJitCode, op->blockOpCount, op->blockLen, op->runCount, (U32)(op->flags2 & OP_FLAG2_WASM_JIT_MEM_ARRAYS)};
         op->flags &= ~OP_FLAG_JIT; // doJIT skips compiled entries
         JitWasmCodeGen* jit = static_cast<JitWasmCodeGen*>(startNewJIT(cpu));
         jit->m_hotTier = true;
@@ -5484,7 +5513,8 @@ static void wasmJitHotFlush(CPU* cpu) {
         if (g_wasmJitHotSubmittedId) {
             // Pending now (pfnJitCode cleared): the old slot is unreachable once the group publishes.
             ids.push_back(g_wasmJitHotSubmittedId);
-            oldSlots.push_back((void*)(uintptr_t)(U32)e.slot);
+            old.id = g_wasmJitHotSubmittedId;
+            oldBlocks.push_back(old);
         } else if (op->pfnJitCode == (void*)(uintptr_t)(U32)e.slot && !(op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
             op->flags |= OP_FLAG_JIT;
         }
@@ -5506,6 +5536,26 @@ static void wasmJitHotFlush(CPU* cpu) {
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopFlushHot = 0;
 #endif
+    // A group publishes whole or not at all. Only published code replaces the old slot: after "out of memory" or a
+    // failed module a block keeps the code it has (sealed, it would run nothing but the interpreter), and queues
+    // itself again in a later period.
+    std::vector<void*> oldSlots;
+    for (const OldBlock& old : oldBlocks) {
+        cancelPendingWasmJitBlock(old.id, old.op); // no-op once published or failed
+        if (old.op->pfnJitCode) {
+            oldSlots.push_back(old.slot);
+            continue;
+        }
+        claimJitBlockOps(old.op, old.blockOpCount, old.blockLen);
+        old.op->pfnJitCode = old.slot;
+        old.op->pfn = cpu->thread->process->startJITOp;
+        old.op->runCount = old.runCount;
+        old.op->flags |= OP_FLAG_JIT;
+        old.op->flags2 |= old.memArrays;
+    }
+    if (oldSlots.empty()) {
+        return;
+    }
     clearJitBlock(oldSlots);
     if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0) {
         klog_fmt("[WASM JIT hot] group %llu: %u blocks; total %llu blocks, %llu KB", (unsigned long long)g_wasmJitHotModules,
@@ -5551,6 +5601,42 @@ bool wasmJitCompilationPaused() {
     return g_wasmJitCompilationPaused;
 }
 
+static void wasmJitOomTickAt(double nowMs) {
+    if (g_wasmJitCompilationPaused) {
+        if (!g_wasmJitOomNextProbeMs) {
+            g_wasmJitOomNextProbeMs = nowMs + WASM_JIT_OOM_PROBE_MS;
+            if (!g_wasmJitOomPauseReported) {
+                g_wasmJitOomPauseReported = true;
+                boxedwine_wasm_jit_report_oom_pause();
+            }
+            return;
+        }
+        if (nowMs < g_wasmJitOomNextProbeMs) {
+            return;
+        }
+        g_wasmJitOomNextProbeMs = nowMs + WASM_JIT_OOM_PROBE_MS;
+        boxedwine_wasm_jit_allow_oom_retry();
+        g_wasmJitCompilationPaused = false;
+        g_wasmJitOomRetryProbePending = true;
+    }
+    // Not paused with requests left (a retry published the oldest): nothing else would run them, and they hold
+    // back the hot groups.
+    try {
+        // May allocate; a request that fails stays sealed for the next tick.
+        retryOldestSealedRequest();
+    } catch (...) {
+    }
+}
+
+// Once per main loop tick, with no compiled block on the stack.
+void wasmJitOomTick() {
+    if (!g_wasmJitCompilationPaused && g_wasmJitSealedRequests.empty()) {
+        g_wasmJitOomNextProbeMs = 0;
+        return;
+    }
+    wasmJitOomTickAt(emscripten_get_now());
+}
+
 #ifdef __TEST
 void wasmJitTestEnableRuntimeBatching(bool enabled) {
     g_wasmJitTestRuntimeBatchingEnabled = enabled;
@@ -5578,6 +5664,7 @@ void wasmJitTestResetRuntimeBatching() {
     g_wasmJitSealedRequests.clear();
     g_wasmJitCompilationPaused = false;
     g_wasmJitOomRetryProbePending = false;
+    g_wasmJitOomNextProbeMs = 0;
     g_wasmJitTestRuntimeBatchingEnabled = false;
     g_wasmJitTestMappedFileKeyOverride = -1;
     g_wasmJitTestTinyAdditionalHits = WASM_JIT_TINY_ADDITIONAL_HITS;
@@ -5599,6 +5686,16 @@ void wasmJitTestSetHotGroups(U32 entries, double waitMs) {
 
 void wasmJitTestHotFlush(CPU* cpu) {
     wasmJitHotFlush(cpu);
+}
+
+void wasmJitTestOomTick(double nowMs) {
+    if (g_wasmJitCompilationPaused || !g_wasmJitSealedRequests.empty()) {
+        wasmJitOomTickAt(nowMs);
+    }
+}
+
+void wasmJitTestClearHotCounts() {
+    memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
 }
 
 U32 wasmJitTestHotQueueSize() {
