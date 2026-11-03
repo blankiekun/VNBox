@@ -7,7 +7,7 @@ FT_STAMP := $(FT_DIR)/.unpacked
 FT_FLAGS_FILE := $(PROJDIR)/lib/freetype/sources.mk
 FT_OBJS := $(FT_SRCS:%=$(BUILD_DIR)/freetype/%.o) $(BUILD_DIR)/freetype/sjlj.c.o
 # FreeType's own setjmp/longjmp (sjlj.c) needs wasm exceptions, as the JIT builds have anyway.
-FT_CC := $(CC) $(OPTIMIZATION_FLAGS) $(TAIL_CALL_FLAG) $(WASM_EXCEPTIONS_FLAG) -sSUPPORT_LONGJMP=wasm -sUSE_ZLIB=1
+FT_CC := $(CC) $(OPTIMIZATION_FLAGS) $(TAIL_CALL_FLAG) $(WASM_EXCEPTIONS_FLAG) -sSUPPORT_LONGJMP=wasm -sUSE_ZLIB=1 $(filter -pthread,$(EXTRA_CPP_FLAGS))
 ALL += $(FT_OBJS)
 CPPFLAGS += -DBOXEDWINE_HOST_FREETYPE -I$(FT_DIR)/include
 -include $(FT_OBJS:.o=.d)

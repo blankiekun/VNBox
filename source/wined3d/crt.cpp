@@ -1,6 +1,7 @@
 // Host wined3d (HOST_WINED3D=1): the msvcrt/ucrt functions Wine's headers turn printf, assert, errno, fpclassify
 // and friends into, implemented on Emscripten's libc. This file uses libc's headers, not Wine's, so each signature
 // is spelled out to match Wine's include/msvcrt prototype (a mismatch would make wasm-ld trap the call).
+#ifdef BOXEDWINE_HOST_WINED3D
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,3 +127,4 @@ void vkd3d_utils_set_log_callback(void* callback) {
 }
 
 }
+#endif
