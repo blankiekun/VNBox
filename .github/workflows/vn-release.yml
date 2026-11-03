@@ -13,13 +13,18 @@ permissions:
 env:
   EMSDK_VERSION: 5.0.7
   # Our own mirror (v0.2.2) of https://boxedwine.org/v2/23/TinyCore15Wine11.0-web.zip, which rate-limits CI and
-  # replaces files in place; the hash pins the file we tested.
+  # replaces files in place; the hash pins the file we tested. build-jp-overlay.sh pins it too (with the Wine it was built from).
   ROOT_FS_URL: https://github.com/blankiekun/VNBox/releases/download/v0.2.2/TinyCore15Wine11.0-web.zip
   ROOT_FS_ORIGIN: https://boxedwine.org/v2/23/TinyCore15Wine11.0-web.zip
   ROOT_FS_SHA256: 4d505092956dd78e36712dac8111c252e5d1b859ce2373fbe7c80242bb65ad47
 
 jobs:
+  # Catches a tag (or branch run) on a commit with a failing self-check: nothing is built or published.
+  checks:
+    uses: ./.github/workflows/vn-checks.yml
+
   release:
+    needs: checks
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

@@ -11,4 +11,11 @@ int vnboxUrlInt(const char* name, int dflt, int lo, int hi, const char* env = nu
 // True when the option is set to exactly value.
 bool vnboxUrlIs(const char* name, const char* value, const char* env = nullptr);
 
+// The guest cannot start: tells the page and a page embedding the player (vnbox-error, source "boot"). Nothing elsewhere.
+#ifdef __EMSCRIPTEN__
+void vnboxStartFailed(const char* why);
+#else
+inline void vnboxStartFailed(const char*) {}
+#endif
+
 #endif

@@ -17,28 +17,48 @@ function browser(threaded) {
     const windowHandlers = new Map();
     const documentHandlers = new Map();
     const events = [];
+    const keys = [];
     const canvas = {
         width: 640, height: 480, focus() {}, addEventListener() {},
         getBoundingClientRect: () => ({left: 100, top: 50, right: 740, bottom: 530, width: 640, height: 480})
     };
     const document = {
-        pointerLockElement: null,
+        pointerLockElement: null, hidden: false,
         getElementById: () => null,
         addEventListener: (type, callback) => documentHandlers.set(type, callback)
     };
     const context = vm.createContext({canvas, document,
-        window: {addEventListener: (type, callback) => windowHandlers.set(type, callback)},
+        window: {addEventListener(type, callback) {
+            windowHandlers.set(type, [...(windowHandlers.get(type) || []), callback]);
+        }},
         _boxedwineEmscriptenMouseButton: (down, button, x, y) => events.push({down, button, x, y}),
         _boxedwineEmscriptenMouseMove() {}, _boxedwineEmscriptenPointerLock() {},
-        _boxedwineEmscriptenKey() {}
+        _boxedwineEmscriptenKey: (scanCode, key, down) => keys.push([scanCode, down])
     });
     vm.runInContext(code, context);
-    return {events, context,
-        send(type, button = 0, clientX = 300, clientY = 250) {
-            let stopped = false;
-            windowHandlers.get(type)({button, clientX, clientY,
-                preventDefault() {}, stopImmediatePropagation() {stopped = true;}});
-            return stopped;
+    // Listeners on window run in the order they were added; only stopImmediatePropagation ends the list.
+    const dispatch = (type, event) => {
+        let consumed = false, immediate = false;
+        for (const callback of windowHandlers.get(type) || []) {
+            callback({...event, preventDefault() {},
+                stopPropagation() {consumed = true;},
+                stopImmediatePropagation() {consumed = immediate = true;}});
+            if (immediate) break;
+        }
+        return consumed;
+    };
+    return {events, keys, context,
+        send: (type, button = 0, clientX = 300, clientY = 250) => dispatch(type, {button, clientX, clientY}),
+        key: (type, code, event = {}) => dispatch(type, {code, key: '', target: {tagName: 'CANVAS'}, ...event}),
+        // A listener added after the page's, as the main loop's wake and audio's resume are.
+        later(type) {
+            const calls = {count: 0};
+            windowHandlers.get(type).push(() => calls.count++);
+            return calls;
+        },
+        hide() {
+            document.hidden = true;
+            documentHandlers.get('visibilitychange')();
         },
         lock(enabled) {
             document.pointerLockElement = enabled ? canvas : null;
@@ -111,4 +131,78 @@ for (const threaded of [false, true]) {
         b.send('mouseup');
         assert.deepEqual(b.events.map(e => e.down), [1, 0, 1, 0]);
     });
+
+    // Bug: stopImmediatePropagation here blocked the main loop's wake and audio's resume, so input
+    // on an idle screen waited for the next timer. Motion stays blocked, to not run a tick per move.
+    test(`${mode}: buttons reach later window listeners, motion does not`, () => {
+        const b = browser(threaded);
+        const down = b.later('mousedown'), up = b.later('mouseup'), move = b.later('mousemove');
+        assert.equal(b.send('mousemove'), true);
+        assert.equal(b.send('mousedown'), true);
+        assert.equal(b.send('mouseup'), true);
+        assert.deepEqual([down.count, up.count, move.count], [1, 1, 0]);
+    });
 }
+
+// The page's own key listeners exist only in the single-threaded builds.
+const [ctrl, a] = [224, 4];
+
+// Bug: Ctrl+Tab's key-up goes to another tab, the guest holds Ctrl and the game skips text alone.
+test('losing focus or hiding releases each key held in the guest, once', () => {
+    for (const lose of [b => b.send('blur'), b => b.hide()]) {
+        const b = browser(false);
+        b.key('keydown', 'ControlLeft');
+        b.key('keydown', 'KeyA');
+        b.key('keydown', 'KeyA');
+        b.key('keyup', 'KeyA');
+        b.key('keydown', 'ShiftLeft');
+        lose(b);
+        lose(b);
+        assert.deepEqual(b.keys.slice(5), [[ctrl, 0], [225, 0]]);
+    }
+});
+
+test('a key released before focus is lost is not released again', () => {
+    const b = browser(false);
+    b.key('keydown', 'KeyA');
+    b.key('keyup', 'KeyA');
+    b.send('blur');
+    assert.deepEqual(b.keys, [[a, 1], [a, 0]]);
+});
+
+// Bug: a game acting on key-up would act twice when the player comes back and lets go of the key.
+test('the real key-up after a focus-loss release sends nothing, and is still consumed', () => {
+    const b = browser(false);
+    b.key('keydown', 'KeyA');
+    b.send('blur');
+    assert.equal(b.key('keyup', 'KeyA'), true);
+    assert.deepEqual(b.keys, [[a, 1], [a, 0]]);
+});
+
+// Bug: boxedwineKey returns null for these key-ups, so the key stayed down in the guest.
+test('a held key is released when its key-up comes from a page input or with Ctrl down', () => {
+    for (const event of [{target: {tagName: 'INPUT'}}, {ctrlKey: true}]) {
+        const b = browser(false);
+        b.key('keydown', 'KeyA');
+        assert.equal(b.key('keyup', 'KeyA', event), true);
+        assert.deepEqual(b.keys, [[a, 1], [a, 0]]);
+    }
+});
+
+test('keys typed in a page input and browser shortcuts stay with the browser', () => {
+    const b = browser(false);
+    for (const event of [{target: {tagName: 'INPUT'}}, {ctrlKey: true}]) {
+        assert.equal(b.key('keydown', 'KeyA', event), false);
+        assert.equal(b.key('keyup', 'KeyA', event), false);
+    }
+    assert.deepEqual(b.keys, []);
+});
+
+// Bug: same as the buttons above; a keyboard-only player also got no audio.
+test('keys reach later window listeners', () => {
+    const b = browser(false);
+    const down = b.later('keydown'), up = b.later('keyup');
+    b.key('keydown', 'KeyA');
+    b.key('keyup', 'KeyA');
+    assert.deepEqual([down.count, up.count], [1, 1]);
+});

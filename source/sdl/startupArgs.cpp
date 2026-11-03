@@ -1035,6 +1035,8 @@ bool StartUpArgs::apply() {
 #endif
                 return false; // doMainLoop should have handled any cleanup, like SDL_Quit if necessary
             }
+        } else {
+            vnboxStartFailed((this->args[0] + " could not be run").c_str());
         }
     }
 #ifdef GENERATE_SOURCE
