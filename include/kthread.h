@@ -206,6 +206,7 @@ public:
     BOXEDWINE_MUTEX waitingCondSync;
 #else
     KListNode<KThread*> scheduledThreadNode;
+    U64 queuedOrder = 0; // when it joined scheduledThreads, in the order of schedulerQueueCount
     KListNode<KThread*> waitThreadNode;
         
     BoxedWineConditionTimer condTimer;
