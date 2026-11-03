@@ -1,0 +1,178 @@
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -45,6 +45,8 @@
+ #include "wine/rbtree.h"
+ #include "wine/debug.h"
+ 
++extern void vnbox_ncm_cache_invalidate(void);  /* VNBox: sysparams.c */
++
+ WINE_DEFAULT_DEBUG_CHANNEL(font);
+ 
+ static HKEY wine_fonts_key;
+@@ -6787,6 +6789,7 @@ INT WINAPI NtGdiAddFontResourceW( const WCHAR *str, ULONG size, ULONG files, DWO
+                                   DWORD tid, void *dv )
+ {
+     if (!font_funcs) return 1;
++    vnbox_ncm_cache_invalidate();  /* VNBox: SPI_GETNONCLIENTMETRICS measures fonts (sysparams.c) */
+     return add_font_resource( str, flags );
+ }
+ 
+@@ -6809,6 +6812,7 @@ HANDLE WINAPI NtGdiAddFontMemResourceEx( void *ptr, DWORD size, void *dv, ULONG
+     if (!(copy = malloc( size ))) return NULL;
+     memcpy( copy, ptr, size );
+ 
++    vnbox_ncm_cache_invalidate();  /* VNBox: SPI_GETNONCLIENTMETRICS measures fonts (sysparams.c) */
+     pthread_mutex_lock( &font_lock );
+     num_fonts = font_funcs->add_mem_font( copy, size, ADDFONT_ALLOW_BITMAP | ADDFONT_ADD_RESOURCE );
+     pthread_mutex_unlock( &font_lock );
+@@ -6855,6 +6859,7 @@ BOOL WINAPI NtGdiRemoveFontResourceW( const WCHAR *str, ULONG size, ULONG files,
+                                       DWORD tid, void *dv )
+ {
+     if (!font_funcs) return TRUE;
++    vnbox_ncm_cache_invalidate();  /* VNBox: SPI_GETNONCLIENTMETRICS measures fonts (sysparams.c) */
+     return remove_font_resource( str, flags );
+ }
+ 
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -4863,6 +4863,84 @@ static DWORD load_entry( struct sysparam_entry *entry, void *data, DWORD size )
+     return count;
+ }
+ 
++/* VNBox: cache of the assembled SPI_GETNONCLIENTMETRICS result. Building it reads 15 entries and then
++ * normalize_nonclientmetrics creates, selects, measures and deletes 3 fonts on the display DC, ~55 us per call in
++ * VNBox; games poll it every frame (Itsusora: once per loop pass, ~1300/s). Keyed by entry point, DPI argument and
++ * the thread's DPI awareness context (the entries' DPI scaling); dropped whenever any entry is saved (every
++ * SPI_SET*) or a font resource is added or removed (normalize measures fonts). WINE_VNBOX_SPI_CACHE=0 (URL option
++ * cheapSpi=0) turns it off. */
++static LONG ncm_cache_gen = 1;
++static pthread_mutex_t ncm_cache_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct
++{
++    LONG gen;
++    BOOL for_dpi;
++    UINT dpi;
++    UINT context;
++    NONCLIENTMETRICSW ncm;
++} ncm_cache[4];
++static unsigned int ncm_cache_next;
++
++void vnbox_ncm_cache_invalidate(void)
++{
++    InterlockedIncrement( &ncm_cache_gen );
++}
++
++static BOOL ncm_cache_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled == -1)
++    {
++        const char *env = getenv( "WINE_VNBOX_SPI_CACHE" );
++        enabled = !env || strcmp( env, "0" );
++    }
++    return enabled;
++}
++
++/* copies a cached result into ncm (all fields but cbSize; iPaddedBorderWidth only when cbSize has room for it, as
++ * the uncached paths do). Returns 0 on a hit, else the generation to store a result computed now under. */
++static LONG ncm_cache_get( NONCLIENTMETRICSW *ncm, BOOL for_dpi, UINT dpi )
++{
++    UINT context = get_thread_dpi_awareness_context(), cb = ncm->cbSize;
++    int padded = ncm->iPaddedBorderWidth;
++    LONG gen;
++    unsigned int i;
++
++    pthread_mutex_lock( &ncm_cache_lock );
++    gen = ncm_cache_gen;
++    for (i = 0; i < ARRAY_SIZE(ncm_cache); i++)
++    {
++        if (ncm_cache[i].gen != gen || ncm_cache[i].for_dpi != for_dpi || ncm_cache[i].dpi != dpi ||
++            ncm_cache[i].context != context) continue;
++        *ncm = ncm_cache[i].ncm;
++        pthread_mutex_unlock( &ncm_cache_lock );
++        ncm->cbSize = cb;
++        if (cb != sizeof(*ncm)) ncm->iPaddedBorderWidth = padded;
++        return 0;
++    }
++    pthread_mutex_unlock( &ncm_cache_lock );
++    return gen;
++}
++
++/* stores a full-size result computed under generation gen (a save since then makes it stale at once) */
++static void ncm_cache_put( const NONCLIENTMETRICSW *ncm, BOOL for_dpi, UINT dpi, LONG gen )
++{
++    UINT context = get_thread_dpi_awareness_context();
++    unsigned int i;
++
++    if (ncm->cbSize != sizeof(*ncm)) return;
++    pthread_mutex_lock( &ncm_cache_lock );
++    for (i = 0; i < ARRAY_SIZE(ncm_cache); i++)
++        if (ncm_cache[i].for_dpi == for_dpi && ncm_cache[i].dpi == dpi && ncm_cache[i].context == context) break;
++    if (i == ARRAY_SIZE(ncm_cache)) i = ncm_cache_next++ % ARRAY_SIZE(ncm_cache);
++    ncm_cache[i].gen = gen;
++    ncm_cache[i].for_dpi = for_dpi;
++    ncm_cache[i].dpi = dpi;
++    ncm_cache[i].context = context;
++    ncm_cache[i].ncm = *ncm;
++    pthread_mutex_unlock( &ncm_cache_lock );
++}
++
+ /* save a value to a registry entry */
+ static BOOL save_entry( const struct sysparam_entry *entry, const void *data, DWORD size,
+                         DWORD type, UINT flags )
+@@ -4870,6 +4948,8 @@ static BOOL save_entry( const struct sysparam_entry *entry, const void *data, DW
+     HKEY base_key, volatile_key;
+     WCHAR nameW[64];
+ 
++    vnbox_ncm_cache_invalidate();
++
+     asciiz_to_unicode( nameW, entry->regval );
+     if (flags & SPIF_UPDATEINIFILE)
+     {
+@@ -5975,8 +6055,14 @@ BOOL WINAPI NtUserSystemParametersInfoForDpi( UINT action, UINT val, PVOID ptr,
+     case SPI_GETNONCLIENTMETRICS:
+     {
+         NONCLIENTMETRICSW *ncm = ptr;
++        LONG gen = 0;
+ 
+         if (!ncm) break;
++        if (ncm_cache_enabled() && !(gen = ncm_cache_get( ncm, TRUE, dpi )))
++        {
++            ret = TRUE;
++            break;
++        }
+         ret = get_entry_dpi( &entry_BORDER, 0, &ncm->iBorderWidth, dpi ) &&
+               get_entry_dpi( &entry_SCROLLWIDTH, 0, &ncm->iScrollWidth, dpi ) &&
+               get_entry_dpi( &entry_SCROLLHEIGHT, 0, &ncm->iScrollHeight, dpi ) &&
+@@ -5994,6 +6080,7 @@ BOOL WINAPI NtUserSystemParametersInfoForDpi( UINT action, UINT val, PVOID ptr,
+         if (ret && ncm->cbSize == sizeof(NONCLIENTMETRICSW))
+             ret = get_entry_dpi( &entry_PADDEDBORDERWIDTH, 0, &ncm->iPaddedBorderWidth, dpi );
+         normalize_nonclientmetrics( ncm );
++        if (ret && gen) ncm_cache_put( ncm, TRUE, dpi, gen );
+         break;
+     }
+     case SPI_GETICONMETRICS:
+@@ -6197,9 +6284,15 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
+     {
+         NONCLIENTMETRICSW *nm = ptr;
+         int padded_border;
++        LONG gen = 0;
+ 
+         if (!ptr) return FALSE;
+ 
++        if (ncm_cache_enabled() && !(gen = ncm_cache_get( nm, FALSE, 0 )))
++        {
++            ret = TRUE;
++            break;
++        }
+         ret = get_entry( &entry_BORDER, 0, &nm->iBorderWidth ) &&
+               get_entry( &entry_PADDEDBORDERWIDTH, 0, &padded_border ) &&
+               get_entry( &entry_SCROLLWIDTH, 0, &nm->iScrollWidth ) &&
+@@ -6221,6 +6314,7 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
+             if (nm->cbSize == sizeof(NONCLIENTMETRICSW)) nm->iPaddedBorderWidth = 0;
+         }
+         normalize_nonclientmetrics( nm );
++        if (ret && gen) ncm_cache_put( nm, FALSE, 0, gen );
+         break;
+     }
+     case SPI_SETNONCLIENTMETRICS:
