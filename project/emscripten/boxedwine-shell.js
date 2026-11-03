@@ -2451,11 +2451,11 @@
               Atomics.store(presentState, 0, 0);
             }
           }
-          return function(width, height, buffer, presentState) {
+          return function(width, height, pixels, presentState) {
             if (!canvas) {
               canvas = document.getElementById('boxedwine-webgl-canvas-0');
             }
-            if (!canvas || !buffer) {
+            if (!canvas || !pixels) {
               finishPresent(presentState);
               return;
             }
@@ -2474,7 +2474,8 @@
               context = canvas.getContext("2d");
             }
             if (context) {
-              context.putImageData(new ImageData(new Uint8ClampedArray(buffer), width, height), 0, 0);
+              // pixels: a view of wasm memory, or from a worker an ArrayBuffer
+              context.putImageData(new ImageData(ArrayBuffer.isView(pixels) ? pixels : new Uint8ClampedArray(pixels), width, height), 0, 0);
             }
             finishPresent(presentState);
           };

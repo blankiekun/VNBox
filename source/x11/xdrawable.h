@@ -21,6 +21,8 @@
 
 class XGC;
 
+bool sameBytes(const U8* a, const U8* b, U32 n);
+
 class XDrawable {
 public:
 	XDrawable(U32 width, U32 height, U32 depth, const VisualPtr& visual, bool isWindow, bool isPBuffer = false);
@@ -66,7 +68,7 @@ public:
 protected:	
 
 	virtual void readImage(U8* dst, U32 dstPitch, S32 x, S32 y, U32 width, U32 height, U32 dstX, U32 dstY);
-	static U32 calculateBytesPerLine(U32 bitsPerPixel, U32 width);
+	static U64 calculateBytesPerLine(U32 bitsPerPixel, U32 width);
 	U32 depth;
 	VisualPtr visual;
 

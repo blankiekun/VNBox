@@ -183,6 +183,10 @@
 #define XK_Scroll_Lock                   0xff14
 #define XK_Sys_Req                       0xff15
 #define XK_Escape                        0xff1b
+#define XK_Muhenkan                      0xff22  /* Cancel Conversion */
+#define XK_Henkan_Mode                   0xff23  /* Start/Stop Conversion */
+#define XK_Hiragana_Katakana             0xff27  /* Hiragana/Katakana toggle */
+#define XK_Eisu_toggle                   0xff30  /* Alphanumeric toggle */
 #define XK_Delete                        0xffff  /* Delete, rubout */
 
 #define XK_Home                          0xff50

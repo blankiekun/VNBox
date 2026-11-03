@@ -136,7 +136,11 @@ private:
     U8* emscriptenSoftwareBuffer = nullptr;
     U32 emscriptenSoftwareBufferSize = 0;
     bool emscriptenSoftwareDirty = false;
-    U8* emscriptenShownFrame = nullptr; // a copy of the frame on the canvas
+    U8* emscriptenRgbaBuffer = nullptr; // the frame in the canvas's byte order
+    U32 emscriptenRgbaBufferSize = 0;
+    bool emscriptenDesktopFillPending = false; // clear() was called and the desktop colour is not in the buffer yet
+    void fillEmscriptenDesktop();
+    U8* emscriptenShownFrame = nullptr; // the frame on the canvas
     U32 emscriptenShownFrameSize = 0, emscriptenShownWidth = 0, emscriptenShownHeight = 0;
     bool emscriptenShownValid = false;
     bool emscriptenSoftwareDisabled = false;
