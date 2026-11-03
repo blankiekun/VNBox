@@ -11,5 +11,6 @@
 #define __TEST_HOSTVORBIS_H__
 
 void testHostVorbisDecode();
+void testHostVorbisSeek();
 
 #endif

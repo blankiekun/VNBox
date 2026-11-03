@@ -11,5 +11,6 @@
 #define __TEST_HOSTFREETYPE_H__
 
 void testHostFreetypeGlyphs();
+void testHostFreetypeTables();
 
 #endif

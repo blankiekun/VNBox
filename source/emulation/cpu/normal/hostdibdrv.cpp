@@ -157,6 +157,15 @@ U32 hostDibdrvAt(const BString& path, U32 offset) {
     return 0;
 }
 
+#ifdef __TEST
+// testHostDibdrv.cpp stands in for hostDibdrvParse: a table's link address and a hosted primitive; its hostDibdrvRun index.
+U32 hostDibdrvTestEntry(U32 table, U32 slot, U32 tableVaddr, U32 vaddr) {
+    dibTableVaddr[table] = tableVaddr;
+    dibEntries.push_back({ 0, vaddr, (U8)table, (U8)slot });
+    return (U32)dibEntries.size() - 1;
+}
+#endif
+
 static U8* dibRam(KMemory* memory, U32 address, bool write) {
     MMU& mmu = getMemData(memory)->mmu[address >> K_PAGE_SHIFT];
     if (write ? !mmu.canWriteRam : !mmu.canReadRam) return nullptr;

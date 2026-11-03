@@ -246,4 +246,75 @@ void testHostVorbisDecode() {
     if (call("vorbis_synthesis", { VB, OP }) || call("vorbis_synthesis_read", { VD, 1 })) testFail("unknown objects taken");
 }
 
+// What a seek does (ov_raw_seek, ov_pcm_seek, so a BGM loop that seeks): vorbis_synthesis_restart mid-stream, packets from
+// elsewhere, some of them only tracked (trackonly + blockin, samples counted, not read), then decoding again. In lock-step
+// with host libvorbis making the same calls: same samples and the same public fields vorbisfile reads. Catches the restart
+// or trackonly not reaching the host copy, which would click or shift at every loop. Then a second stream on the same guest
+// objects with no clear between (a new id header): catches a block or dsp state kept from the first stream.
+void testHostVorbisSeek() {
+    std::vector<std::vector<U8>> store;
+    int blocksize1;
+    std::vector<ogg_packet> packets = encode(store, blocksize1);
+    vorbis_info vi;
+    vorbis_comment vc;
+    vorbis_dsp_state vd;
+    vorbis_block vb;
+    auto hostInit = [&]() {
+        vorbis_info_init(&vi);
+        vorbis_comment_init(&vc);
+        for (int i = 0; i < 3; i++) vorbis_synthesis_headerin(&vi, &vc, &packets[i]);
+        vorbis_synthesis_init(&vd, &vi);
+        vorbis_block_init(&vd, &vb);
+    };
+    auto hostClear = [&]() {
+        vorbis_block_clear(&vb);
+        vorbis_dsp_clear(&vd);
+        vorbis_comment_clear(&vc);
+        vorbis_info_clear(&vi);
+    };
+    U32 samples = 0;
+    auto step = [&](size_t i, bool track) {
+        ogg_packet& p = packets[i];
+        putPacket(p);
+        int want = track ? vorbis_synthesis_trackonly(&vb, &p) : vorbis_synthesis(&vb, &p);
+        if (!call(track ? "vorbis_synthesis_trackonly" : "vorbis_synthesis", { VB, OP }) || (int)EAX != want || want) testFail("packet %d: result %d, not %d", (int)i, (int)EAX, want);
+        want = vorbis_synthesis_blockin(&vd, &vb);
+        if (!call("vorbis_synthesis_blockin", { VD, VB }) || (int)EAX != want) testFail("packet %d: blockin", (int)i);
+        if (memory->readd(VD + 0x14) != (U32)vd.pcm_current || memory->readd(VD + 0x18) != (U32)vd.pcm_returned || memory->readd(VD + 0x20) != (U32)vd.eofflag ||
+            (S64)memory->readq(VD + 0x38) != (S64)vd.granulepos || (S64)memory->readq(VD + 0x40) != (S64)vd.sequence) testFail("packet %d: guest vd's public fields out of step", (int)i);
+        float** pcm;
+        int n = vorbis_synthesis_pcmout(&vd, track ? nullptr : &pcm);
+        if (!call("vorbis_synthesis_pcmout", { VD, track ? 0 : PCMOUT }) || (int)EAX != n) testFail("packet %d: %d samples, not %d", (int)i, (int)EAX, n);
+        if (n > 0 && !track) {
+            for (int ch = 0; ch < 2; ch++) {
+                if (memory->memcmp(memory->readd(RETARR + ch * 4), pcm[ch], n * 4)) testFail("packet %d: samples of channel %d differ", (int)i, ch);
+            }
+        }
+        samples += n > 0 ? n : 0;
+        vorbis_synthesis_read(&vd, n);
+        if (n > 0 && (!call("vorbis_synthesis_read", { VD, (U32)n }) || EAX)) testFail("packet %d: read", (int)i);
+    };
+    size_t mid = 3 + (packets.size() - 3) / 3;
+    if (packets.size() < mid + 8) testFail("too few packets: %d", (int)packets.size());
+    guestInit(blocksize1, VI2);
+    initCalls(packets, VI2);
+    hostInit();
+    for (size_t i = 3; i < mid; i++) step(i, false);
+    if (call("vorbis_synthesis_restart", { VD })) testFail("restart not left to the guest too");
+    vorbis_synthesis_restart(&vd);
+    for (size_t i = mid; i < mid + 2; i++) step(i, true);
+    samples = 0;
+    for (size_t i = mid + 2; i < packets.size(); i++) step(i, false);
+    if (samples < 1000) testFail("only %u samples after the seek", samples);
+    hostClear();
+    // the next stream's headers on the same objects, no clear
+    initCalls(packets, VI2);
+    hostInit();
+    samples = 0;
+    for (size_t i = 3; i < packets.size(); i++) step(i, false);
+    if (samples < 10000) testFail("only %u samples of the second stream", samples);
+    hostClear();
+    clearCalls();
+}
+
 #endif
