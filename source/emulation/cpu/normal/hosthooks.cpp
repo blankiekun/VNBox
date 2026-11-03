@@ -30,7 +30,7 @@
 // JS may only read memory that is already RAM: a not-yet-loaded file page loads
 // through the Emscripten FS, which in the JSPI build may suspend, and wasm can't
 // suspend under JS frames. So the layer asks for file pages it needs (module
-// headers, the main module) to be loaded at attach time, from a syscall where
+// headers, the exe and the game's DLLs whole) to be loaded at attach time, from a syscall where
 // the stack is wasm only.
 #include "../../softmmu/kmemory_soft.h"
 #include "../../softmmu/soft_mmu.h"

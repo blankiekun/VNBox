@@ -44,7 +44,6 @@
     const F = globalThis.boxedwineFrida = {
         api: null, // set by the first poll from C (hosthooks.cpp)
         pid: 0, tid: 0, teb: 0,
-        lines: [],
         poll, attach, hit,
     };
 
@@ -202,9 +201,9 @@
         return len ? decoder('utf-16le').decode(readBytes(u32(at + 4), len)) : '';
     }
     // The loader's InLoadOrderModuleList, as Frida reads it: TEB → PEB → Ldr; the exe comes first.
-    function modulesOf(teb) {
+    function modulesOf(teb, max = 1024) {
         const ldr = u32(u32(teb + 0x30) + 0x0c), head = ldr + 0x0c, out = [];
-        for (let e = u32(head); e !== head && out.length < 1024; e = u32(e)) {
+        for (let e = u32(head); e !== head && out.length < max; e = u32(e)) {
             const base = u32(e + 0x18);
             if (base) out.push(makeModule(unicodeString(e + 0x2c), base, u32(e + 0x20), unicodeString(e + 0x24)));
         }
@@ -336,7 +335,6 @@
         if (!handles.has(thread.handle)) return; // unloaded while a join timer ran
         const t = { id: thread.id, label: thread.label, kind: thread.kind, address: thread.address, module: thread.module };
         if (t.kind === 'script') {
-            F.lines.push(text);
             console.log('[frida] ' + JSON.stringify(text));
         } else {
             console.log('[frida ' + t.id + '] ' + JSON.stringify(text));
@@ -764,7 +762,7 @@
         threadId = String(threadId);
         const base = threadId.split('#')[0];
         const h = handles.get(base);
-        const head = (what) => '// ' + what + '\n// Written by VNBox frida-compat.js scriptFor(): runs as a frida= script on its own (no libraries).\n' +
+        const head = (what) => '// ' + what.replace(/[\r\n\u2028\u2029]/g, ' ') + '\n// Written by VNBox frida-compat.js scriptFor(): runs as a frida= script on its own (no libraries).\n' +
             'const g = { Interceptor, Process, Module, ptr };\nconst makeJoiner = ' + makeJoiner + ';\n';
         if (h && h.kind === 'script') return h.source;
         if (h && h.kind === 'hcode') {
@@ -836,13 +834,18 @@
     }
 
     const params = typeof vnboxParam === 'undefined' ? null : { get: vnboxParam }; // lazyfs.js; absent in node checks
-    const scriptUrl = params && params.get('frida') ? new URL(params.get('frida'), location.href).href : null;
+    let scriptUrl = null;
+    try {
+        if (params && params.get('frida')) scriptUrl = new URL(params.get('frida'), location.href).href;
+    } catch (e) { // this file must finish loading: the emulator calls poll(), and a throw there stops the game
+        report('bad frida= URL: ' + params.get('frida'));
+    }
     const exe = lower(params && (params.get('p') || '').split(/[\\/]/).pop());
     // attachedPid: the game process (the exe's), attached once the boot script is fetched or, without one,
     // once a hook is first loaded at run time; a new process of the exe (the game restarted) gets every handle again.
-    // candidate: the process being prepared, otherPids: processes of other exes.
+    // candidate: the process being prepared. lastModule, knownModules, newPhase: pollNewModules.
     let loaded = false, attachedPid = 0, candidate = 0, phase = 0, seenAt = 0;
-    const otherPids = new Set();
+    let lastModule = 0, knownModules = new Set(), newPhase = 0;
     if (scriptUrl) {
         fetchTree(scriptUrl).then(() => {
             loaded = true;
@@ -857,38 +860,80 @@
     // From C every 1024 syscalls, on the guest thread of process pid. 0: nothing, 2: load the
     // ranges asked for with prefetch and poll again, 1: load them and attach.
     function poll(pid, tid, teb) {
-        if (!loaded || pid === attachedPid || otherPids.has(pid) || !teb) return 0;
+        if (!loaded || !teb) return 0;
         F.pid = pid; // for the reads below; hits keep going to attachedPid's hooks
         try {
-            return pollProcess(pid, teb);
+            return pid === attachedPid ? pollNewModules(teb) : pollProcess(pid, teb);
         } finally {
             F.pid = attachedPid;
         }
     }
     function pollProcess(pid, teb) {
         let mods;
-        try { mods = modulesOf(teb); } catch (e) { return 0; }
-        if (!mods.length) return 0;
-        if (lower(mods[0].name) !== exe) { otherPids.add(pid); return 0; }
+        try {
+            // Checked again at every poll, the first module's name alone: a launcher's fork child still reads as the
+            // launcher until its exec, and the same pid then is the game.
+            const first = modulesOf(teb, 1);
+            if (!first.length || lower(first[0].name) !== exe) return 0;
+            mods = modulesOf(teb);
+        } catch (e) { return 0; }
         // shortcut: attach 2 s after the exe shows up, like attaching to a running process; scripts
-        // that hook a DLL loaded later need a wait or a retry (dc00's do it themselves where needed)
+        // that hook a DLL loaded later need a wait or a retry (dc00's do it themselves where needed):
+        // pollNewModules loads its pages by the next poll.
         const now = performance.now();
         if (candidate !== pid) { candidate = pid; seenAt = now; phase = 0; }
         if (now - seenAt < 2000) return 0;
-        if (phase === 0) { // the main module whole and every module's headers
+        if (phase === 0) { // the main module whole
             phase = 1;
             F.api.prefetch(mods[0].base.v, mods[0].size);
-            for (const m of mods.slice(1)) F.api.prefetch(m.base.v, 0x1000);
+            prefetchHeaders(mods.slice(1));
             return 2;
         }
-        for (const m of mods.slice(1)) { // export directories, for Module.findExportByName
+        prefetchExports(mods.slice(1));
+        return 1;
+    }
+    // Scripts scan a game's own DLLs (libLuna's SearchMemory walks every module), and Wine maps a DLL's
+    // file pages lazily: those load whole. Of Wine's DLLs only what export lookups read, in two polls.
+    function prefetchHeaders(mods) {
+        for (const m of mods) F.api.prefetch(m.base.v, /^[a-z]:\\windows\\/i.test(m.path) ? 0x1000 : m.size);
+    }
+    function prefetchExports(mods) { // for Module.findExportByName
+        for (const m of mods) {
             try {
                 const pe = m.base.v + u32(m.base.v + 0x3c);
                 const rva = u32(pe + 0x78), size = u32(pe + 0x7c);
                 if (rva) F.api.prefetch(m.base.v + rva, size);
             } catch (e) { /* header unreadable */ }
         }
-        return 1;
+    }
+    const lastModuleOf = (teb) => u32(u32(u32(teb + 0x30) + 0x0c) + 0x10); // PEB → Ldr → InLoadOrderModuleList.Blink
+    // The attached process: its list's last entry tells, for three reads, that it loaded or unloaded a DLL.
+    function pollNewModules(teb) {
+        let last, mods;
+        try {
+            last = lastModuleOf(teb);
+            if (last === lastModule) return 0;
+            mods = modulesOf(teb);
+        } catch (e) { return 0; }
+        const fresh = mods.filter((m) => !knownModules.has(m.base.v));
+        if (newPhase === 0) {
+            newPhase = 1;
+            prefetchHeaders(fresh);
+            return 2;
+        }
+        newPhase = 0;
+        prefetchExports(fresh);
+        knownModules = new Set(mods.map((m) => m.base.v));
+        lastModule = last;
+        return 0;
+    }
+    // A match across a page boundary, the scan's one hard case: the exe's first, loaded whole before attach.
+    function scanCrossesPage(base) {
+        const at = base.add(0xffc);
+        let bytes;
+        try { bytes = readBytes(at.v, 8); } catch (e) { return true; } // no second page here
+        const pattern = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join(' ');
+        return scanSync(base.add(0xff0), 0x20, pattern).some((r) => r.address.equals(at));
     }
 
     function attach(pid, tid, teb) {
@@ -899,13 +944,16 @@
         attachedPid = pid;
         candidate = 0;
         Object.assign(F, { pid, tid, teb });
-        const main = modulesOf(teb)[0];
+        const mods = modulesOf(teb), main = mods[0];
+        knownModules = new Set(mods.map((m) => m.base.v));
+        lastModule = lastModuleOf(teb);
         // self-check of the C scan and pattern parsing on the exe's DOS header
         const ok = ['4d 5a', '4? 5a', '?? 5a 90', '4d 5a : ff ff'].every((p) => {
             const r = scanSync(main.base, 0x40, p);
             return r.length === 1 && r[0].address.equals(main.base);
-        }) && scanSync(main.base, 0x40, '4d 5a 4d').length === 0;
+        }) && scanSync(main.base, 0x40, '4d 5a 4d').length === 0 && scanCrossesPage(main.base);
         console.log('[frida] attach pid ' + pid + ' ' + main.name + ' @ ' + main.base + ' size 0x' + main.size.toString(16) + ', scan self-check ' + (ok ? 'ok' : 'FAILED'));
+        if (!ok) report('scan self-check failed: scripts that scan memory will find nothing');
         for (const h of handles.values()) {
             if (h === SEARCH) { if (searching) runSearch(); continue; }
             try {
