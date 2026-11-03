@@ -163,6 +163,13 @@
       "group": "Display", "restart": true, "experimental": false
     },
     {
+      "name": "animatedCursors",
+      "label": "Animated cursors",
+      "description": "Plays a game's animated mouse cursor frame by frame, as on Windows; off shows its first frame only.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Display", "restart": true, "experimental": false
+    },
+    {
       "name": "audioPeriod",
       "label": "Audio buffer (frames)",
       "description": "Frames per audio callback when the audio worklet is not used, rounded down to a power of two; higher stutters less but lags more.",

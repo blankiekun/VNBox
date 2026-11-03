@@ -45,6 +45,8 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #include <emscripten/em_asm.h>
+#include <emscripten/eventloop.h>
+#include <emscripten/html5.h>
 
 // These page listeners bypass SDL's queue, so processEvents never counts them: stats=1's input/s and motion/s do it here.
 extern "C" EMSCRIPTEN_KEEPALIVE void boxedwineEmscriptenMouseMove(int x, int y) {
@@ -369,11 +371,61 @@ void KNativeInputSDL::updateMouseCaptureTitle(SDL_Window* window) {
     }
 }
 
-void KNativeInputSDL::setCursor(SDL_Cursor* cursor) {
+void KNativeInputSDL::setCursor(SDL_Cursor* cursor, const CursorFramesPtr& frames) {
+    if (frames && frames == guestCursorFrames) {
+        return; // the animated cursor already shown: keep its frame and timer
+    }
     guestCursor = cursor;
+    guestCursorFrames = frames;
+    guestCursorFrame = 0;
     guestCursorVisible = cursor != nullptr;
     SDL_SetCursor(mouseCaptureReleased ? SDL_GetDefaultCursor() : cursor);
     SDL_ShowCursor(mouseCaptureReleased || guestCursorVisible ? SDL_ENABLE : SDL_DISABLE);
+    animateCursor();
+}
+
+// Browsers show only the first frame of a CSS cursor image, so an animated guest cursor (.ani, winex11's
+// XcursorImages with several frames) is played here: one browser timeout per frame swaps the page cursor to
+// the next pre-built frame at that frame's delay. No timer runs unless an animated cursor is the one shown,
+// visible, captured and on a visible page.
+void KNativeInputSDL::animateCursor() {
+#ifdef __EMSCRIPTEN__
+    if (cursorTimer) {
+        emscripten_clear_timeout(cursorTimer);
+        cursorTimer = 0;
+    }
+    if (!guestCursorFrames || mouseCaptureReleased || !guestCursorVisible) {
+        return;
+    }
+    if (!visibilityHooked) {
+        visibilityHooked = true;
+        emscripten_set_visibilitychange_callback(this, false, [](int, const EmscriptenVisibilityChangeEvent* e, void* data) -> EM_BOOL {
+            KNativeInputSDL* input = (KNativeInputSDL*)data;
+            input->pageHidden = e->hidden != 0;
+            input->animateCursor();
+            return EM_FALSE;
+        });
+        EmscriptenVisibilityChangeEvent status;
+        if (emscripten_get_visibility_status(&status) == EMSCRIPTEN_RESULT_SUCCESS) {
+            pageHidden = status.hidden != 0;
+        }
+    }
+    if (pageHidden) {
+        return;
+    }
+    const CursorFrame& shown = (*guestCursorFrames)[guestCursorFrame];
+    cursorTimer = emscripten_set_timeout([](void* data) {
+        KNativeInputSDL* input = (KNativeInputSDL*)data;
+        input->cursorTimer = 0;
+        if (!input->guestCursorFrames) {
+            return;
+        }
+        input->guestCursorFrame = (input->guestCursorFrame + 1) % input->guestCursorFrames->size();
+        input->guestCursor = (*input->guestCursorFrames)[input->guestCursorFrame].cursor;
+        SDL_SetCursor(input->guestCursor);
+        input->animateCursor();
+    }, shown.delayMs, this);
+#endif
 }
 
 void KNativeInputSDL::setMouseCaptureReleased(bool released) {
@@ -406,6 +458,7 @@ void KNativeInputSDL::setMouseCaptureReleased(bool released) {
         }
         SDL_SetCursor(SDL_GetDefaultCursor());
         SDL_ShowCursor(SDL_ENABLE);
+        animateCursor(); // stops it: the page arrow shows while released
     } else {
         const bool restorePosition = !hostUiMouseReleased;
         hostUiMouseReleased = false;
@@ -413,6 +466,7 @@ void KNativeInputSDL::setMouseCaptureReleased(bool released) {
         SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, focusClickthroughBeforeRelease ? "1" : "0");
         SDL_SetCursor(guestCursor);
         SDL_ShowCursor(guestCursorVisible ? SDL_ENABLE : SDL_DISABLE);
+        animateCursor();
         // A released game returns to its virtual position. An ordinary desktop
         // app follows the pointer back from the host UI, without jumping it.
         if (restorePosition) {
