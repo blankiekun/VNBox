@@ -497,8 +497,8 @@
         // ?jit-record=true switches the WASM JIT into relocatable codegen so
         // compiled blocks can be exported with the Save JIT Cache button. Off
         // by default because relocatable blocks give up the embedded-pointer
-        // dispatch fast paths (~12% throughput). Replay (a server cache zip
-        // being present) activates the same mode implicitly.
+        // dispatch fast paths (~12% throughput). A server cache zip is looked
+        // for only then: without this parameter no zip is fetched or replayed.
         function getJitRecord() {
             var record = getParameter("jit-record");
             if(!allowParameterOverride()){
@@ -1386,8 +1386,12 @@
             }
 
             // preRun executes after the WASM exports have been installed. Only
-            // JIT builds export this persistence latch and can use the cache.
-            if (typeof Module._wasm_jit_set_persistence_active === 'function') {
+            // JIT builds export this persistence latch and can use the cache,
+            // and only a recording (?jit-record=true) opens it: a plain start
+            // needs no IndexedDB, no zip fetch and nothing to wait for, and the
+            // EM_JS cache code is not reached without persistence mode.
+            if (Config.recordJITCache === true &&
+                    typeof Module._wasm_jit_set_persistence_active === 'function') {
                 // Create /tmp-jit-modules so the JIT cache import path is valid.
                 try { FS.mkdir('/tmp-jit-modules'); } catch(e) {}
 
