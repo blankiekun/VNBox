@@ -6,9 +6,10 @@
 # kernel headers (6.8) lack it, so it never uses ntsync. With the header, both still fall back to
 # wineserver waits when /dev/ntsync can't be opened, as now.
 # Same source, patches (tools/buildWine/wine_builds.json's 11.0 patches), compiler and flags as the
-# root fs. With NTSYNC=0 (no header), both files are byte-identical to the root fs's (v0.1.3).
+# root fs, plus vn/wine/ntdll-*.patch (cheaper yields, sleeps and timed-out waits).
+# With NTSYNC=0 (no header) and NTDLL_PATCHES=0, both files are byte-identical to the root fs's (v0.1.3).
 # Wine is LGPL-2.1: build-jp-overlay.sh ships the source notes. Needs Docker.
-# Usage: vn/build-wine-ntsync.sh <out dir>  (writes ntdll.so, wineserver and patches/, the patches applied)
+# Usage: vn/build-wine-ntsync.sh <out dir>  (writes ntdll.so, wineserver and patches/, the root fs patches applied)
 set -euo pipefail
 out=$(realpath -m "$1")
 here=$(cd "$(dirname "$0")" && pwd)
@@ -47,6 +48,12 @@ for op in ops:
     n += 1
     shutil.copy(f"{src}/patches/{op['apply_patch']}", f"{dst}/{n:03d}-{op['apply_patch']}")
 PY
+# vn/wine/ntdll-*.patch go after the root fs patches; build-jp-overlay.sh ships them from vn/wine/, so they
+# stay out of the patches/ copied to $out (= the root fs list).
+mkdir -p "$work/vnbox"
+if [ "${NTDLL_PATCHES:-1}" != 0 ]; then
+  for p in "$here"/wine/ntdll-*.patch; do cp "$p" "$work/vnbox/900-$(basename "$p")"; done
+fi
 mkdir -p "$out"
 docker run --rm -v "$work:/w" -v "$out:/out" -e HOST_UID="$(id -u)" ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c bash -euo pipefail -c '
   # libc6-dev:i386 as in build_wine.py: wineserver links its libc_nonshared.a (CET-built atexit).
@@ -55,7 +62,7 @@ docker run --rm -v "$work:/w" -v "$out:/out" -e HOST_UID="$(id -u)" ubuntu:24.04
   gcc -v 2>&1 | grep -q "13.3.0-6ubuntu2~24.04.1" || echo "warning: GCC differs from the root fs build (13.3.0-6ubuntu2~24.04.1)" >&2
   [ ! -f /w/ntsync.h ] || install -m 644 /w/ntsync.h /usr/include/linux/ntsync.h
   cd /tmp && tar xf /w/wine.tar.xz && cd wine-11.0
-  for p in /w/patches/*.patch; do patch -p1 -s --no-backup-if-mismatch < "$p"; done
+  for p in /w/patches/*.patch /w/vnbox/*.patch; do [ ! -f "$p" ] || patch -p1 -s --no-backup-if-mismatch < "$p"; done
   CC="gcc -m32" CXX="g++ -m32" CFLAGS="-DNDEBUG -O2 -msse2 -march=pentium4 -mfpmath=sse" \
     LD="ld -m elf_i386" TARGETFLAGS="-m32" LDFLAGS="-s" \
     ./configure --without-mingw --disable-tests --prefix=/opt/wine --without-x --without-freetype \
