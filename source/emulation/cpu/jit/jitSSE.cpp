@@ -1000,19 +1000,22 @@ void JitSSE::dynamic_fxsave(DecodedOp* op) {
         write(JitWidth::b32, output(28), (U32)0xffff);
         value = nullptr;
 
-        top = readCPU(JitWidth::b32, offsetof(CPU, fpu.top));
-        andValue(JitWidth::b32, top, 7);
-        shlValue(JitWidth::b32, top, 4);
+        // Physical register i is ST((i - top) & 7) and slot n holds ST(n): "slot" = ((i - top) & 7) * 16
+        RegPtr slot = readCPU(JitWidth::b32, offsetof(CPU, fpu.top));
+        xorValue(JitWidth::b32, slot, 7); // i = 0: (-top) & 7 = (~top + 1) & 7
+        addValue(JitWidth::b32, slot, 1);
+        shlValue(JitWidth::b32, slot, 4);
+        andValue(JitWidth::b32, slot, 0x70);
         for (U32 i = 0; i < 8; i++) {
             U32 regOffset = offsetof(CPU, fpu.regs) + i * sizeof(extFloat80_t);
             value = readCPU(JitWidth::b64, regOffset + offsetof(extFloat80_t, signif));
-            write(JitWidth::b64, createMemPtr(hostBase, top, 0, 32, false), value);
+            write(JitWidth::b64, createMemPtr(hostBase, slot, 0, 32, false), value);
             value = readCPU(JitWidth::b16, regOffset + offsetof(extFloat80_t, signExp), value);
-            write(JitWidth::b16, createMemPtr(hostBase, top, 0, 40, false), value);
-            subValue(JitWidth::b32, top, 16);
-            andValue(JitWidth::b32, top, 0x70);
+            write(JitWidth::b16, createMemPtr(hostBase, slot, 0, 40, false), value);
+            addValue(JitWidth::b32, slot, 16);
+            andValue(JitWidth::b32, slot, 0x70);
         }
-        top = nullptr;
+        slot = nullptr;
         value = nullptr;
 
         for (U32 i = 0; i < 8; i++) {
@@ -1076,19 +1079,22 @@ void JitSSE::dynamic_fxrstor(DecodedOp* op) {
         restoreFPURounding();
         updateSseDivExceptionState();
 
-        RegPtr top = readCPU(JitWidth::b32, offsetof(CPU, fpu.top));
-        andValue(JitWidth::b32, top, 7);
-        shlValue(JitWidth::b32, top, 4);
+        // Same slots as dynamic_fxsave: physical register i comes from slot (i - top) & 7
+        RegPtr slot = readCPU(JitWidth::b32, offsetof(CPU, fpu.top));
+        xorValue(JitWidth::b32, slot, 7);
+        addValue(JitWidth::b32, slot, 1);
+        shlValue(JitWidth::b32, slot, 4);
+        andValue(JitWidth::b32, slot, 0x70);
         for (U32 i = 0; i < 8; i++) {
             U32 regOffset = offsetof(CPU, fpu.regs) + i * sizeof(extFloat80_t);
-            value = read(JitWidth::b64, createMemPtr(hostBase, top, 0, 32, false), value);
+            value = read(JitWidth::b64, createMemPtr(hostBase, slot, 0, 32, false), value);
             writeCPU(JitWidth::b64, regOffset + offsetof(extFloat80_t, signif), value);
-            value = read(JitWidth::b16, createMemPtr(hostBase, top, 0, 40, false), value);
+            value = read(JitWidth::b16, createMemPtr(hostBase, slot, 0, 40, false), value);
             writeCPU(JitWidth::b16, regOffset + offsetof(extFloat80_t, signExp), value);
-            subValue(JitWidth::b32, top, 16);
-            andValue(JitWidth::b32, top, 0x70);
+            addValue(JitWidth::b32, slot, 16);
+            andValue(JitWidth::b32, slot, 0x70);
         }
-        top = nullptr;
+        slot = nullptr;
         value = nullptr;
 
         writeCPUValue(JitWidth::b32, offsetof(CPU, fpu.isRegCached), 0);
