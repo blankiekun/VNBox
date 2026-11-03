@@ -922,6 +922,10 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostLibcStrtol, "Test native libc strtol/strtoul"},
     {testHostClock, "Test native clock reads (QPC, system time)"},
     {testHostLibcMutex, "Test native pthread_mutex_lock/unlock"},
+    {testHostHookPatchedExport, "Test a game's patch on a hooked export runs instead of the hook"},
+    {testHostLibcHead, "Test a hooked export's head op does the call or goes on with the guest function"},
+    {testHostLibcDeclines, "Test native libc leaves DF, segments, code, copy-on-write and unloaded pages to the guest"},
+    {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostAcmBadFile, "Test a corrupt vorbis.acm can't make the host allocate gigabytes"},
