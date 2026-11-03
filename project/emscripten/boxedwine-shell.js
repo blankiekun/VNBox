@@ -2102,6 +2102,11 @@
                 params.push("-env");
                 params.push("WINE_VNBOX_GETMSG_MASKS=0");
             }
+            // cheapAsyncKey=0: win32u reads the queue's shared memory once per check again in GetAsyncKeyState and friends (vn/wine/win32u-async-key.patch)
+            if (vnboxParam("cheapAsyncKey") === "0") {
+                params.push("-env");
+                params.push("WINE_VNBOX_ASYNC_KEY=0");
+            }
             // cheapSpi=0: win32u builds SystemParametersInfo(SPI_GETNONCLIENTMETRICS) again on every call (vn/wine/win32u-spi-cache.patch)
             if (vnboxParam("cheapSpi") === "0") {
                 params.push("-env");
