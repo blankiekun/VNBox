@@ -2413,6 +2413,17 @@ static const FxHardwareImage FX_HW_POP[7] = {
 static const FxHardwareImage FX_HW_MMX = {0x0000, 0xff, {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88}};
 // fxrstor of an image with slot n = V[n], TOP = k, FTW = 0xff (k = 0..7), then fstp ST(0..7) to memory: the same for every k
 static const U8 FX_HW_RESTORED[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
+// the same fxrstor, then movq [mem], mm0..7: MMn is physical register n, so it moves with TOP (low 8 bytes compared)
+static const U8 FX_HW_RESTORED_MMX[8][8] = {
+    {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88},
+    {0x88,0x11,0x22,0x33,0x44,0x55,0x66,0x77},
+    {0x77,0x88,0x11,0x22,0x33,0x44,0x55,0x66},
+    {0x66,0x77,0x88,0x11,0x22,0x33,0x44,0x55},
+    {0x55,0x66,0x77,0x88,0x11,0x22,0x33,0x44},
+    {0x44,0x55,0x66,0x77,0x88,0x11,0x22,0x33},
+    {0x33,0x44,0x55,0x66,0x77,0x88,0x11,0x22},
+    {0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x11},
+};
 
 constexpr U32 FX_DATA = MEM_BASE + 0x5000; // V[n] at FX_DATA + n * 16
 constexpr U32 FX_SINK = MEM_BASE + 0x5100; // fstp destination, 16 bytes apart
@@ -2431,37 +2442,62 @@ static void emitFxFninitLoad(U32 count) {
     }
 }
 
-static void verifyFxBytes(U32 address, const U8* expected, U32 count, const char* name, U32 k, U32 n) {
-    for (U32 i = 0; i < count; i++) {
-        U8 actual = memory->readb(address + i);
-        if (actual != expected[i]) {
-            failed("%s k=%u: slot/ST %u byte %u expected %02x got %02x", name, k, n, i, expected[i], actual);
-            return;
+// Call after newInstruction(): it wipes guest memory.
+static void writeFxValues() {
+    U32 data = cpu->seg[DS].address + FX_DATA;
+    for (U32 i = 0; i < 8; i++) {
+        for (U32 b = 0; b < 10; b++) {
+            memory->writeb(data + i * 16 + b, FX_VALUES[i][b]);
         }
     }
 }
 
-static void verifyFxHardwareImage(const FxHardwareImage& e, U32 slotBytes, const char* name, U32 k) {
+// expected[n] names the value at address + n * 16 by its first byte; a failure prints the first bytes of all 8 next to the hardware's.
+static void verifyFxValues(U32 address, const U8* expected, U32 bytes, const char* name, U32 k) {
+    bool same = true;
+    U8 got[8];
+    for (U32 n = 0; n < 8; n++) {
+        got[n] = memory->readb(address + n * 16);
+        for (U32 b = 0; b < bytes; b++) {
+            same = same && memory->readb(address + n * 16 + b) == FX_VALUES[expected[n] / 0x11 - 1][b];
+        }
+    }
+    if (!same) {
+        failed("%s k=%u: slots %02x %02x %02x %02x %02x %02x %02x %02x, hardware has %02x %02x %02x %02x %02x %02x %02x %02x (%u bytes each)", name, k,
+            got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7],
+            expected[0], expected[1], expected[2], expected[3], expected[4], expected[5], expected[6], expected[7], bytes);
+    }
+}
+
+static void verifyFxHardwareImage(const FxHardwareImage& e, U32 bytes, const char* name, U32 k) {
     U32 area = cpu->seg[DS].address + FX_AREA;
     if (memory->readw(area + 2) != e.fsw || memory->readb(area + 4) != e.ftw) {
         failed("%s k=%u: FSW %04x FTW %02x, hardware has %04x %02x", name, k, memory->readw(area + 2), memory->readb(area + 4), e.fsw, e.ftw);
     }
+    verifyFxValues(area + 32, e.slots, bytes, name, k);
+}
+
+static void writeFxRestoreImage(U32 top) {
+    U32 area = cpu->seg[DS].address + FX_AREA;
+    memory->memset(area, 0, 512);
+    memory->writew(area, 0x037f);
+    memory->writew(area + 2, (U16)(top << 11));
+    memory->writeb(area + 4, 0xff);
+    memory->writed(area + 24, 0x1f80);
+    memory->writed(area + 28, 0xffff);
     for (U32 n = 0; n < 8; n++) {
-        verifyFxBytes(area + 32 + n * 16, FX_VALUES[e.slots[n] / 0x11 - 1], slotBytes, name, k, n);
+        for (U32 b = 0; b < 10; b++) {
+            memory->writeb(area + 32 + n * 16 + b, FX_VALUES[n][b]);
+        }
     }
 }
 
 static void runFxHardwareSlotOrder() {
     for (U32 cheap = 0; cheap < 2; cheap++) {
         g_cheapFxsave = (int)cheap;
-        U32 data = cpu->seg[DS].address + FX_DATA;
-        for (U32 i = 0; i < 8; i++) {
-            for (U32 b = 0; b < 10; b++) {
-                memory->writeb(data + i * 16 + b, FX_VALUES[i][b]);
-            }
-        }
         for (U32 k = 0; k < 8; k++) {
             newInstruction(0);
+            writeFxValues();
             emitFxFninitLoad(8);
             for (U32 i = 0; i < k; i++) {
                 pushCode8(0xd9); pushCode8(0xf7); // fincstp
@@ -2472,6 +2508,7 @@ static void runFxHardwareSlotOrder() {
         }
         for (U32 k = 1; k < 8; k++) {
             newInstruction(0);
+            writeFxValues();
             emitFxFninitLoad(8);
             for (U32 i = 0; i < k; i++) {
                 emitFxModrm(0xdb, 0x3d, FX_SINK); // fstp tbyte
@@ -2481,6 +2518,7 @@ static void runFxHardwareSlotOrder() {
             verifyFxHardwareImage(FX_HW_POP[k - 1], 10, "fxsave after fstp", k);
         }
         newInstruction(0);
+        writeFxValues();
         emitFxFninitLoad(3);
         for (U32 i = 0; i < 8; i++) {
             pushCode8(0x0f);
@@ -2491,28 +2529,27 @@ static void runFxHardwareSlotOrder() {
         runTestCPU();
         verifyFxHardwareImage(FX_HW_MMX, 8, "fxsave in MMX mode", 0);
         for (U32 k = 0; k < 8; k++) {
-            U32 area = cpu->seg[DS].address + FX_AREA;
-            memory->memset(area, 0, 512);
-            memory->writew(area, 0x037f);
-            memory->writew(area + 2, (U16)(k << 11));
-            memory->writeb(area + 4, 0xff);
-            memory->writed(area + 24, 0x1f80);
-            memory->writed(area + 28, 0xffff);
-            for (U32 n = 0; n < 8; n++) {
-                for (U32 b = 0; b < 10; b++) {
-                    memory->writeb(area + 32 + n * 16 + b, FX_VALUES[n][b]);
-                }
-            }
             newInstruction(0);
+            writeFxRestoreImage(k);
             pushCode8(0xdb); pushCode8(0xe3); // fninit
             emitFxrstor(FX_AREA);
             for (U32 n = 0; n < 8; n++) {
                 emitFxModrm(0xdb, 0x3d, FX_SINK + n * 16); // fstp tbyte: ST(0), then the next one
             }
             runTestCPU();
+            verifyFxValues(cpu->seg[DS].address + FX_SINK, FX_HW_RESTORED, 10, "fxrstor then fstp", k);
+
+            newInstruction(0);
+            writeFxRestoreImage(k);
+            pushCode8(0xdb); pushCode8(0xe3); // fninit
+            emitFxrstor(FX_AREA);
             for (U32 n = 0; n < 8; n++) {
-                verifyFxBytes(cpu->seg[DS].address + FX_SINK + n * 16, FX_VALUES[FX_HW_RESTORED[n] / 0x11 - 1], 10, "fxrstor then fstp", k, n);
+                pushCode8(0x0f);
+                emitFxModrm(0x7f, (U8)(0x05 | (n << 3)), FX_SINK + n * 16); // movq [sink], mm<n>
             }
+            pushCode8(0x0f); pushCode8(0x77); // emms
+            runTestCPU();
+            verifyFxValues(cpu->seg[DS].address + FX_SINK, FX_HW_RESTORED_MMX[k], 8, "fxrstor then movq mm", k);
         }
     }
     g_cheapFxsave = 1;
