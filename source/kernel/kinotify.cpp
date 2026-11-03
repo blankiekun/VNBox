@@ -65,6 +65,9 @@ U32 KInotifyObject::create(KThread* thread, U32 flags) {
 
     std::shared_ptr<KInotifyObject> object = std::make_shared<KInotifyObject>();
     KFileDescriptorPtr fd = thread->process->allocFileDescriptor(object, K_O_RDONLY, 0, -1, 0);
+    if (!fd) {
+        return -K_EMFILE;
+    }
     if (flags & K_O_CLOEXEC) {
         fd->descriptorFlags |= FD_CLOEXEC;
     }

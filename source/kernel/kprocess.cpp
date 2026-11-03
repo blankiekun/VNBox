@@ -983,15 +983,29 @@ U32 KProcess::getNextFileDescriptorHandle(int after) {
             return i;
         }
     }
-    kpanic_fmt("KProcess::getNextFileDescriptorHandle %s ran out of file handles", name.c_str());
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        kwarn_fmt("KProcess::getNextFileDescriptorHandle %s ran out of file handles", name.c_str());
+    }
     return -1;
 }
 
+// O(1) until the table really is full, so it can sit on open's path.
+bool KProcess::isFileDescriptorTableFull() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(fdsMutex);
+    return this->fds.size() >= MAX_NUMBER_OF_FILES && (S32)this->getNextFileDescriptorHandle(0) < 0;
+}
+
+// handle < 0 takes the next free number and gives nullptr when there is none: the caller returns -K_EMFILE.
 KFileDescriptorPtr KProcess::allocFileDescriptor(const std::shared_ptr<KObject>& kobject, U32 accessFlags, U32 descriptorFlags, S32 handle, U32 afterHandle) {    
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(fdsMutex);
 
     if (handle<0) {
         handle = this->getNextFileDescriptorHandle(afterHandle);
+        if (handle < 0) {
+            return nullptr;
+        }
     }
     KFileDescriptorPtr result = std::make_shared<KFileDescriptor>(shared_from_this(), kobject, accessFlags, descriptorFlags, handle);
     
@@ -1018,6 +1032,10 @@ U32 translateOpenError() {
 U32 KProcess::openFileDescriptor(BString currentDirectory, BString localPath, U32 accessFlags, U32 descriptorFlags, S32 handle, U32 afterHandle, KFileDescriptorPtr& result, U32 mode) {
     std::shared_ptr<FsNode> node;
     std::shared_ptr<KObject> kobject;
+    // Linux takes the number first: a full table must not create or truncate the file
+    if (handle < 0 && this->isFileDescriptorTableFull()) {
+        return -K_EMFILE;
+    }
     BString fullPath = Fs::getFullPath(currentDirectory, localPath);
     bool trailingSlashRequiresDirectory = fullPath.length() > 1 && fullPath.endsWith("/");
     bool createdNode = false;
@@ -1092,6 +1110,9 @@ U32 KProcess::openFileDescriptor(BString currentDirectory, BString localPath, U3
         node->setMode(mode);
     }
     result = this->allocFileDescriptor(kobject, accessFlags, descriptorFlags, handle, afterHandle);
+    if (!result) {
+        return -K_EMFILE;
+    }
     if (createdNode) {
         KInotifyObject::notifyPath(node->path, K_IN_CREATE);
     }
@@ -1617,7 +1638,11 @@ U32 KProcess::dup(U32 fildes) {
     if (!fd) {
         return -K_EBADF;
     }
-    return this->allocFileDescriptor(fd->kobject, fd->accessFlags, 0, -1, 0)->handle; // do not copy file descriptor flags
+    KFileDescriptorPtr result = this->allocFileDescriptor(fd->kobject, fd->accessFlags, 0, -1, 0); // do not copy file descriptor flags
+    if (!result) {
+        return -K_EMFILE;
+    }
+    return result->handle;
 }
 
 U32 KProcess::rmdir(BString path) {
@@ -2834,7 +2859,11 @@ U32 KProcess::memfd_create(BString name, U32 flags) {
     if (!(flags & 2)) { // MFD_ALLOW_SEALING	
         openNode->addSeals(K_F_SEAL_SEAL);
     }
-    return this->allocFileDescriptor(kobject, K_O_RDWR, descriptorFlags, -1, 0)->handle;
+    KFileDescriptorPtr result = this->allocFileDescriptor(kobject, K_O_RDWR, descriptorFlags, -1, 0);
+    if (!result) {
+        return -K_EMFILE;
+    }
+    return result->handle;
 }
 
 U32 KProcess::prctl(U32 option, U32 arg2) {
@@ -3001,10 +3030,16 @@ U32 KProcess::fcntrl(KThread* thread, FD fildes, U32 cmd, U32 arg) {
             return 0;
         case K_F_DUPFD: {
             KFileDescriptorPtr result = this->allocFileDescriptor(fd->kobject, fd->accessFlags, fd->descriptorFlags, -1, arg);        
+            if (!result) {
+                return -K_EMFILE;
+            }
             return result->handle;
         }
         case K_F_DUPFD_CLOEXEC: {
             KFileDescriptorPtr result = this->allocFileDescriptor(fd->kobject, fd->accessFlags, fd->descriptorFlags, -1, arg);
+            if (!result) {
+                return -K_EMFILE;
+            }
             result->descriptorFlags=FD_CLOEXEC;
             return result->handle;
         }
@@ -3129,6 +3164,9 @@ U32 KProcess::set_thread_area(KThread* thread, U32 info) {
 U32 KProcess::epollcreate(U32 size, U32 flags) {
     std::shared_ptr<KObject> o = std::make_shared<KEPoll>();
     KFileDescriptorPtr result = this->allocFileDescriptor(o, K_O_RDWR, flags, -1, 0);
+    if (!result) {
+        return -K_EMFILE;
+    }
     return result->handle;
 }
 
@@ -3614,6 +3652,9 @@ U32 KProcess::timerfd_create(U32 clockid, U32 flags) {
     std::shared_ptr<KTimer> o = std::make_shared<KTimer>();
     KFileDescriptorPtr fd = allocFileDescriptor(o, K_O_RDONLY, 0, -1, 0);
 
+    if (!fd) {
+        return -K_EMFILE;
+    }
     if (flags & K_O_CLOEXEC) {
         fd->descriptorFlags |= FD_CLOEXEC;
     }

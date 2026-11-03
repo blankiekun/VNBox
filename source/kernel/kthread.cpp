@@ -384,6 +384,21 @@ void freeFutex(struct futex* f) {
     f->address = 0;
 }
 
+#ifndef BOXEDWINE_MULTI_THREADED
+// A signal handler is about to run on this thread. Like Linux, a wait not yet woken leaves the queue, so a wake during
+// the handler goes to the next waiter; the rerun compares the value and queues again, with a relative timeout in full.
+static void leaveFutexQueue(KThread* thread) {
+    SystemFutexesLock futexesLock;
+
+    for (auto& entry : systemFutexes) {
+        struct futex* f = entry.get();
+        if (f->thread == thread && !f->wake) {
+            freeFutex(f);
+        }
+    }
+}
+#endif
+
 void KThread::clearFutexes() {
     SystemFutexesLock futexesLock;
 
@@ -1501,6 +1516,9 @@ void KThread::runSignal(U32 signal, U32 trapNo, U32 errorNo) {
                 interrupted = 1;
             this->waitingCond->signalAll(); // this will make sure it gets cleaned up properly
         }		
+        // not only when waitingCond is set: a wait whose timer just woke it hasn't left its queues yet
+        ntsyncSignalDelivered(this);
+        leaveFutexQueue(this);
 #endif
         // move to front of the queue
 #ifndef BOXEDWINE_MULTI_THREADED

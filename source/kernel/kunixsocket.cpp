@@ -952,6 +952,10 @@ U32 KUnixSocketObject::recvmsg(KThread* thread, const KFileDescriptorPtr& fd, U3
 
         for (;i<hdr.msg_controllen/16 && i<msg->objects.size();i++) {
             KFileDescriptorPtr recvFd = thread->process->allocFileDescriptor(msg->objects[i].object, msg->objects[i].accessFlags, 0, -1, 0);
+            if (!recvFd) { // Linux: the data still arrives, the fds that don't fit are dropped
+                memory->writed(address + 24, K_MSG_CTRUNC); // msg_flags
+                break;
+            }
             writeCMsgHdr(thread, hdr.msg_control + i * 16, 16, K_SOL_SOCKET, K_SCM_RIGHTS);
             memory->writed(hdr.msg_control + i * 16 + 12, recvFd->handle);
         }
