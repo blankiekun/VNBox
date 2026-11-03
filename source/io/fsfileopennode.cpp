@@ -184,8 +184,11 @@ bool FsFileOpenNode::canMap() {
 
 U32 FsFileOpenNode::readNative(U8* buffer, U32 len) {
     if (this->readAheadOn) {
-        return (U32)this->readAhead.read(buffer, len, this->pos, this->fileNode->getFileIdentity()->dataGeneration,
+        int64_t position = this->pos; // S64 is long long, int64_t is long on 64-bit Linux
+        S32 result = this->readAhead.read(buffer, len, position, this->fileNode->getFileIdentity()->dataGeneration,
             [this](U8* dst, S64 offset, U32 n) { return this->readAt(dst, offset, n); });
+        this->pos = position;
+        return (U32)result;
     }
     return (U32)::read(this->handle, buffer, len);
 }
