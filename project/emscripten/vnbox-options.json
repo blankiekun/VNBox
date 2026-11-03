@@ -25,6 +25,34 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeDibdrv",
+      "label": "Native GDI drawing",
+      "description": "Runs Wine's per-pixel GDI drawing into bitmaps (text, fills, blits, blends) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "cheapGetMessage",
+      "label": "Cheap message retrieval",
+      "description": "GetMessage asks Wine's server only for the message itself, not twice more to reset and re-read its queue state.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeClock",
+      "label": "Native clock reads",
+      "description": "Reads QueryPerformanceCounter, timeGetTime and the system time as browser code instead of an emulated system call.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeFreetype",
+      "label": "Native FreeType",
+      "description": "Loads and draws Windows text glyphs (GDI fonts) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "hotGroup",
       "label": "Hot code groups",
       "description": "Compiles code that runs hot together into one module, so it runs faster.",
