@@ -232,6 +232,12 @@
                         FSFS.queuePersist(mounted.mount);
                         return node;
                     };
+                    mounted.node_ops.setattr = function(node, attr) {
+                        if (attr.size !== undefined) {
+                            FSFS.queuePersist(mounted.mount);
+                        }
+                        return memfsNodeOps.setattr(node, attr);
+                    };
                     mounted.node_ops.rmdir = function() {
                         FSFS.queuePersist(mounted.mount);
                         return memfsNodeOps.rmdir.apply(null, arguments);

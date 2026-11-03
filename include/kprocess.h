@@ -293,6 +293,7 @@ public:
     U32 fstatfs64(FD fildes, U32 address);
     U32 statx(FD dirfd, BString path, U32 flags, U32 mask, U32 buf);
     U32 ftruncate64(FD fildes, U64 length);
+    U32 fsync(FD fildes);
     U32 fallocate(FD fildes, U32 mode, S64 offset, S64 length);
     U32 getcwd(U32 buffer, U32 size);
     U32 getdents(FD fildes, U32 dirp, U32 count, bool is64);

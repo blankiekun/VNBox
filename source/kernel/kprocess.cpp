@@ -2156,6 +2156,19 @@ U32 KProcess::ftruncate64(FD fildes, U64 length) {
     return p->setLength(length);
 }
 
+// fsync and fdatasync: anything that isn't a file has nothing to put on disk.
+U32 KProcess::fsync(FD fildes) {
+    KFileDescriptorPtr fd = this->getFileDescriptor(fildes);
+
+    if (fd==nullptr) {
+        return -K_EBADF;
+    }
+    if (fd->kobject->type!=KTYPE_FILE) {
+        return 0;
+    }
+    return std::dynamic_pointer_cast<KFile>(fd->kobject)->openFile->sync();
+}
+
 U32 KProcess::fallocate(FD fildes, U32 mode, S64 offset, S64 length) {
     if (mode) {
         return -K_EOPNOTSUPP;

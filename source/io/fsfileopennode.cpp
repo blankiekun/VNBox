@@ -214,6 +214,15 @@ U32 FsFileOpenNode::writeNative(U8* buffer, U32 len) {
     return result;
 }
 
+// In the browser this waits until IndexedDB committed (fd_sync, libwasi.js), and fails if it didn't.
+U32 FsFileOpenNode::sync() {
+#ifdef BOXEDWINE_MSVC
+    return _commit(this->handle) ? -translateErr(errno) : 0;
+#else
+    return ::fsync(this->handle) ? -translateErr(errno) : 0;
+#endif
+}
+
 U32 FsFileOpenNode::allocate(U64 offset, U64 len) {
 #if defined(__linux__) && !defined(__EMSCRIPTEN__)
     if (offset > (U64)std::numeric_limits<off_t>::max() ||

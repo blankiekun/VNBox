@@ -1150,6 +1150,13 @@
             }
         }
         function initBrowserFilesystem(callback) {
+            lazyPatchIdbfs();
+            let stores = [];
+            if (Config.rootStorageMode == STORAGE_INDEXED_DB || (Config.storageMode == STORAGE_INDEXED_DB && Config.persist_d_drive)) stores.push(ROOT);
+            if (Config.lazyApp.startsWith("opfs:")) stores.push(getLazyAppMount());
+            lazyHoldStores(stores, () => mountBrowserStorage(callback));
+        }
+        function mountBrowserStorage(callback) {
     		console.log("Use Storage mode: "+Config.storageMode);
             console.log("Use Root FS storage mode: "+Config.rootStorageMode);
             FS.mkdirTree(ROOT);

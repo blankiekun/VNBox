@@ -42,6 +42,7 @@ public:
     void waitForEvents(BOXEDWINE_CONDITION& parentCondition, U32 events) override;
     bool isWriteReady() override;
     bool isReadReady() override;
+    U32 sync() override;
     U32 readNative(U8* buffer, U32 len) override;
     U32 writeNative(U8* buffer, U32 len) override;
     U32 allocate(U64 offset, U64 len) override;

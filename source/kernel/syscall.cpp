@@ -1011,8 +1011,9 @@ static U32 syscall_ipc(CPU* cpu, U32 eipCount) {
 }
 
 static U32 syscall_fsync(CPU* cpu, U32 eipCount) {    
-    U32 result = 0;
-    SYS_LOG1(SYSCALL_SYSTEM, cpu, "fsync: fd=%d result=%d(0x%X) IGNORED\n", ARG1, result, result);
+    SYS_LOG1(SYSCALL_SYSTEM, cpu, "fsync: fd=%d", ARG1);
+    U32 result = cpu->thread->process->fsync(ARG1);
+    SYS_LOG(SYSCALL_SYSTEM, cpu, " result=%d(0x%X)\n", result, result);
     return result;
 }
 
@@ -1167,8 +1168,9 @@ static U32 syscall_writev(CPU* cpu, U32 eipCount) {
 }
 
 static U32 syscall_fdatasync(CPU* cpu, U32 eipCount) {    
-    U32 result = 0;
-    SYS_LOG1(SYSCALL_SYSTEM, cpu, "fdatasync: fd=%d result=%d(0x%X) IGNORED\n", ARG1, result, result);
+    SYS_LOG1(SYSCALL_SYSTEM, cpu, "fdatasync: fd=%d", ARG1);
+    U32 result = cpu->thread->process->fsync(ARG1);
+    SYS_LOG(SYSCALL_SYSTEM, cpu, " result=%d(0x%X)\n", result, result);
     return result;
 }
 
