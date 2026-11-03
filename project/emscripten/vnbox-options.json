@@ -156,6 +156,13 @@
       "group": "Display", "restart": true, "experimental": false
     },
     {
+      "name": "disableHideCursor",
+      "label": "Always show mouse pointer",
+      "description": "Shows the browser arrow where the game hides its cursor; off hides it as the game asks.",
+      "type": "bool", "default": false, "urlValues": { "true": "true", "false": "false" },
+      "group": "Display", "restart": true, "experimental": false
+    },
+    {
       "name": "audioPeriod",
       "label": "Audio buffer (frames)",
       "description": "Frames per audio callback when the audio worklet is not used, rounded down to a power of two; higher stutters less but lags more.",
