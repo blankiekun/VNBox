@@ -333,6 +333,168 @@ void testWasmJitInlineCall() {
 
     cpu->nextOp = nullptr;
 }
+
+extern U32 hostLibcTestEip, hostLibcTestFn; // hosthooks.cpp
+U32 hostLibcFnId(const char* name);
+
+// Hosted functions called from compiled code. Catches: a compiled call site that loses the guest's return address or
+// esp, a hosted result that isn't seen by the next instruction in the block (stale register local), a call the host
+// declines that doesn't reach the guest function, a PLT stub or pointer retargeted to guest code still running the host
+// function, a head op replaced by new code still run as hosted, a stub's jmp left out of the instruction count,
+// a host entry running the return site past the slice budget, invalidation freeing the shared host entry as if it
+// were a generated block's table slot, and hostCall off still using the host entry.
+void testWasmJitHostCall() {
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    testNewInstruction(0);
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    cpu->big = 1;
+    Seg savedSegs[7];
+    memcpy(savedSegs, cpu->seg, sizeof(savedSegs));
+    for (int s : { CS, DS, ES, SS }) cpu->seg[s].address = 0; // hosted functions need flat segments
+    const U32 base = TEST_CODE_ADDRESS;
+    const U32 fnF = base + 0x100, fnH = base + 0x140, stub = base + 0x180, fnG = base + 0x1c0;
+    const U32 got = TEST_HEAP_ADDRESS + 0x100, text = TEST_HEAP_ADDRESS + 0x200;
+    const U32 unmapped = TEST_HEAP_ADDRESS + 32 * K_PAGE_SIZE;
+    const U32 stackTop = savedSegs[SS].address + cpu->reg[4].u32;
+    context.memory->unmap(unmapped, K_PAGE_SIZE);
+    context.memory->memset(text, 0, 16);
+    context.memory->memcpy(text, "abc", 3);
+    context.memory->writed(got, fnF);
+    auto code = [&](U32 offset, std::initializer_list<U8> bytes) {
+        context.codeIp = base + offset;
+        for (U8 b : bytes) testPushCode8(b);
+    };
+    auto code32 = [&](U32 value) { for (int i = 0; i < 4; i++) testPushCode8((U8)(value >> (i * 8))); };
+    auto rel = [&](U32 offset, U32 target) { code(offset, {0xe8}); code32(target - (base + offset + 5)); };
+    // Caller, a call by each route: rel32 to the function, rel32 to a PLT stub, by register, by pointer in memory.
+    code(0x00, {0x53}); rel(0x01, fnF); code(0x06, {0x83, 0xc4, 0x04, 0x89, 0xc6}); // push ebx; call F; add esp,4; mov esi,eax
+    code(0x0b, {0x53}); rel(0x0c, stub); code(0x11, {0x83, 0xc4, 0x04, 0x89, 0xc7}); // ...; mov edi,eax
+    code(0x16, {0x53, 0xb9}); code32(fnF); code(0x1c, {0xff, 0xd1, 0x83, 0xc4, 0x04, 0x89, 0xc5}); // mov ecx,F; call ecx; ...; mov ebp,eax
+    code(0x23, {0x53, 0xff, 0x15}); code32(got); code(0x2a, {0x83, 0xc4, 0x04, 0x89, 0xc2, 0xcd, 0x97}); // call [got]; ...; mov edx,eax; int 97
+    // Second caller, compiled before it ever reached the function: push ebx; call H; add esp,4; mov esi,eax; int 97
+    code(0x40, {0x53}); rel(0x41, fnH); code(0x46, {0x83, 0xc4, 0x04, 0x89, 0xc6, 0xcd, 0x97});
+    code(0x100, {0xb8, 0x77, 0x07, 0x00, 0x00, 0xc3}); // F: mov eax,0x777; ret  (guest bodies differ from what strlen returns)
+    code(0x140, {0xb8, 0x88, 0x08, 0x00, 0x00, 0xc3}); // H
+    code(0x180, {0xff, 0x25}); code32(got);            // stub: jmp [got]
+    code(0x1c0, {0xb8, 0x55, 0x05, 0x00, 0x00, 0xc3}); // G
+    const U32 strlenFn = hostLibcFnId("strlen");
+    hostLibcTestEip = fnF;
+    hostLibcTestFn = strlenFn;
+
+    auto runAt = [&](U32 eip, DecodedOp* op) {
+        cpu->eip.u32 = eip;
+        cpu->nextOp = op;
+        cpu->yield = false;
+        cpu->blockInstructionCount = 0;
+        for (U32 i = 0; i < 128 && (!cpu->nextOp || cpu->nextOp->inst != TestEnd); ++i) {
+            contextTimeRemaining = 1000000;
+            cpu->run();
+        }
+        if (!cpu->nextOp || cpu->nextOp->inst != TestEnd) testFail("host call: did not reach the end");
+    };
+    auto runCaller = [&](const char* what, U32 string, U32 esi, U32 edi, U32 ebp, U32 edx) {
+        cpu->reg[3].u32 = string;
+        cpu->reg[4].u32 = stackTop;
+        cpu->reg[0].u32 = cpu->reg[1].u32 = cpu->reg[2].u32 = cpu->reg[5].u32 = cpu->reg[6].u32 = cpu->reg[7].u32 = 0;
+        context.memory->writed(stackTop - 4, 0);
+        runAt(base, cpu->getOp(base, 0));
+        if (cpu->reg[6].u32 != esi || cpu->reg[7].u32 != edi || cpu->reg[5].u32 != ebp || cpu->reg[2].u32 != edx) {
+            testFail("host call, %s: esi=%x edi=%x ebp=%x edx=%x", what, cpu->reg[6].u32, cpu->reg[7].u32, cpu->reg[5].u32, cpu->reg[2].u32);
+        }
+        if (cpu->reg[4].u32 != stackTop) testFail("host call, %s: esp=%x, expected %x", what, cpu->reg[4].u32, stackTop);
+        if (context.memory->readd(stackTop - 4) != string) testFail("host call, %s: the last argument must be on the stack", what);
+        if (context.memory->readd(stackTop - 8) != base + 0x2a) testFail("host call, %s: the return address must be on the stack", what);
+        if (cpu->reg[1].u32 != fnF) testFail("host call, %s: ecx=%x", what, cpu->reg[1].u32);
+        return cpu->blockInstructionCount;
+    };
+
+    // Not compiled: the head op runs from the dispatcher and notes the call sites.
+    if (!cpu->getOp(fnF, 0)->pfnJitCode) testFail("a wrapped export must get the host entry");
+    runCaller("not compiled", text, 3, 3, 3, 3);
+
+    // Compiled: the one block runs all four calls, nothing hops.
+    DecodedOp* caller = cpu->getOp(base, 0);
+    context.memory->removeCodeBlock(base, caller, false); // tests compile on first entry, before it saw any call
+    startNewJIT(cpu, base, caller);
+    caller->runCount = JIT_RUN_COUNT + 1;
+    if (!caller->pfnJitCode || caller->blockOpCount != 18) testFail("the calls must not end the block (%u ops)", caller->blockOpCount);
+    const U32 compiled = runCaller("compiled", text, 3, 3, 3, 3);
+    // What blocks hopping through the same calls count: the block's ops and the stub's jmp.
+    if (compiled != caller->blockOpCount + 1) testFail("host call instructions: %u, expected %u", compiled, caller->blockOpCount + 1);
+
+    // Declined (string in an unmapped page): the guest function runs and returns into the block.
+    runCaller("declined", unmapped, 0x777, 0x777, 0x777, 0x777);
+    // A hosted result right after a declined one: the block reloads what the call changed.
+    runCaller("after declined", text, 3, 3, 3, 3);
+
+    // The pointer the stub and `call [got]` read now holds a guest function.
+    context.memory->writed(got, fnG);
+    cpu->getOp(fnG, 0);
+    runCaller("retargeted", text, 3, 0x555, 3, 0x555);
+    context.memory->writed(got, fnF);
+
+    // Host entry not reached from a call site: the entry runs the call and tail-calls the return site's block.
+    hostLibcTestEip = fnH;
+    cpu->getOp(fnH, 0);
+    DecodedOp* second = cpu->getOp(base + 0x40, 0);
+    wasmJitTestForgetHostCallSites();
+    startNewJIT(cpu, base + 0x40, second);
+    second->runCount = JIT_RUN_COUNT + 1;
+    if (second->blockOpCount != 2) testFail("a call not seen reaching a hosted function must end the block (%u ops)", second->blockOpCount);
+    DecodedOp* returnSite = cpu->getOp(base + 0x46, 0);
+    startNewJIT(cpu, base + 0x46, returnSite);
+    returnSite->runCount = JIT_RUN_COUNT + 1;
+    auto runSecond = [&]() {
+        cpu->reg[3].u32 = text;
+        cpu->reg[4].u32 = stackTop;
+        cpu->reg[6].u32 = 0;
+        runAt(base + 0x40, second);
+        if (cpu->reg[6].u32 != 3 || cpu->reg[4].u32 != stackTop) testFail("host entry: esi=%x esp=%x", cpu->reg[6].u32, cpu->reg[4].u32);
+    };
+    runSecond();
+    // Out of budget at the host entry: the call is done, the return site waits for the next slice.
+    cpu->reg[3].u32 = text;
+    cpu->reg[4].u32 = stackTop - 4;
+    context.memory->writed(stackTop - 4, base + 0x46);
+    context.memory->writed(stackTop, text);
+    cpu->eip.u32 = fnH;
+    cpu->nextOp = cpu->getOp(fnH, 0);
+    cpu->blockInstructionCount = 5;
+    contextTimeRemaining = 5;
+    cpu->run();
+    if (cpu->nextOp != returnSite || cpu->eip.u32 != base + 0x46 || cpu->reg[0].u32 != 3 || cpu->blockInstructionCount != 5) {
+        testFail("host entry out of budget: next %p eip=%x eax=%x count=%u", cpu->nextOp, cpu->eip.u32, cpu->reg[0].u32, cpu->blockInstructionCount);
+    }
+
+    // The shared entry isn't a generated block's slot: clearing it frees nothing, it still runs.
+    clearJitBlock({ cpu->getOp(fnH, 0)->pfnJitCode });
+    runSecond();
+    context.memory->removeCodeBlock(base + 0x40, second, false);
+    context.memory->removeCodeBlock(base + 0x46, returnSite, false);
+
+    // New code over a wrapped export: the compiled call sites run the new code, not the old host function.
+    hostLibcTestEip = 0;
+    context.memory->writeb(fnF + 1, 0x99);
+    runCaller("function replaced", text, 0x799, 0x799, 0x799, 0x799);
+
+    // hostCall off: same results through the dispatcher, no host entry.
+    setenv("BOXEDWINE_WASM_JIT_HOST_CALL", "0", 1);
+    hostLibcTestEip = fnH;
+    context.memory->removeCode(cpu->thread, fnH, 6, false);
+    DecodedOp* offHead = cpu->getOp(fnH, 0);
+    second = cpu->getOp(base + 0x40, 0);
+    if (offHead->pfnJitCode) testFail("hostCall off must not use the host entry");
+    runSecond();
+    unsetenv("BOXEDWINE_WASM_JIT_HOST_CALL");
+
+    hostLibcTestEip = 0;
+    hostLibcTestFn = 0;
+    contextTimeRemaining = savedBudget;
+    cpu->nextOp = nullptr;
+    memcpy(cpu->seg, savedSegs, sizeof(savedSegs));
+}
 #endif
 
 #ifdef BOXEDWINE_MULTI_THREADED

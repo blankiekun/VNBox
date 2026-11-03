@@ -381,6 +381,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testWasmJitStBoundedDispatch, "Test ST WASM JIT instruction budget", TEST_ENTRY_SERIAL},
     {testWasmJitHotGroups, "Test ST WASM JIT hot groups", TEST_ENTRY_SERIAL},
     {testWasmJitInlineCall, "Test ST WASM JIT leaf-call inlining", TEST_ENTRY_SERIAL},
+    {testWasmJitHostCall, "Test ST WASM JIT direct calls to hosted functions", TEST_ENTRY_SERIAL},
     {testWasmJitRuntimeGrouping, "Test WASM JIT runtime grouping"},
     {testWasmJitPendingLifecycle, "Test WASM JIT pending lifecycle"},
     {testWasmJitTinyAnonymousPromotion, "Test WASM JIT tiny anonymous promotion"},

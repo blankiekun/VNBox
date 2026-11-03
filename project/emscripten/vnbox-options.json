@@ -102,6 +102,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "hostCall",
+      "label": "Direct native calls",
+      "description": "Compiled code calls the native functions (string functions, mutexes, text and drawing) and goes on at the return address without stopping in the block dispatcher.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "fastX87",
       "label": "Fast x87 maths",
       "description": "How the JIT keeps x87 floating point state: 1 is faster with the same results, 2 skips checks and may break games.",

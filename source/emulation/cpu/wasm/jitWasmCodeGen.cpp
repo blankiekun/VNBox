@@ -1072,6 +1072,21 @@ static bool wasmJitInlineEnabled() {
 #endif
 }
 
+#ifndef BOXEDWINE_MULTI_THREADED
+void OPCALL wasmHostCallBlock(CPU* cpu, DecodedOp* unused);
+static inline bool wasmJitIsHostCallEntry(void* jitEntry) { return jitEntry == reinterpret_cast<void*>(wasmHostCallBlock); }
+// Return addresses of calls that reached a hosted function (direct-mapped, one store per call): a later compile of the
+// caller calls it from inside the block (emitHostCallSite). A lost or stale entry only changes which code gets emitted.
+#define WASM_JIT_HOST_CALL_SITES 4096
+static U32 g_wasmJitHostCallSites[WASM_JIT_HOST_CALL_SITES];
+static inline U32& wasmJitHostCallSite(U32 returnAddress) {
+    return g_wasmJitHostCallSites[(returnAddress ^ (returnAddress >> 12)) & (WASM_JIT_HOST_CALL_SITES - 1)];
+}
+#ifdef __TEST
+void wasmJitTestForgetHostCallSites() { memset(g_wasmJitHostCallSites, 0, sizeof(g_wasmJitHostCallSites)); }
+#endif
+#endif
+
 // Block chaining reads the next op through the target the exit already holds (emitChainToNextOp).
 // cheapHop=0 turns it off; tests use BOXEDWINE_WASM_JIT_CHEAP_HOP=0.
 static bool jitCheapHopDisabled() {
@@ -4507,6 +4522,62 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
 #endif
 }
 
+#ifndef BOXEDWINE_MULTI_THREADED
+// Hosted functions (hostLibcRun, hosthooks.cpp) called from compiled code. A wrapped export's head op looks like a
+// compiled block: pfn is wasmStartJITOp and pfnJitCode this C++ function's table index (one shared entry, no module).
+// emitChainToNextOp tail-calls it as it does any block, and it tail-calls the block at the return address, so a
+// hosted call doesn't return to the dispatcher and run() twice. The head counts no guest instructions, as hostLibcOp's
+// didn't; the return site's are added as the chain sequence adds them. Must stay in step with emitChainToNextOp.
+// It also notes the return address: once the caller compiles, that call site runs the host function from inside
+// its block (emitHostCallSite, wasmHelper_hostCall) and this entry only sees the calls no compile saw coming.
+// hostCall=0 turns it all off (the head keeps hostLibcOp); tests use BOXEDWINE_WASM_JIT_HOST_CALL=0.
+void OPCALL hostLibcGuest(CPU* cpu, DecodedOp* op); // normalCPU.cpp
+bool hostLibcRun(CPU* cpu, U32 fn); // hosthooks.cpp
+
+void OPCALL wasmHostCallBlock(CPU* cpu, DecodedOp*) {
+    DecodedOpCache& opCache = getMemData(cpu->memory)->opCache;
+    // By eip: a block can hold a head op that was removed (unmapped library), and only eip says what runs now.
+    DecodedOp* head = opCache.get(cpu->getEipAddress());
+    if (!head || !wasmJitIsHostCallEntry(head->pfnJitCode)) {
+        cpu->nextOp = head; // back to the dispatcher, which decodes (or faults) what is at eip now
+        return;
+    }
+    if (!hostLibcRun(cpu, head->imm)) {
+        MUSTTAIL return hostLibcGuest(cpu, head);
+    }
+    const U32 returnAddress = cpu->getEipAddress();
+    wasmJitHostCallSite(returnAddress) = returnAddress;
+    DecodedOp* next = opCache.get(returnAddress);
+    if (!next || ((next->flags2 & OP_FLAG2_DECODED_32BIT) != 0) != cpu->isBig()) {
+        next = cpu->getNextOp();
+    }
+    cpu->nextOp = next;
+    if (next && next->pfn == wasmStartJITOp && next->pfnJitCode && !cpu->yield && !vnboxProfOn &&
+            !wasmJitPersistenceActive() && (S32)cpu->blockInstructionCount < contextTimeRemaining) {
+        cpu->blockInstructionCount += next->blockOpCount;
+        cpu->wasmJitActiveBlock = nullptr;
+        cpu->wasmJitBailout = WASM_JIT_BAILOUT_NONE;
+        MUSTTAIL return reinterpret_cast<OpCallback>(next->pfnJitCode)(cpu, nullptr);
+    }
+}
+
+void wasmHostCallInstall(DecodedOp* head) {
+#if defined(__EMSCRIPTEN__) && !defined(__TEST)
+    static int disabled = -1;
+    if (disabled < 0) {
+        disabled = vnboxUrlIs("hostCall", "0") ? 1 : 0;
+        klog_fmt("[vnbox] direct host calls from compiled code %s", disabled ? "off (hostCall=0)" : "on");
+    }
+#else
+    const char* value = std::getenv("BOXEDWINE_WASM_JIT_HOST_CALL");
+    const bool disabled = value && strcmp(value, "0") == 0;
+#endif
+    if (disabled) return;
+    head->pfn = wasmStartJITOp;
+    head->pfnJitCode = reinterpret_cast<void*>(wasmHostCallBlock);
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // C++ helpers imported by generated WASM modules
 // ---------------------------------------------------------------------------
@@ -4895,6 +4966,21 @@ static void wasmHelper_hotBlock(CPU* cpu, U32 eip) {
 }
 #endif
 
+#ifndef BOXEDWINE_MULTI_THREADED
+// A compiled call site (emitHostCallSite), return address already pushed: runs the hosted function at `target`.
+// memHelperValue 0 (not hosted now, or it declined; nothing changed) sends the block on through jumpEip.
+static void wasmHelper_hostCall(CPU* cpu, U32 target) {
+    cpu->eip.u32 = target; // what the function's fault or the head op would see
+    DecodedOp* head = getMemData(cpu->memory)->opCache.get(cpu->getEipAddress());
+    if (head && wasmJitIsHostCallEntry(head->pfnJitCode) && hostLibcRun(cpu, head->imm)) {
+        cpu->memHelperValue = 1;
+        checkActiveBlockAfterWrite(cpu);
+    } else {
+        cpu->memHelperValue = 0;
+    }
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Helper table: array of C++ function pointers exported to WASM modules.
 // Order must match WasmHelperIdx below.
@@ -4976,6 +5062,7 @@ static const void* g_wasmHelperTable[] = {
     (void*)scasd32rPrefix,
 #ifndef BOXEDWINE_MULTI_THREADED
     (void*)wasmHelper_hotBlock,
+    (void*)wasmHelper_hostCall,
 #endif
 };
 static constexpr int WASM_HELPER_COUNT = (int)(sizeof(g_wasmHelperTable) / sizeof(g_wasmHelperTable[0]));
@@ -15099,6 +15186,11 @@ bool JitWasmCodeGen::analyzeInlineCallee(U32 eip, DecodedOp* op, InlineCallee& c
 bool JitWasmCodeGen::canInlineCall(U32 eip, DecodedOp* op) {
     if (m_inlineCalls.count(eip)) return true;
     InlineCallee callee;
+    if (isHostCallSite(eip, op)) {
+        callee.hostCall = true;
+        m_inlineCalls.emplace(eip, std::move(callee));
+        return true;
+    }
     if (!analyzeInlineCallee(eip, op, callee)) return false;
     m_inlineCalls.emplace(eip, std::move(callee));
     return true;
@@ -15144,6 +15236,9 @@ bool JitWasmCodeGen::emitInlinedCall(DecodedOp* op) {
         return false;
     }
     InlineCallee& callee = found->second;
+    if (callee.hostCall) {
+        return false;
+    }
     const U32 callEip = this->currentEip;
     const U32 returnEip = callEip + op->len;
     // The callee must not be part of this block (its analyses key on eip).
@@ -15241,6 +15336,133 @@ bool JitWasmCodeGen::emitInlinedCall(DecodedOp* op) {
         jumpEip(next);
     }
     return true;
+}
+
+// A call that reached a hosted function when it last ran (wasmJitHostCallSite), through any route: rel32, a PLT stub or
+// a pointer. See wasmHostCallBlock. The block doesn't end here.
+bool JitWasmCodeGen::isHostCallSite(U32 eip, DecodedOp* op) {
+#ifdef BOXEDWINE_MULTI_THREADED
+    (void)eip; (void)op;
+    return false;
+#else
+    if ((op->inst != CallJd && op->inst != CallE32 && op->inst != CallR32) || !cpu->big ||
+            m_inlineCalls.size() >= WASM_JIT_INLINE_MAX_SITES || wasmJitPersistenceActive() || wasmJitRecordActive() || vnboxProfOn) {
+        return false;
+    }
+    const U32 returnAddress = eip + op->len;
+    return wasmJitHostCallSite(returnAddress) == returnAddress;
+#endif
+}
+
+// The call site: push the return address, find the target (one `jmp [mem]` PLT stub is read here), and have the helper
+// run the hosted function at it. Then the block goes on with the next instruction, and nothing was hopped to. The
+// target is only known at run time, so nothing depends on what is mapped: a target that isn't hosted now, or a call the
+// host function declines, leaves through jumpEip like any call and reaches the guest function.
+bool JitWasmCodeGen::emitHostCallSite(DecodedOp* op) {
+#ifdef BOXEDWINE_MULTI_THREADED
+    (void)op;
+    return false;
+#else
+    auto found = m_inlineCalls.find(this->currentEip);
+    if (found == m_inlineCalls.end() || !found->second.hostCall || m_inlineDepth || keptRegisterUsage() || m_preserveCpuRegisterState) {
+        return false;
+    }
+    const U32 callEip = this->currentEip;
+    const U32 returnEip = callEip + op->len;
+    const U32 csBase = cpu->seg[CS].address;
+    m_forwardedResultConsumer = nullptr;
+    m_forwardedResultEndEip = 0;
+    m_publishedLazyFlagType = FLAGS_NULL;
+    m_readGroupActive = false;
+    flushFpuCache();
+
+    RegPtr target;
+    RegPtr returnAddress = getTmpReg();
+    movValue(JitWidth::b32, returnAddress, returnEip - csBase);
+    if (op->inst == CallE32) {
+        target = read(JitWidth::b32, calculateEaa(op)); // before the push, esp may be in the address
+        push32(returnAddress);
+    } else if (op->inst == CallR32) {
+        target = getTmpReg();
+        mov(JitWidth::b32, target, getReadOnlyReg(op->reg));
+        push32(returnAddress);
+    } else {
+        push32(returnAddress);
+        returnAddress = nullptr;
+        const U32 callee = callEip + op->len + (S32)op->imm;
+        DecodedOp* stub = cpu->memory->getDecodedOp(callee);
+        // The block's analyses key on eip: a stub overlapping this block's code isn't read here.
+        const bool readStub = stub && stub->inst == JmpE32 && !(stub->flags & OP_FLAG_NO_JIT) && !stub->lock &&
+            !(callee <= this->lastOpEip + 15 && this->startingEip < callee + stub->len);
+        if (readStub) {
+            m_inlinedRanges.push_back({callee, callee + stub->len}); // a changed stub invalidates this block
+            m_inlineDepth++;
+            this->currentEip = callee; // a fault in the read is the stub's
+            preCompileInlined(stub);
+            target = read(JitWidth::b32, calculateEaa(stub));
+            m_inlineDepth--;
+            this->currentEip = callEip;
+            currentOp = op;
+            m_currentWasmOp = op;
+            lastCompiledOpLen = op->len;
+            // The dispatcher counts the caller's ops (blockOpCount); the stub's jmp is counted here.
+            m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+            m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+            m_emitter.emitI32Load((U32)offsetof(CPU, blockInstructionCount));
+            m_emitter.emitI32Const(1);
+            m_emitter.emitOp(WASM_I32_ADD);
+            m_emitter.emitI32Store((U32)offsetof(CPU, blockInstructionCount));
+        } else {
+            target = getTmpReg();
+            movValue(JitWidth::b32, target, callee - csBase);
+        }
+    }
+    returnAddress = nullptr;
+
+    U32 helperIdx = HELPER_CPU_FIRST;
+    while (helperIdx < WASM_HELPER_COUNT && g_wasmHelperTable[helperIdx] != (const void*)wasmHelper_hostCall) ++helperIdx;
+    if (helperIdx == WASM_HELPER_COUNT) kpanic("host call helper is not imported");
+    syncDirtyRegsToHost();
+    emitArmSmcBailout();
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    pushRegValue(target);
+    m_emitter.emitCall(helperIdx);
+    emitBailoutCheck();
+    {
+        // Rare path: leaves the block. Keep the hot path's register mapping.
+        auto gpLoaded = m_gpLoaded, gpDirty = m_gpDirty;
+        auto xmmLoaded = m_xmmLoaded, xmmDirty = m_xmmDirty;
+        auto segLoaded = m_segLoaded;
+        auto fpu = fpuStackCache;
+        auto lazy = currentLazyFlags, published = m_publishedLazyFlagType;
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitI32Load((U32)offsetof(CPU, memHelperValue));
+        m_emitter.emitOp(WASM_I32_EQZ);
+        m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
+        m_emitter.emitIf();
+        jumpEip(target);
+        m_emitter.emitEnd();
+        m_gpLoaded = gpLoaded; m_gpDirty = gpDirty;
+        m_xmmLoaded = xmmLoaded; m_xmmDirty = xmmDirty;
+        m_segLoaded = segLoaded;
+        fpuStackCache = fpu;
+        currentLazyFlags = lazy; m_publishedLazyFlagType = published;
+    }
+    target = nullptr;
+    // The function changed the registers it returns in and the stack pointer in the CPU struct.
+    m_gpLoaded.fill(false);
+    m_xmmLoaded.fill(false);
+    m_segLoaded.fill(false);
+    currentLazyFlags = FLAGS_NULL;
+    m_publishedLazyFlagType = FLAGS_NULL;
+    if (callEip >= this->lastOpEip && !(this->stopBeforeEip && this->stopBeforeEip == returnEip)) {
+        // The block ends with this call: continue at the return site through the dispatcher.
+        RegPtr next = getTmpReg();
+        movValue(JitWidth::b32, next, returnEip - csBase);
+        jumpEip(next);
+    }
+    return true;
+#endif
 }
 
 void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
@@ -15613,6 +15835,9 @@ void JitWasmCodeGen::compile(DecodedOp* op) {
     if (compileCachedFpuOp(op)) return;
     if (op->isBranch()) {
         emitBranchBailoutCheck();
+    }
+    if (op->isCall() && emitHostCallSite(op)) {
+        return;
     }
     if (op->inst == CallJd && emitInlinedCall(op)) {
         return;
@@ -16406,6 +16631,9 @@ static PreparedJitCodeInvalidation wasmJitPrepareCodeInvalidation(KMemory* memor
     prepared->decodedOps = &decodedOps;
     prepared->tableSlots.reserve(jitEntries.size());
     for (void* entry : jitEntries) {
+#ifndef BOXEDWINE_MULTI_THREADED
+        if (wasmJitIsHostCallEntry(entry)) continue; // shared, not a generated block's slot
+#endif
         if (entry) {
             prepared->tableSlots.push_back((S32)(uintptr_t)entry);
         }
@@ -16973,6 +17201,9 @@ void clearJitBlock(const std::vector<void*>& jitOps) {
 #endif
     for (void* p : jitOps) {
         if (!p) continue;
+#ifndef BOXEDWINE_MULTI_THREADED
+        if (wasmJitIsHostCallEntry(p)) continue; // shared, not a generated block's slot
+#endif
         int tableIdx = (int)(uintptr_t)p;
         if (seen.insert(tableIdx).second) {
 #ifdef BOXEDWINE_MULTI_THREADED

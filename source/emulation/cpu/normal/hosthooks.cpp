@@ -394,7 +394,13 @@ void hostLibcMapped(KFile* file) {
 
 // LIBC_* (or HOST_ACM, HOST_CLOCK + CLOCK_* - 1, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
 // process, else LIBC_NONE.
+#ifdef __TEST
+U32 hostLibcTestEip, hostLibcTestFn; // testWasmJitHostCall: guest code at an eip that counts as a wrapped export
+#endif
 U32 hostLibcAt(CPU* cpu, U32 eip) {
+#ifdef __TEST
+    if (eip == hostLibcTestEip) return hostLibcTestFn;
+#endif
     if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
     if ((!hostElfAny && !hostAcmAny && !hostClockAny && !hostDibdrvAny && !hostGlyphmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();

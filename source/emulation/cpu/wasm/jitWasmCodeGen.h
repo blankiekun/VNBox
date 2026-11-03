@@ -978,6 +978,7 @@ public:
         std::vector<DecodedOp*> ops; // straight-line ops, ret last
         std::vector<U32> opEips;
         std::vector<U32> targets;  // forward jcc targets inside the callee (descending)
+        bool hostCall = false;     // not a callee: a call site that reaches a hosted function (emitHostCallSite)
     };
     std::map<U32, InlineCallee> m_inlineCalls; // by call eip
     struct InlineTarget { U32 eip; U32 token; };
@@ -987,6 +988,8 @@ public:
     bool canInlineCall(U32 eip, DecodedOp* op) override;
     bool analyzeInlineCallee(U32 eip, DecodedOp* op, InlineCallee& callee);
     bool emitInlinedCall(DecodedOp* op);
+    bool isHostCallSite(U32 eip, DecodedOp* op);
+    bool emitHostCallSite(DecodedOp* op);
     void preCompileInlined(DecodedOp* op);
     using JitCodeGen::canJumpInBlock;
     bool canJumpInBlock(U32 opEip, DecodedOp* op) override {
@@ -1379,6 +1382,7 @@ void wasmJitTestHotFlush(CPU* cpu);
 U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
 U64 wasmJitTestInlinedCalls();
+void wasmJitTestForgetHostCallSites();
 bool wasmJitTestRelocAllocationTransfer();
 U32 wasmJitTestSealedCount();
 extern "C" U32 wasmJitTestRuntimeGroupCount();

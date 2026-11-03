@@ -386,16 +386,25 @@ static void OPCALL hostHookOp(CPU* cpu, DecodedOp* op) {
 U32 hostLibcAt(CPU* cpu, U32 eip);
 bool hostLibcRun(CPU* cpu, U32 fn);
 
-static void OPCALL hostLibcOp(CPU* cpu, DecodedOp* op) {
-    if (hostLibcRun(cpu, op->imm)) {
-        NEXT_DONE();
-        return;
-    }
+// The guest function runs: its first op, which the head op kept in nextJump.
+void OPCALL hostLibcGuest(CPU* cpu, DecodedOp* op) {
     DecodedOp* real = reinterpret_cast<DecodedOp*>(op->data.nextJump);
 #if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT)
     MUSTTAIL return normalDispatch(cpu, real);
 #else
     real->pfn(cpu, real);
+#endif
+}
+
+static void OPCALL hostLibcOp(CPU* cpu, DecodedOp* op) {
+    if (hostLibcRun(cpu, op->imm)) {
+        NEXT_DONE();
+        return;
+    }
+#if defined(BOXEDWINE_DIRECT_NORMAL_DISPATCH) || defined(BOXEDWINE_WASM_JIT)
+    MUSTTAIL return hostLibcGuest(cpu, op);
+#else
+    hostLibcGuest(cpu, op);
 #endif
 }
 
@@ -431,6 +440,9 @@ static void initNormalOps() {
 
 #if defined(BOXEDWINE_JIT)
 void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op);
+#endif
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+void wasmHostCallInstall(DecodedOp* head); // jitWasmCodeGen.cpp
 #endif
 
 NormalCPU::NormalCPU(KMemory* memory) : CPU(memory) {   
@@ -502,6 +514,9 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
                     head->runCount = JIT_RUN_COUNT + 1;
 #endif
                     head->data.nextJump = reinterpret_cast<DecodedOp**>(op);
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+                    if (!frida) wasmHostCallInstall(head);
+#endif
                     op = head;
                 }
                 DecodedOp* nextOp = op;
