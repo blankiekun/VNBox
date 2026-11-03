@@ -25,6 +25,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeMutex",
+      "label": "Native mutexes",
+      "description": "Takes and releases uncontended Linux-side locks (Wine's font, GDI and window locks) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "cheapFxsave",
       "label": "Cheap FPU state save",
       "description": "Saves and restores the FPU/SSE state (FXSAVE/FXRSTOR, done on every Wine system call) in one step instead of field by field. Same results.",
