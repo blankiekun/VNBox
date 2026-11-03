@@ -388,6 +388,7 @@ const TestEntry TEST_ENTRIES[] = {
 #endif
 #if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
     {testWasmJitStBoundedDispatch, "Test ST WASM JIT instruction budget", TEST_ENTRY_SERIAL},
+    {testWasmJitSideExitTargetRewritten, "Test ST WASM JIT side exit after its target is rewritten", TEST_ENTRY_SERIAL},
     {testWasmJitHotGroups, "Test ST WASM JIT hot groups", TEST_ENTRY_SERIAL},
     {testWasmJitHotGroupOom, "Test ST WASM JIT hot group out of memory", TEST_ENTRY_SERIAL},
     {testWasmJitSingleOpOomPropagates, "Test ST WASM JIT single op allocation failure", TEST_ENTRY_SERIAL},

@@ -78,6 +78,9 @@ void testWasmJitLoopReachability();
 void testWasmJitRepMovsdState();
 void testWasmJitMultipleLoops();
 void testWasmJitConditionalSideExits();
+#ifndef BOXEDWINE_MULTI_THREADED
+void testWasmJitSideExitTargetRewritten();
+#endif
 void testWasmJitSseCompareConditions();
 void testWasmJitFpuCache();
 void testWasmJitFpuMemory();
