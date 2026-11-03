@@ -338,8 +338,12 @@
                 if(property.length > 6) {
                 	if( (property.startsWith("%22") && property.endsWith("%22") )
                 		|| (property.startsWith('%27') && property.endsWith('%27'))){
-                    	let kv = property.substring(3, property.length - 3).split(':');
-                    	return kv[0].trim() + "=" + kv[1].trim();
+                    	let entry = property.substring(3, property.length - 3), colon = entry.indexOf(':');
+                    	if (colon < 0) {
+                    		console.log("ENV property must be NAME:value");
+                    		return '';
+                    	}
+                    	return entry.substring(0, colon).trim() + "=" + entry.substring(colon + 1).trim();
                 	}else{
 	                	console.log("ENV property must be in quoted string");
                 	}
@@ -813,7 +817,11 @@
             if (!allowParameterOverride() || baseUrl === "") {
                 return "";
             }
-            baseUrl = decodeURIComponent(baseUrl);
+            try {
+                baseUrl = decodeURIComponent(baseUrl);
+            } catch (e) {
+                throw new Error(param + " is not a valid URL value: " + baseUrl); // shown by bootFailed: a typo, not an endless download
+            }
             if (!baseUrl.endsWith("/")) {
                 baseUrl += "/";
             }
@@ -956,7 +964,7 @@
         function buildCDRomFileSystems(callback) {
 			if(Config.cdromISOFiles.length > 0){
 				loadCDRomDisc(0).then(callback).catch(function(error) {
-					console.log("Unable to load disc 1: " + error);
+					vnboxReport("cdrom", "Unable to load disc 1: " + error);
 					callback();
 				});
             }else{
@@ -1144,7 +1152,7 @@
                         });
                     });
                 } else {
-                    console.log("Unable to insert disc " + (index + 1) + ": " + disc);
+                    vnboxReport("cdrom", "Unable to insert disc " + (index + 1) + ": " + disc);
                 }
                 cdromLoading = -1;
                 updateCDRomControls();
@@ -1160,7 +1168,7 @@
                     finish(inserted);
                 }
             }).catch(function(error) {
-                console.log("Unable to load disc " + (index + 1) + ": " + disc + " error: " + error);
+                vnboxReport("cdrom", "Unable to load disc " + (index + 1) + ": " + disc + " error: " + error);
                 cdromLoading = -1;
                 updateCDRomControls();
             });
@@ -2473,7 +2481,11 @@
           // As a default initial behavior, pop up an alert when webgl context is lost. To make your
           // application robust, you may want to override this behavior before shipping!
           // See http://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15.2
-          canvas.addEventListener("webglcontextlost", function(e) { alert('WebGL context lost. You will need to reload the page.'); e.preventDefault(); }, false);
+          canvas.addEventListener("webglcontextlost", function(e) {
+            vnboxReport('webgl', 'WebGL context lost');
+            gameFailed('Graphics were lost. Reload the page.');
+            e.preventDefault();
+          }, false);
           var originalGetContext = canvas.getContext.bind(canvas);
           canvas.getContext = function(type, attributes) {
             if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {
@@ -2544,14 +2556,17 @@
         var reason = event && event.reason;
         Module.printErr('Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : reason));
         if (typeof vnboxReport === 'function') vnboxReport('error', 'Unhandled promise rejection: ' + (reason && reason.stack ? reason.stack : reason));
-        bootFailed('Unable to start: ' + (reason && reason.message ? reason.message : reason)); // preRun and fetches land here
+        // preRun and fetches land here, and the loader's new WebAssembly.Suspending on a browser without JSPI
+        var noJspi = typeof boxedwineJspiReads !== 'undefined' && typeof WebAssembly.Suspending !== 'function';
+        bootFailed(noJspi ? 'This browser cannot run this build: it needs WebAssembly JSPI (Chrome 137+, Firefox 153+).'
+                          : 'Unable to start: ' + (reason && reason.message ? reason.message : reason));
       };
 function createFile(dir, name, buf) {
     try {
         FS.createDataFile(dir, name, buf, true, true);
         console.log("File created:" + dir + "/" + name);
     } catch(e) {
-        console.log("Unable to create file:" + dir + "/" + name + "  error:" + e);
+        vnboxReport("boot", "Unable to create file:" + dir + "/" + name + "  error:" + e);
     }
 }
 // The log textarea shows the last OUTPUT_KEPT_LINES lines, rewritten at most every 250 ms:
@@ -2575,7 +2590,10 @@ function flushOutput() {
 // A boot that cannot go on says why, in place of "Preparing...". textContent: the reason can hold file names.
 var bootFailure = false;
 function bootFailed(text) {
-    if (isRunning) return;
+    if (!isRunning) gameFailed(text);
+}
+// The same once the game has started: a dead tick, lost graphics, a guest that could not start. Stays over its last frame.
+function gameFailed(text) {
     bootFailure = true;
     statusElement.textContent = text;
     spinnerElement.style.display = 'none';
@@ -2646,7 +2664,14 @@ function initWasmJitCache(callback) {
         updateSaveJitButton();
         callback();
     };
-    var req = indexedDB.open('boxedwine-wasm-jit', 1);
+    var req;
+    try {
+        req = indexedDB.open('boxedwine-wasm-jit', 1);
+    } catch (e) {
+        console.warn('[WASM JIT] IndexedDB unavailable, JIT cache disabled');
+        done();
+        return;
+    }
     req.onupgradeneeded = function(e) {
         e.target.result.createObjectStore('blocks');
     };
@@ -2662,7 +2687,8 @@ function initWasmJitCache(callback) {
         tx.oncomplete = function() {
             fetchServerJitCache(done);
         };
-        tx.onerror = function() {
+        // Not onerror as well: an abort follows every error, and one at commit (a full disk) comes with no error event.
+        tx.onabort = function() {
             fetchServerJitCache(done);
         };
     };

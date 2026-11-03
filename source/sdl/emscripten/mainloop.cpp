@@ -289,6 +289,15 @@ void mainloop() {
 
 #endif
 
+void vnboxStartFailed(const char* why) {
+    klog_fmt("Unable to start: %s", why);
+    EM_ASM({
+        var why = UTF8ToString($0);
+        if (typeof vnboxReport === "function") vnboxReport("boot", why);
+        if (typeof gameFailed === "function" && !bootFailure) gameFailed("Unable to start: " + why); /* the first failure is the cause */
+    }, why);
+}
+
 // The one reading path for VNBox URL options (vnboxparam.h).
 int vnboxUrlInt(const char* name, int dflt, int lo, int hi, const char* env) {
     return EM_ASM_INT({
@@ -334,17 +343,23 @@ bool doMainLoop() {
     // Mouse motion does not: moving over an idle screen would run a tick per event, the next timer takes it.
     // A hidden page gets no frames: the guest and audio keep running, nothing is drawn (vnbox_set_hidden),
     // a tick waiting for a frame goes on at once, and the next tick once visible draws the latest frame.
+    // Firefox also stops frames in a display:none iframe, with document.hidden still false (a wrapper minimizing its
+    // window). A frame not there after 100 ms ends the wait, and no tick waits again until a frame comes: not pacing,
+    // the guest runs flat out then, this only removes a wait that may never end.
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
         var lastFrame = performance.now();
-        var frame = function() { lastFrame = performance.now(); requestAnimationFrame(frame); };
+        var stopped = false; // the tick failed for good
+        var noFrames = false;
+        var frame = function() { if (stopped) return; noFrames = false; lastFrame = performance.now(); requestAnimationFrame(frame); };
         var post = function() { channel.port2.postMessage(0); };
         var timer = 0;
         var wait = function(delay) { timer = setTimeout(function() { timer = 0; next(); }, delay); };
         var wake = function() { if (timer) { clearTimeout(timer); wait(0); } };
         var raf = 0; // the frame a tick waits for, which never comes once the page is hidden
-        var framed = function() { raf = 0; post(); };
+        var rafLate = 0;
+        var framed = function() { raf = 0; clearTimeout(rafLate); post(); };
         var visibility = function() {
             wasmExports["vnbox_set_hidden"](document.hidden ? 1 : 0);
             if (!document.hidden) wake();
@@ -357,7 +372,10 @@ bool doMainLoop() {
         });
         var next = function() { tick().then(function(delay) {
             if (delay >= 0) wait(delay);
-            else if (!document.hidden && performance.now() - lastFrame > 12) raf = requestAnimationFrame(framed);
+            else if (!document.hidden && !noFrames && performance.now() - lastFrame > 12) {
+                raf = requestAnimationFrame(framed);
+                rafLate = setTimeout(function() { noFrames = true; cancelAnimationFrame(raf); framed(); }, 100);
+            }
             else post();
         }, function(e) {
 #ifdef BOXEDWINE_HOST_WINED3D
@@ -368,6 +386,8 @@ bool doMainLoop() {
                 return;
             }
 #endif
+            stopped = true;
+            if (typeof gameFailed === "function") gameFailed("The game stopped: " + e + ". Reload to continue.");
             if (typeof vnboxReport === "function") vnboxReport("tick", String(e) + (e && e.stack ? "\n" + e.stack : "")); else console.error("tick failed: " + e); }); };
         channel.port1.onmessage = next;
         requestAnimationFrame(frame);
@@ -381,11 +401,13 @@ bool doMainLoop() {
 }
 #ifdef BOXEDWINE_JSPI
 void cdromRunQueuedInsert();
+void hostFolderRunQueuedSync();
 extern "C" EMSCRIPTEN_KEEPALIVE void vnbox_set_hidden(int hidden) {
     XServer::hidden = hidden != 0;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE int boxedwine_tick() {
     cdromRunQueuedInsert();
+    hostFolderRunQueuedSync();
     mainloop();
     return jspiTickDelay;
 }

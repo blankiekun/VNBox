@@ -21,6 +21,30 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 
+#ifdef BOXEDWINE_JSPI
+#include <string>
+#include <utility>
+#include <vector>
+#endif
+
+static void syncDirectories(const char* mountPath, const char* relativeDirs);
+
+#ifdef BOXEDWINE_JSPI
+// A new .link file is read through fd_read, a suspending import: it only works inside boxedwine_tick (lazyfs-jspi-lib.js).
+static std::vector<std::pair<std::string, std::string>> queuedSyncs;
+
+void hostFolderRunQueuedSync() {
+    if (queuedSyncs.empty()) {
+        return;
+    }
+    std::vector<std::pair<std::string, std::string>> syncs;
+    syncs.swap(queuedSyncs);
+    for (auto& sync : syncs) {
+        syncDirectories(sync.first.c_str(), sync.second.c_str());
+    }
+}
+#endif
+
 extern "C" {
 
 // Called by the browser host folder refresh after it changed files under the
@@ -36,6 +60,16 @@ void boxedwineHostFolderSyncDirectories(const char* mountPath, const char* relat
     if (!mountPath || !mountPath[0] || !relativeDirs) {
         return;
     }
+#ifdef BOXEDWINE_JSPI
+    queuedSyncs.emplace_back(mountPath, relativeDirs); // the next boxedwine_tick does it
+#else
+    syncDirectories(mountPath, relativeDirs);
+#endif
+}
+
+}
+
+static void syncDirectories(const char* mountPath, const char* relativeDirs) {
     std::shared_ptr<FsNode> mountNode = Fs::getNodeFromLocalPath(B(""), BString::copy(mountPath), true);
     if (!mountNode) {
         return;
@@ -59,8 +93,6 @@ void boxedwineHostFolderSyncDirectories(const char* mountPath, const char* relat
             node->syncLoadedChildrenWithFileSystem();
         }
     }
-}
-
 }
 
 #endif

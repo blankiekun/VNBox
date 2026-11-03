@@ -31,6 +31,9 @@ encoding instead:
 make release WASM_EXCEPTIONS_FLAG=-fwasm-exceptions
 ```
 
+The `jitJspi` target also needs WebAssembly JSPI: Chrome/Edge 137+ or Firefox 153+.
+Other browsers get a message on the page saying so.
+
 
 ## Build
 

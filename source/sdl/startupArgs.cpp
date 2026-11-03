@@ -614,7 +614,9 @@ bool StartUpArgs::apply() {
     for (auto& zip : zips) {
         U64 startTime = KSystem::getMicroCounter();
         std::shared_ptr<FsZip> fsZip = std::make_shared<FsZip>();
-        fsZip->init(zip, B(""));
+        if (!fsZip->init(zip, B(""))) {
+            vnboxStartFailed((zip + " is not a readable zip file").c_str());
+        }
         openZips.push_back(fsZip);
         U64 endTime = KSystem::getMicroCounter();
         klog_fmt("Loaded %s in %d ms", zip.c_str(), (U32)(endTime - startTime) / 1000);
@@ -793,7 +795,9 @@ bool StartUpArgs::apply() {
                 if (!info.localPath.endsWith("/", false)) {
                     info.localPath= info.localPath+"/";
                 }
-                fsZip->init(info.nativePath, info.localPath);
+                if (!fsZip->init(info.nativePath, info.localPath)) {
+                    vnboxStartFailed((info.nativePath + " is not a readable zip file").c_str());
+                }
                 openZips.push_back(fsZip);
                 U64 endTime = KSystem::getMicroCounter();
                 klog_fmt("Mounted %s in %d ms", info.nativePath.c_str(), (U32)(endTime - startTime) / 1000);
@@ -1016,6 +1020,8 @@ bool StartUpArgs::apply() {
 #endif
                 return false; // doMainLoop should have handled any cleanup, like SDL_Quit if necessary
             }
+        } else {
+            vnboxStartFailed((this->args[0] + " could not be run").c_str());
         }
     }
 #ifdef GENERATE_SOURCE
