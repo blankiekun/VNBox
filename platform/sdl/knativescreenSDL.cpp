@@ -909,7 +909,7 @@ bool KNativeScreenSDL::saveBmp(const BString& filepath, U8* buffer, U32 bpp, U32
     return true;
 }
 
-void KNativeScreenSDL::buildCursor(KThread* thread, const std::shared_ptr<XCursor>& cursor, U32 pixelsAddress, U32 width, U32 height, S32 xHot, S32 yHot) {
+void KNativeScreenSDL::buildCursor(KThread* thread, const std::shared_ptr<XCursor>& cursor, U32 pixelsAddress, U32 width, U32 height, S32 xHot, S32 yHot, U32 frame, U32 delayMs) {
     if (KSystem::videoOption == VIDEO_NO_WINDOW) {
         return;
     }
@@ -945,11 +945,23 @@ void KNativeScreenSDL::buildCursor(KThread* thread, const std::shared_ptr<XCurso
     SDL_FreeSurface(surface);
 
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);
+    if (frame) {
+        // a later frame of an animated cursor: kept, the page cursor swaps to it in KNativeInputSDL::animateCursor
+        if (KNativeInputSDL::CursorFramesPtr frames = cursorFrames.get(cursor->id)) {
+            frames->push_back({ sdlCursor, delayMs });
+        }
+        return;
+    }
     SDL_Cursor* prev = cursors.get(cursor->id);
     if (prev) {
         SDL_FreeCursor(prev);
     }
     cursors.set(cursor->id, sdlCursor);
+    if (delayMs) {
+        KNativeInputSDL::CursorFramesPtr frames = std::make_shared<std::vector<KNativeInputSDL::CursorFrame>>();
+        frames->push_back({ sdlCursor, delayMs });
+        cursorFrames.set(cursor->id, frames);
+    }
 }
 
 void KNativeScreenSDL::setCursor(const std::shared_ptr<XCursor>& cursor) {
@@ -957,10 +969,15 @@ void KNativeScreenSDL::setCursor(const std::shared_ptr<XCursor>& cursor) {
         return;
     }
     SDL_Cursor* sdlCursor;
+    KNativeInputSDL::CursorFramesPtr frames;
 
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);
         sdlCursor = cursors.get(cursor->id);
+        frames = cursorFrames.get(cursor->id);
+        if (frames && frames->size() < 2) {
+            frames = nullptr;
+        }
     }
     if (!sdlCursor) {
         switch (cursor->shape) {
@@ -1030,7 +1047,7 @@ void KNativeScreenSDL::setCursor(const std::shared_ptr<XCursor>& cursor) {
     }
     if (XServer* server = XServer::getServer(true)) server->setMouseCursorVisible(sdlCursor != nullptr);
     DISPATCH_MAIN_THREAD_BLOCK_THIS_BEGIN
-        input->setCursor(sdlCursor);
+        input->setCursor(sdlCursor, frames);
 #ifdef __APPLE__
         macCursorUpdate();
 #endif

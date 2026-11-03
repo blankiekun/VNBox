@@ -46,7 +46,10 @@ public:
     void setMousePos(int x, int y) override;
     void setMouseConfinement(bool confined) override;
     bool isMouseCaptureReleased() const { return mouseCaptureReleased.load(); }
-    void setCursor(SDL_Cursor* cursor);
+    // An animated cursor's frames (each shown for delayMs), pre-built SDL cursors; frame 0 is the cursor itself.
+    struct CursorFrame { SDL_Cursor* cursor; U32 delayMs; };
+    typedef std::shared_ptr<std::vector<CursorFrame>> CursorFramesPtr;
+    void setCursor(SDL_Cursor* cursor, const CursorFramesPtr& frames = nullptr);
     U32 getInputModifiers() override;
 
     int xToScreen(int x);
@@ -101,6 +104,14 @@ private:
     bool focusClickthroughBeforeRelease = false;
     SDL_Cursor* guestCursor = nullptr;
     bool guestCursorVisible = true;
+    CursorFramesPtr guestCursorFrames; // set while the guest's cursor is animated
+    U32 guestCursorFrame = 0;
+    void animateCursor(); // (re)arms the frame timer, or stops it when the cursor can't be seen
+#ifdef __EMSCRIPTEN__
+    long cursorTimer = 0;
+    bool pageHidden = false;
+    bool visibilityHooked = false;
+#endif
     U32 mouseHintWindowId = 0;
     BString mouseHintBaseTitle;
     BString mouseHintTitle;

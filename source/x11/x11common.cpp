@@ -22,6 +22,9 @@
 #include "x11flush.h"
 #include "vnboxstats.h"
 #include "knativesystem.h"
+#ifdef __EMSCRIPTEN__
+#include "vnboxparam.h"
+#endif
 
 Int99Callback int9BCallback[X11_COUNT];
 U32 int9BCallbackSize = X11_COUNT;
@@ -3093,16 +3096,26 @@ void x11_CursorImagesLoadCursor(CPU* cpu) {
         EAX = 0;
         return;
     }
-    if (images.nimage > 1) {
+    // An animated cursor (winex11 passes every frame of a .ani / animated resource, delay = ms to the next one)
+    // keeps all its frames: the page cursor plays them (KNativeInputSDL::animateCursor). animatedCursors=0 = frame 0 only.
+#ifdef __EMSCRIPTEN__
+    static const bool animate = !vnboxUrlIs("animatedCursors", "0");
+#else
+    static const bool animate = false;
+#endif
+    U32 count = animate ? images.nimage : 1;
+    if (images.nimage > 1 && !animate) {
         klog("x11_CursorImagesLoadCursor animated cursors not supported, will use first frame");
     }
     XCursorPtr cursor = std::make_shared<XCursor>(0);
     server->addCursor(cursor);
     EAX = cursor->id;
 
-    XcursorImage frame;
-    frame.read(memory, memory->readd(images.imagesAddress));
-    KNativeSystem::getScreen()->buildCursor(thread, cursor, frame.pixelsAddress, frame.width, frame.height, frame.xhot, frame.yhot);
+    for (U32 i = 0; i < count; i++) {
+        XcursorImage frame;
+        frame.read(memory, memory->readd(images.imagesAddress + i * 4));
+        KNativeSystem::getScreen()->buildCursor(thread, cursor, frame.pixelsAddress, frame.width, frame.height, frame.xhot, frame.yhot, i, count > 1 ? std::max<U32>(frame.delay, 1) : 0);
+    }
 }
 
 // Cursor XcursorLibraryLoadCursor(Display* dpy, const char* file)
