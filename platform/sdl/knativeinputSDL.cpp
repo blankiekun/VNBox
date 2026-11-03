@@ -217,24 +217,50 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         };
     }
 
+    // Keys down in the guest. SDL never sees them, so its blur handler can't release them.
+    var heldKeys = new Set();
+
+    function releaseHeldKeys() {
+        heldKeys.forEach(function(scanCode) {
+            _boxedwineEmscriptenKey(scanCode, 0, 0);
+        });
+        heldKeys.clear();
+    }
+
+    window.addEventListener('blur', releaseHeldKeys, false);
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            releaseHeldKeys();
+        }
+    }, false);
+
+    // stopPropagation, not stopImmediatePropagation: SDL's handlers are further along the path,
+    // while the main loop's wake and audio's resume are later listeners on window and must still run.
     window.addEventListener('keydown', function(event) {
         var key = boxedwineKey(event);
         if (!key) {
             return;
         }
+        heldKeys.add(key.scanCode);
         _boxedwineEmscriptenKey(key.scanCode, key.key, 1);
         event.preventDefault();
-        event.stopImmediatePropagation();
+        event.stopPropagation();
     }, true);
 
     window.addEventListener('keyup', function(event) {
         var key = boxedwineKey(event);
-        if (!key) {
+        var scanCode = keyCodeToSDLScanCode[event.code];
+        // A key down in the guest is released whatever the event's target or modifiers are now.
+        // One it doesn't hold gets no second key-up: focus loss already released it.
+        var held = heldKeys.delete(scanCode);
+        if (!held && !key) {
             return;
         }
-        _boxedwineEmscriptenKey(key.scanCode, key.key, 0);
+        if (held) {
+            _boxedwineEmscriptenKey(scanCode, key ? key.key : 0, 0);
+        }
         event.preventDefault();
-        event.stopImmediatePropagation();
+        event.stopPropagation();
     }, true);
 #endif
 
@@ -262,7 +288,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         canvas.focus();
         _boxedwineEmscriptenMouseButton(1, boxedwineButton(event.button), point.x, point.y);
         event.preventDefault();
-        event.stopImmediatePropagation();
+        event.stopPropagation();
     }, true);
 
     window.addEventListener('mouseup', function(event) {
@@ -277,7 +303,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         lastMousePoint = point;
         _boxedwineEmscriptenMouseButton(0, boxedwineButton(event.button), point.x, point.y);
         event.preventDefault();
-        event.stopImmediatePropagation();
+        event.stopPropagation();
     }, true);
 
     canvas.addEventListener('contextmenu', function(event) {
@@ -615,6 +641,17 @@ bool KNativeInputSDL::mouseWheel(int amount, int x, int y) {
     return false;
 }
 
+// Browsers let audio start only after a user gesture. A key press is one too, whatever the flag's name says.
+static void enableSoundOnFirstInput() {
+    if (KSystem::enableSoundAfterMouseClick) {
+        KSystem::enableSoundAfterMouseClick = false;
+        KSystem::soundEnabled = true;
+        KDspAudio::iterateOpenAudio([](KDspAudioPtr& audio) {
+            audio->soundEnabled();
+            });
+    }
+}
+
 bool KNativeInputSDL::mouseButton(U32 down, U32 button, int x, int y) {
 #ifdef __EMSCRIPTEN__
     // Absolute browser events bypass SDL. Keep polling consistent with those
@@ -628,13 +665,7 @@ bool KNativeInputSDL::mouseButton(U32 down, U32 button, int x, int y) {
         }
     }
 #endif
-    if (KSystem::enableSoundAfterMouseClick) {
-        KSystem::enableSoundAfterMouseClick = false;
-        KSystem::soundEnabled = true;
-        KDspAudio::iterateOpenAudio([](KDspAudioPtr& audio) {
-            audio->soundEnabled();
-            });
-    }
+    enableSoundOnFirstInput();
     x = xFromScreen(x);
     y = yFromScreen(y);
 
@@ -670,6 +701,22 @@ void KNativeInputSDL::clearEmscriptenMousePosition() {
 }
 #endif
 
+void KNativeInputSDL::hostMousePos(int* x, int* y) {
+#ifdef __EMSCRIPTEN__
+    // The absolute browser handlers consume motion before SDL sees it. SDL
+    // can otherwise report the old canvas-entry point even after a click in
+    // the game. Pointer-locked input still uses SDL's virtual cursor.
+    U64 position = emscriptenMousePosition.load();
+    if (position != ~(U64)0 && !SDL_GetRelativeMouseMode()) {
+        *x = (S32)(position >> 32);
+        *y = (S32)(U32)position;
+    } else
+#endif
+    {
+        SDL_GetMouseState(x, y);
+    }
+}
+
 bool KNativeInputSDL::getMousePos(int* x, int* y, bool allowWarp) {
     if (mouseCaptureReleased) {
         U64 position = releasedMousePosition;
@@ -688,19 +735,7 @@ bool KNativeInputSDL::getMousePos(int* x, int* y, bool allowWarp) {
         return checkMousePos(*x, *y, false);
     }
 #endif
-#ifdef __EMSCRIPTEN__
-    // The absolute browser handlers consume motion before SDL sees it. SDL
-    // can otherwise report the old canvas-entry point even after a click in
-    // the game. Pointer-locked input still uses SDL's virtual cursor.
-    U64 position = emscriptenMousePosition.load();
-    if (position != ~(U64)0 && !SDL_GetRelativeMouseMode()) {
-        *x = (S32)(position >> 32);
-        *y = (S32)(U32)position;
-    } else
-#endif
-    {
-        SDL_GetMouseState(x, y);
-    }
+    hostMousePos(x, y);
 
     *x = xFromScreen(*x);
     *y = yFromScreen(*y);
@@ -864,6 +899,9 @@ U32 KNativeInputSDL::getInputModifiers() {
 }
 
 bool KNativeInputSDL::key(U32 sdlScanCode, U32 key, U32 down) {
+    if (down) {
+        enableSoundOnFirstInput();
+    }
     XServer* server = XServer::getServer(true);
     if (server) {
         U32 x11Key = XKeyboard::sdl2x11(sdlScanCode);
@@ -1299,7 +1337,7 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
     } else if (e->type == SDL_MOUSEWHEEL) {
         // Handle up/down mouse wheel movements
         int x, y;
-        SDL_GetMouseState(&x, &y);
+        hostMousePos(&x, &y);
         if (!mouseWheel(e->wheel.y * 80, x, y)) {
             onMouseWheel(e->wheel.y);
         }
