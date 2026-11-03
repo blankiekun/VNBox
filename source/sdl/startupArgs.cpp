@@ -49,6 +49,9 @@
 #include "../server/localserver.h"
 #include "../io/fszip.h"
 #include "loader.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten/em_asm.h>
+#endif
 #include "kstat.h"
 #include "knativesystem.h"
 #include "knativeinput.h"
@@ -454,7 +457,7 @@ static void setWineRegValue(const char* file, const std::string& section, const 
     std::string reg;
     U8 buffer[4096];
     U32 len;
-    while ((len = openNode->readNative(buffer, sizeof(buffer))) > 0 && len != (U32)-1) {
+    while ((S32)(len = openNode->readNative(buffer, sizeof(buffer))) > 0) {
         reg.append((const char*)buffer, len);
     }
     openNode->close();
@@ -526,6 +529,16 @@ static void setWineRegValue(const char* file, const std::string& section, const 
     openNode->close();
     delete openNode;
 }
+
+#ifdef BOXEDWINE_ZLIB
+// A root or overlay zip the engine cannot read: going on would run without Wine or without VNBox's Wine parts, with no word to anyone.
+static void zipFailed(const BString& zip) {
+    kwarn_fmt("Could not read zip file: %s", zip.c_str());
+#ifdef __EMSCRIPTEN__
+    MAIN_THREAD_EM_ASM({ if (typeof vnboxZipFailed === "function") vnboxZipFailed(UTF8ToString($0)); }, zip.c_str());
+#endif
+}
+#endif
 
 bool StartUpArgs::apply() {
     // Set before anything below can kpanic. An automation script can't dismiss a dialog, and its
@@ -615,7 +628,8 @@ bool StartUpArgs::apply() {
         U64 startTime = KSystem::getMicroCounter();
         std::shared_ptr<FsZip> fsZip = std::make_shared<FsZip>();
         if (!fsZip->init(zip, B(""))) {
-            vnboxStartFailed((zip + " is not a readable zip file").c_str());
+            zipFailed(zip);
+            return false;
         }
         openZips.push_back(fsZip);
         U64 endTime = KSystem::getMicroCounter();
@@ -796,7 +810,8 @@ bool StartUpArgs::apply() {
                     info.localPath= info.localPath+"/";
                 }
                 if (!fsZip->init(info.nativePath, info.localPath)) {
-                    vnboxStartFailed((info.nativePath + " is not a readable zip file").c_str());
+                    zipFailed(info.nativePath);
+                    return false;
                 }
                 openZips.push_back(fsZip);
                 U64 endTime = KSystem::getMicroCounter();

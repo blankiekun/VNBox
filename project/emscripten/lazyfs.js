@@ -30,6 +30,7 @@ var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, wai
 window.__lazyStats = lazyStats;
 var lazyCache = new Map(); // "file:block" → Uint8Array, insertion order = LRU order
 var lazyFiles = []; // jspi mode: File objects by index
+var lazyHandles = []; // jspi mode: their file handles, for a new File when one went stale
 var lazyEagerLeft = LAZY_EAGER_BUDGET;
 var lazyFailingStores = new Set(); // mount points reported as failing, until a persist works again
 var lazyBase = typeof document !== "undefined" && document.currentScript ? new URL(".", document.currentScript.src).href : ""; // this file's folder, not the page's
@@ -124,10 +125,15 @@ function lazyCopy(node, buffer, offset, length, position, readRun) {
     return step();
 }
 
-// Async run read for jspi mode.
+// A File stops reading when its file changes (another tab copied the game again).
+function lazyFreshFile(file) {
+    return lazyHandles[file].getFile().then(f => { lazyFiles[file] = f; });
+}
+
+// Async run read for jspi mode. A failed read gets a new File and one more try.
 function lazyReadRunAsync(file, start, length) {
-    var t = performance.now();
-    return lazyFiles[file].slice(start, start + length).arrayBuffer().then(b => {
+    var t = performance.now(), read = () => lazyFiles[file].slice(start, start + length).arrayBuffer();
+    return read().catch(() => lazyFreshFile(file).then(read)).then(b => {
         lazyStats.waitMs += performance.now() - t;
         return new Uint8Array(b);
     });
@@ -165,8 +171,9 @@ function lazyBecomeMemfs(node, bytes) {
 }
 
 // Reads a File synchronously on the main thread: a sync XHR of a blob: URL, bytes as a binary string.
-// shortcut: holds the file twice in memory for a moment; fine for the rare first write to a big
-// game file, a block overlay would be needed for games rewriting huge files in place.
+// shortcut: holds the file twice in memory for a moment, and a file over the browser's string limit
+// (about 512 MiB in Chromium) fails, so its first write is an error; fine for the rare first write to a
+// big game file, a block overlay would be needed for games rewriting huge files in place.
 function lazyReadFileSync(file) {
     var url = URL.createObjectURL(file);
     try {
@@ -187,16 +194,20 @@ function lazyCopyUp(node, empty) {
     if (node.lazyCopied) return;
     if (empty) return lazyBecomeMemfs(node, new Uint8Array(0));
     var bytes;
-    if (node.lazyAsync) {
-        bytes = lazyReadFileSync(lazyFiles[node.lazyFile]);
-        if (bytes.length !== node.lazySize) {
-            vnboxReport("lazyfs", "copy of " + node.name + " read " + bytes.length + " of " + node.lazySize + " bytes");
-            throw new FS.ErrnoError(29); // EIO
+    try {
+        if (node.lazyAsync) {
+            bytes = lazyReadFileSync(lazyFiles[node.lazyFile]);
+            if (bytes.length !== node.lazySize) throw new Error("read " + bytes.length + " of " + node.lazySize + " bytes");
+        } else {
+            bytes = new Uint8Array(node.lazySize);
+            if (node.lazyBytes) bytes.set(node.lazyBytes);
+            else node.lazyReadSync(node, bytes, 0, node.lazySize, 0);
         }
-    } else {
-        bytes = new Uint8Array(node.lazySize);
-        if (node.lazyBytes) bytes.set(node.lazyBytes);
-        else node.lazyReadSync(node, bytes, 0, node.lazySize, 0);
+    } catch (e) { // only an ErrnoError becomes a failed write: anything else would go through fd_write into wasm and end the tick
+        if (node.lazyAsync) lazyFreshFile(node.lazyFile).catch(() => { }); // no waiting here: the next try gets it
+        if (e.name === "ErrnoError") throw e;
+        vnboxReport("lazyfs", "copy of " + node.name + " failed: " + e);
+        throw new FS.ErrnoError(29); // EIO
     }
     lazyBecomeMemfs(node, bytes);
 }
@@ -251,37 +262,74 @@ function lazyAddFile(parent, fileName, index, size, readSync, bytes) {
 
 // jspi mode: fetches url into the origin private file system once (lazyfs-cache/), then adds
 // it at dir/name as a lazy node read from there, so a root or overlay zip stays out of the JS heap.
-// The copy is keyed by the zip's sha256 from vnbox-zips.sha256 (next to the page, written by the
-// release), so a new release's zip replaces the old copy.
-// shortcut: a zip missing from vnbox-zips.sha256 is kept by name; a changed one needs a new name.
+// The copy is keyed by the zip's sha256 from vnbox-zips.sha256 (next to this file, written by the
+// release), so a new release's zip replaces the old copy. Only lazyfs-cache/ is deleted from: saves are in IndexedDB.
+// shortcut: a zip missing from vnbox-zips.sha256 is kept by name, until the engine cannot read it
+// (lazyForgetUnlistedZip); a changed one needs a new name.
 var lazyZipSums = null;
-function lazyZipSum(name) {
-    lazyZipSums = lazyZipSums || fetch("vnbox-zips.sha256").then(r => r.ok ? r.text() : "", () => "").then(text => {
+function lazyZipSum(name, fresh) {
+    if (fresh) lazyZipSums = null;
+    lazyZipSums = lazyZipSums || fetch(lazyBase + "vnbox-zips.sha256", fresh ? { cache: "reload" } : {}).then(r => r.ok ? r.text() : "", () => "").then(text => {
         var sums = {};
         text.split("\n").forEach(line => { var m = /^([0-9a-f]{64}) [ *](.+)$/.exec(line.trim()); if (m) sums[m[2]] = m[1]; });
         return sums;
     });
     return lazyZipSums.then(sums => sums[name] || "");
 }
-async function lazyAddCachedFile(dir, name, url) {
-    var cache = await (await navigator.storage.getDirectory()).getDirectoryHandle("lazyfs-cache", { create: true });
-    var encoded = encodeURIComponent(name), sha = await lazyZipSum(name);
-    var cacheName = sha ? sha + "~" + encoded : encoded, file = null;
-    try { file = await (await cache.getFileHandle(cacheName)).getFile(); } catch (e) { }
-    if (!file || !file.size) { // an interrupted download leaves the file empty
-        var response = await fetch(url);
-        if (!response.ok) throw new Error("HTTP " + response.status);
-        var handle = await cache.getFileHandle(cacheName, { create: true });
-        await response.body.pipeTo(await handle.createWritable());
-        file = await handle.getFile();
-        for await (var key of cache.keys()) { // older copies of this zip
-            if (key !== cacheName && (key === encoded || (/^[0-9a-f]{64}~/.test(key) && key.substring(65) === encoded))) {
-                await cache.removeEntry(key).catch(() => { });
-            }
+// Is this copy the zip the release lists? A wrong answer from a proxy or an old HTTP cache entry would otherwise
+// stay for good. Read whole, so once per copy: an empty "ok~" file beside it remembers.
+async function lazyZipIsRight(cache, cacheName, sha, file) {
+    if (!sha) return true;
+    if (await cache.getFileHandle("ok~" + cacheName).then(() => true, () => false)) return true;
+    var digest = new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer()));
+    if (Array.from(digest, b => b.toString(16).padStart(2, "0")).join("") !== sha) return false;
+    await cache.getFileHandle("ok~" + cacheName, { create: true });
+    return true;
+}
+// For as long as the page lives: a tab playing the last release keeps the copy it reads (lazyDropOldZips).
+function lazyHoldZip(cacheName) {
+    return new Promise(held => navigator.locks.request("vnbox-zip:" + cacheName, { mode: "shared" }, () => {
+        held();
+        return new Promise(() => { });
+    }));
+}
+async function lazyDropOldZips(cache, cacheName, encoded) {
+    for await (var key of cache.keys()) {
+        var copy = key.replace(/^ok~/, "");
+        if (copy !== cacheName && (copy === encoded || (/^[0-9a-f]{64}~/.test(copy) && copy.substring(65) === encoded))) {
+            await navigator.locks.request("vnbox-zip:" + copy, { ifAvailable: true }, lock => lock && cache.removeEntry(key).catch(() => { }));
         }
     }
+}
+async function lazyAddCachedFile(dir, name, url) {
+    var cache = await (await navigator.storage.getDirectory()).getDirectoryHandle("lazyfs-cache", { create: true });
+    var encoded = encodeURIComponent(name), handle = null, file = null, cacheName;
+    for (var fresh = false; ; fresh = true) { // the second time past the HTTP cache: the list or the zip may be what is out of date
+        var sha = await lazyZipSum(name, fresh);
+        cacheName = sha ? sha + "~" + encoded : encoded;
+        await lazyHoldZip(cacheName);
+        try { handle = await cache.getFileHandle(cacheName); file = await handle.getFile(); } catch (e) { file = null; }
+        if (file && file.size && await lazyZipIsRight(cache, cacheName, sha, file)) break; // an interrupted download leaves the file empty
+        var response = await fetch(url, fresh ? { cache: "reload" } : {});
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        await cache.removeEntry("ok~" + cacheName).catch(() => { });
+        handle = await cache.getFileHandle(cacheName, { create: true });
+        await response.body.pipeTo(await handle.createWritable());
+        file = await handle.getFile();
+        if (await lazyZipIsRight(cache, cacheName, sha, file)) break;
+        if (fresh) {
+            await cache.removeEntry(cacheName).catch(() => { });
+            throw new Error("the download does not match its sha256 (a proxy or a bad connection?)");
+        }
+    }
+    await lazyDropOldZips(cache, cacheName, encoded);
     lazyAddFile(dir, name, lazyFiles.length, file.size, null, null);
     lazyFiles.push(file);
+    lazyHandles.push(handle);
+}
+// The engine could not read this zip. A listed copy matched its sum, so downloading it again would change nothing.
+function lazyForgetUnlistedZip(name) {
+    return navigator.storage.getDirectory().then(root => root.getDirectoryHandle("lazyfs-cache")).then(cache => cache.removeEntry(encodeURIComponent(name))).catch(() => { });
 }
 
 // One path part as Boxedwine names it when the game creates it (Fs::localNameToRemote): game files
@@ -300,19 +348,32 @@ function lazyEscapeName(name) {
     }).join("");
 }
 
+// NFC only when there are marks to compose: NFC also rewrites CJK compatibility ideographs such as U+FA10, which a
+// Windows name can hold and Wine's CP932 asks for as they are.
+function lazyGameName(name) {
+    return /\p{M}/u.test(name) ? name.normalize("NFC") : name;
+}
+
 // Where a game file goes in the tree: under the spelling the overlay already uses for each part. Both
 // spellings side by side would decode to one local name and the raw one, added last, would hide the save.
+// Names are in NFC, as a game's are after Shift-JIS: a folder from macOS has them in NFD, which Wine does not match.
+// A save made under the folder's NFD spelling, before this, stays where it is.
 function lazyOverlayPath(root, relative) {
     return relative.split("/").reduce((dir, part) => {
-        var raw = dir + "/" + part, escaped = dir + "/" + lazyEscapeName(part);
-        return escaped !== raw && !FS.analyzePath(raw).exists && FS.analyzePath(escaped).exists ? escaped : raw;
+        var nfc = lazyGameName(part), raw = dir + "/" + nfc, escaped = dir + "/" + lazyEscapeName(nfc);
+        if (escaped === raw && nfc === part) return raw;
+        if (FS.analyzePath(raw).exists) return raw;
+        if (FS.analyzePath(escaped).exists) return escaped;
+        var old = nfc === part ? null : [dir + "/" + part, dir + "/" + lazyEscapeName(part)].find(p => FS.analyzePath(p).exists);
+        return old || raw;
     }, root);
 }
 
 function lazyBuildTree(root, entries, readSync) {
     FS.mkdirTree(root);
+    var isGame = root.startsWith(LAZY_APP_MOUNT_ROOT); // a disc has no overlay, and its sheet names files as they are spelled
     entries.forEach(entry => {
-        var path = lazyOverlayPath(root, entry.path);
+        var path = isGame ? lazyOverlayPath(root, entry.path) : root + "/" + entry.path;
         if (entry.dir) { FS.mkdirTree(path); return; }
         var slash = path.lastIndexOf("/"), parent = path.substring(0, slash), fileName = path.substring(slash + 1);
         lazyStats.files++;
@@ -396,13 +457,7 @@ function lazyPatchIdbfs() {
             return setattr(node, attr);
         };
         ops.rename = (node, newDir, newName) => {
-            try {
-                lazyCopyUpTree(node);
-            } catch (e) {
-                if (e.name === "ErrnoError") throw e;
-                vnboxReport("lazyfs", "copy of " + node.name + " for a rename failed: " + e); // too big for memory: the rename fails, nothing is lost
-                throw new FS.ErrnoError(29); // EIO
-            }
+            lazyCopyUpTree(node); // too big for memory: the rename fails, nothing is lost
             return rename(node, newDir, newName);
         };
         return root;
@@ -482,6 +537,7 @@ async function mountLazyAppJspi(mountPoint, name, dirHandle) {
                 var f = await h.getFile();
                 entries.push({ path: path, file: lazyFiles.length, size: f.size, bytes: lazyEagerTake(f.size) ? new Uint8Array(await f.arrayBuffer()) : null });
                 lazyFiles.push(f);
+                lazyHandles.push(h);
             }
         }
     };

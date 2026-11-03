@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 globalThis.window = globalThis;
 const L = new Function(fs.readFileSync(new URL('./lazyfs.js', import.meta.url), 'utf8') +
-    '\nreturn { lazyCopy, lazyCache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX, LAZY_EAGER_MAX, LAZY_EAGER_BUDGET, lazyEagerTake, lazyEscapeName, lazyOverlayPath, lazyPatchIdbfs };')();
+    '\nreturn { lazyCopy, lazyCache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX, LAZY_EAGER_MAX, LAZY_EAGER_BUDGET, lazyEagerTake, lazyEscapeName, lazyGameName, lazyOverlayPath, lazyPatchIdbfs };')();
 const B = L.LAZY_BLOCK, size = 10 * (1 << 20) + 123;
 const file = Uint8Array.from({ length: size }, (_, i) => (i * 7) & 255);
 const reads = [];
@@ -52,6 +52,19 @@ assert.equal(L.lazyOverlayPath('/g', '@raw'), '/g/@raw');
 lookups.length = 0;
 assert.equal(L.lazyOverlayPath('/g', 'a/b.dat'), '/g/a/b.dat');
 assert.equal(lookups.length, 0);
+
+// A game asks for the NFC name, from Shift-JIS; a folder from macOS has NFD (te + U+3099), which Wine does not match.
+const nfd = '\u30c6\u3099', nfc = '\u30c7';
+overlay.clear();
+assert.equal(L.lazyOverlayPath('/g', `${nfd}/${nfd}.dat`), `/g/${nfc}/${nfc}.dat`);
+// A compatibility ideograph is not NFD: Wine's CP932 asks for U+FA10 itself, and NFC would turn it into U+585A.
+assert.equal(L.lazyGameName('\ufa10.dat'), '\ufa10.dat');
+// A save made under the folder's NFD spelling stays visible: pointing past it would bring the shipped file back.
+overlay.add(`/g/${nfd}`);
+assert.equal(L.lazyOverlayPath('/g', `${nfd}/a`), `/g/${nfd}/a`);
+// The NFC spelling wins once a game made it: the escaped one is how Fs::localNameToRemote spells a created name.
+overlay.add(`/g/${L.lazyEscapeName(nfc)}`);
+assert.equal(L.lazyOverlayPath('/g', `${nfd}/a`), `/g/${L.lazyEscapeName(nfc)}/a`);
 
 // The budget must stop eager reads for good: 40,000 small files all held in memory is the bug.
 assert.ok(!L.lazyEagerTake(L.LAZY_EAGER_MAX + 1));

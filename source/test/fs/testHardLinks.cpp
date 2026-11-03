@@ -7585,6 +7585,33 @@ void testDiscImageLayouts() {
         }
     }
 
+    // Real CUE sheets from Windows: a UTF-8 BOM, a name in another case, a Shift-JIS name that cannot match the file's UTF-8 one.
+    struct Sheet { const char* folder; const char* cue; const char* file; };
+    const Sheet sheets[] = {
+        { "cue-bom", "\xEF\xBB\xBF" "FILE \"disc.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n", "disc.bin" },
+        { "cue-case", "FILE \"DISC.BIN\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n", "disc.bin" },
+        { "cue-sjis", "FILE \"\x83\x51\x81\x5B\x83\x80.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n", "\xE3\x82\xB2\xE3\x83\xBC\xE3\x83\xA0.bin" },
+        { "cue-sjis-5c", "FILE \"\x83\x5C\x83\x74\x83\x67.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n", "soft.bin" }, // a trail byte that reads as a backslash
+    };
+    for (const Sheet& sheet : sheets) {
+        std::filesystem::create_directories(dir / sheet.folder, error);
+        writeTestFile(dir / sheet.folder / sheet.file, bin.data(), bin.size());
+        writeTestFile(dir / sheet.folder / "disc.cue", sheet.cue, strlen(sheet.cue));
+        std::shared_ptr<DiscImage> disc = DiscImage::open(BString::copy((dir / sheet.folder / "disc.cue").string().c_str()));
+        U8 sector3 = 0;
+        if (!disc || disc->tracks.size() != 1 || disc->readData(3 * 2048, &sector3, 1) != 1 || sector3 != 3) {
+            testFail("the CUE sheet in %s did not open its file", sheet.folder);
+        }
+    }
+    // Two BINs: nothing says which one the Shift-JIS name means, and guessing would mount the wrong data
+    std::filesystem::create_directories(dir / "cue-two", error);
+    writeTestFile(dir / "cue-two" / "a.bin", bin.data(), bin.size());
+    writeTestFile(dir / "cue-two" / "b.bin", bin.data(), bin.size());
+    writeTestFile(dir / "cue-two" / "disc.cue", sheets[2].cue, strlen(sheets[2].cue));
+    if (DiscImage::open(BString::copy((dir / "cue-two" / "disc.cue").string().c_str()))) {
+        testFail("a CUE sheet with an unknown name picked one of two BINs");
+    }
+
     // Alcohol 120%: an MDS (lead-in entry, a data and an audio track) and the MDF it names as "*.mdf"
     std::vector<U8> mds(400, 0);
     auto put16 = [&mds](size_t at, U32 v) { mds[at] = (U8)v; mds[at + 1] = (U8)(v >> 8); };

@@ -34,7 +34,10 @@ U32 FsOpenNode::internalRead(KThread* thread, U32 address, U32 len) {
         S64 offset = this->getFilePointer();
         U32 read = this->readNative(ram, len);
         if ((S32)read < 0) {
-            result = read;
+            // Earlier guest pages may already hold data: report that progress, as write() does.
+            if (!result) {
+                result = read;
+            }
             return false;
         }
         if ((S32)read > 0) {
