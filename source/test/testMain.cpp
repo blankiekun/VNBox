@@ -399,6 +399,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testWasmJitStopBlockBefore, "Test ST WASM JIT block stop before a block start", TEST_ENTRY_SERIAL},
     {testWasmJitInlineCalleeShapes, "Test ST WASM JIT inlined callee below its caller", TEST_ENTRY_SERIAL},
     {testWasmJitFailedGroupSplits, "Test ST WASM JIT failed group splits", TEST_ENTRY_SERIAL},
+    {testWasmJitFlagsMatchOneBlockPerOp, "Test ST WASM JIT flags in one block match one block per op", TEST_ENTRY_SERIAL},
     {testWasmJitRuntimeGrouping, "Test WASM JIT runtime grouping"},
     {testWasmJitPendingLifecycle, "Test WASM JIT pending lifecycle"},
     {testWasmJitTinyAnonymousPromotion, "Test WASM JIT tiny anonymous promotion"},

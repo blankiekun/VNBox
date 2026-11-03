@@ -18,6 +18,8 @@
 #include "../../emulation/cpu/wasm/wasmModuleMerger.h"
 #include "../../emulation/cpu/normal/normalCPU.h"
 #include <climits>
+#include <string>
+#include <vector>
 #include <emscripten.h>
 void clearJitBlock(const std::vector<void*>& jitOps);
 #ifdef BOXEDWINE_MULTI_THREADED
@@ -723,6 +725,139 @@ void testWasmJitLazyFlagStores() {
     if ((cpu->reg[rEdx].u32 & 0xff) != 0) testFail("forwarded high-byte non-zero: edx=%x", cpu->reg[rEdx].u32);
     contextTimeRemaining = savedBudget;
     cpu->nextOp = nullptr;
+}
+
+// Catches: a lazy type store dropped, or a result forwarded, where a later reader needs another value. Random runs of
+// register ops in one block against the same ops one block each: there nothing is dropped or forwarded and each setcc,
+// cmov and jcc reads the type and values in the CPU struct.
+void testWasmJitFlagsMatchOneBlockPerOp() {
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    contextTimeRemaining = 0x7fffffff;
+    struct Unit { std::vector<U8> b; S32 relAt = -1; }; // relAt: a jcc's rel32 to the stub
+    U32 seed = 0x9e3779b9;
+    auto rnd = [&]() { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; };
+    auto value = [&]() {
+        static const U32 edges[] = {0, 1, 2, 0x7f, 0x80, 0xff, 0x100, 0x7fff, 0x8000, 0xffff, 0x10000, 0x7fffffff, 0x80000000, 0xffffffff};
+        return (rnd() & 3) ? edges[rnd() % 14] : rnd();
+    };
+    auto r32 = [&]() { static const U8 gp[] = {0, 1, 2, 3, 5, 6}; return gp[rnd() % 6]; }; // edi marks the stub, esp stays
+    auto pushImm = [](std::vector<U8>& b, U32 imm, U32 bytes) { for (U32 i = 0; i < bytes; ++i) b.push_back((U8)(imm >> (8 * i))); };
+    auto cc = [&]() { static const U8 common[] = {4, 5, 8, 9, 10, 11}; return (U8)((rnd() & 3) ? common[rnd() % 6] : rnd() % 16); }; // z, s, p are the forwarded ones
+    auto makeOp = [&]() {
+        std::vector<U8> b;
+        const U32 kind = rnd() % 100, width = rnd() % 3; // width: 0 32 bits, 1 16 bits, 2 8 bits
+        const U8 d = width == 2 ? (U8)(rnd() % 8) : r32(), s = width == 2 ? (U8)(rnd() % 8) : r32();
+        const U8 rr = (U8)(0xc0 | (s << 3) | d);
+        const U32 immBytes = width == 0 ? 4 : width == 1 ? 2 : 1;
+        if (width == 1 && kind < 65) b.push_back(0x66);
+        if (kind < 30) { // add sub cmp test and or xor adc sbb, register form
+            static const U8 alu[] = {0x01, 0x29, 0x39, 0x85, 0x21, 0x09, 0x31, 0x11, 0x19};
+            b.push_back((U8)(alu[rnd() % (kind < 27 ? 7 : 9)] - (width == 2 ? 1 : 0)));
+            b.push_back(rr);
+        } else if (kind < 45) { // the same with an immediate
+            static const U8 ext[] = {0, 1, 4, 5, 6, 7};
+            b.push_back(width == 2 ? 0x80 : 0x81);
+            b.push_back((U8)(0xc0 | (ext[rnd() % 6] << 3) | d));
+            pushImm(b, value(), immBytes);
+        } else if (kind < 55) { // mov
+            b.push_back(width == 2 ? 0x88 : 0x89);
+            b.push_back(rr);
+        } else if (kind < 60) {
+            b.push_back((U8)((width == 2 ? 0xb0 : 0xb8) + d));
+            pushImm(b, value(), immBytes);
+        } else if (kind < 65) { // lea d,[base+index+disp8]
+            if (width == 2) b.push_back(0x66);
+            b.push_back(0x8d); b.push_back((U8)(0x44 | (r32() << 3))); b.push_back((U8)((r32() << 3) | r32())); b.push_back((U8)rnd());
+        } else if (kind < 78) { // setcc r8
+            b.push_back(0x0f); b.push_back((U8)(0x90 + cc())); b.push_back((U8)(0xc0 | (rnd() % 8)));
+        } else if (kind < 88) { // cmovcc r32
+            b.push_back(0x0f); b.push_back((U8)(0x40 + cc())); b.push_back((U8)(0xc0 | (r32() << 3) | r32()));
+        } else { // ops that drop the type or keep CF: inc dec neg shl shr sar
+            const U8 r = r32();
+            switch (rnd() % 6) {
+            case 0: b.push_back((U8)(0x40 + r)); break;
+            case 1: b.push_back((U8)(0x48 + r)); break;
+            case 2: b.push_back(0xf7); b.push_back((U8)(0xd8 + r)); break;
+            case 3: b.push_back(0xc1); b.push_back((U8)(0xe0 + r)); b.push_back((U8)(rnd() % 32)); break;
+            case 4: b.push_back(0xc1); b.push_back((U8)(0xe8 + r)); b.push_back((U8)(rnd() % 32)); break;
+            default: b.push_back(0xc1); b.push_back((U8)(0xf8 + r)); b.push_back((U8)(rnd() % 32)); break;
+            }
+        }
+        return b;
+    };
+    const U32 trials = 1500, flagMask = CF | PF | AF | ZF | SF | OF, stub = 0x800, perOp = 0x200, stride = 0x20;
+    for (U32 trial = 0; trial < trials; ++trial) {
+        JitShape t; // new memory and decoded ops
+        CPU* cpu = t.cpu;
+        std::vector<Unit> units(2 + rnd() % 14);
+        for (auto& u : units) {
+            const U32 what = rnd() % 100;
+            if (what < 6) { // a side exit
+                u.b = {0x0f, (U8)(0x80 + cc()), 0, 0, 0, 0};
+                u.relAt = 2;
+            } else {
+                u.b = makeOp();
+                if (what < 12) { // a jcc over the op: a label in the block
+                    u.b.insert(u.b.begin(), {(U8)(0x70 + cc()), (U8)u.b.size()});
+                }
+            }
+        }
+        auto place = [&](U32 offset, const Unit& u) {
+            t.context.codeIp = TEST_CODE_ADDRESS + offset;
+            for (size_t i = 0; i < u.b.size(); ++i) {
+                if (u.relAt >= 0 && (S32)i >= u.relAt && (S32)i < u.relAt + 4) {
+                    testPushCode8((stub - (offset + (U32)u.relAt + 4)) >> (8 * (i - u.relAt)));
+                } else {
+                    testPushCode8(u.b[i]);
+                }
+            }
+            return offset + (U32)u.b.size();
+        };
+        U32 end = 0;
+        for (const auto& u : units) end = place(end, u);
+        t.code(end, {0xcd, 0x97});
+        for (U32 i = 0; i < units.size(); ++i) t.code(place(perOp + i * stride, units[i]), {0xcd, 0x97});
+        t.code(stub, {0xbf, 1, 0, 0, 0, 0xcd, 0x97}); // mov edi,1; int 97
+
+        const U32 start[6] = {value(), value(), value(), value(), value(), value()}, startFlags = rnd() & flagMask;
+        auto reset = [&]() {
+            t.regs(start[0], start[1], start[2], start[3], start[4], start[5], 0);
+            cpu->lazyFlagType = FLAGS_NONE;
+            cpu->setFlags(startFlags, FMASK_ALL);
+        };
+        reset();
+        t.run(t.compile(0), 0);
+        U32 oneBlock[8];
+        for (U32 i = 0; i < 8; ++i) oneBlock[i] = cpu->reg[i].u32;
+        cpu->fillFlags();
+        const U32 oneBlockFlags = cpu->flags & flagMask;
+
+        reset();
+        for (U32 i = 0; i < units.size() && !cpu->reg[7].u32; ++i) {
+            const U32 offset = perOp + i * stride;
+            t.run(t.compile(offset), offset);
+        }
+        cpu->fillFlags();
+        bool same = (cpu->flags & flagMask) == oneBlockFlags;
+        for (U32 i = 0; i < 8; ++i) same = same && cpu->reg[i].u32 == oneBlock[i];
+        if (!same) {
+            std::string hex;
+            char text[8];
+            for (const auto& u : units) {
+                for (U8 x : u.b) { snprintf(text, sizeof(text), "%02x", x); hex += text; }
+                hex += " ";
+            }
+            testFail("trial %u: one block flags=%x eax=%x ecx=%x edx=%x ebx=%x ebp=%x esi=%x edi=%x, per op flags=%x eax=%x ecx=%x edx=%x ebx=%x ebp=%x esi=%x edi=%x; start %x %x %x %x %x %x flags %x; code %s",
+                trial, oneBlockFlags, oneBlock[0], oneBlock[1], oneBlock[2], oneBlock[3], oneBlock[5], oneBlock[6], oneBlock[7],
+                cpu->flags & flagMask, cpu->reg[0].u32, cpu->reg[1].u32, cpu->reg[2].u32, cpu->reg[3].u32, cpu->reg[5].u32, cpu->reg[6].u32, cpu->reg[7].u32,
+                start[0], start[1], start[2], start[3], start[4], start[5], startFlags, hex.c_str());
+            break;
+        }
+        cpu->nextOp = nullptr;
+    }
+    contextTimeRemaining = savedBudget;
+    testContext().cpu->nextOp = nullptr;
 }
 
 // Catches: the release-only stop before a block start (the exit in compileOps, the trim fix-up, a return site that is
