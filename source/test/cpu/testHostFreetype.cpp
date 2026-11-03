@@ -197,6 +197,26 @@ void testHostFreetypeGlyphs() {
     }
     if (glyphs < 1000) testFail("only %u glyphs compared", glyphs);
 
+    // A debug trap (hardware breakpoint set, or TF) doesn't change who owns a face. The mirror has no driver, so guest
+    // FT_Load_Glyph would fault on driver->root.library and guest FT_Done_Face would fail and leak the host face.
+    if (!call("FT_New_Memory_Face", { GUEST_LIB, font, (U32)data.size(), 0, aface }) || EAX) testFail("second FT_New_Memory_Face not done on the host");
+    U32 face2 = memory->readd(aface);
+    if (guest<FT_FaceRec>(face).driver) testFail("the mirror has a driver: guest code could run on it");
+    cpu->debugTrapActive = true;
+    U32 gi = FT_Get_Char_Index(want, 'g');
+    FT_Error terr = FT_Load_Glyph(want, gi, FT_LOAD_NO_HINTING);
+    if (!call("FT_Load_Glyph", { face, gi, FT_LOAD_NO_HINTING }) || EAX != (U32)terr) testFail("FT_Load_Glyph on a host face left to the guest under a debug trap");
+    U32 tslot = gaddr(guest<FT_FaceRec>(face).glyph);
+    if (guest<FT_GlyphSlotRec>(tslot).outline.n_points != want->glyph->outline.n_points) testFail("slot not synced under a debug trap");
+    terr = FT_Render_Glyph(want->glyph, FT_RENDER_MODE_NORMAL);
+    if (!call("FT_Render_Glyph", { tslot, FT_RENDER_MODE_NORMAL }) || EAX != (U32)terr) testFail("FT_Render_Glyph on a host slot left to the guest under a debug trap");
+    if (!call("FT_Done_Face", { face2 }) || EAX) testFail("FT_Done_Face on a host face left to the guest under a debug trap");
+    // what is still open goes to the guest, whose functions are valid for it and step through its watched writes
+    if (call("FT_New_Memory_Face", { GUEST_LIB, font, (U32)data.size(), 0, aface })) testFail("new face taken under a debug trap");
+    if (call("FT_Outline_Get_Bitmap", { GUEST_LIB, tslot + (U32)offsetof(FT_GlyphSlotRec, outline), bitmapRec })) testFail("FT_Outline_Get_Bitmap taken under a debug trap");
+    cpu->debugTrapActive = false;
+    if (call("FT_Load_Glyph", { face2, 1, 0 })) testFail("call on a face freed under a debug trap taken");
+
     // objects the host didn't create stay guest code
     if (call("FT_Load_Glyph", { heap + 0x3000, 1, 0 }) || call("FT_Render_Glyph", { heap + 0x3000, 0 }) || call("FT_Done_Face", { heap + 0x3000 }))
         testFail("call on a guest face taken");

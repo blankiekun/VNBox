@@ -33,7 +33,9 @@ constexpr U32 STACK = HEAP + 0x400, INST = HEAP + 0x500, HDR = HEAP + 0x600, WFX
 constexpr U32 SRC = HEAP + 0x1000, DST = HEAP + 0x10000, RET = 0x12345678;
 
 // 0.25 s of a stereo 44.1 kHz tone as an Ogg Vorbis stream (headers on their own pages, as encoders write them).
-std::vector<U8> encode() {
+// headerBytes: when given, every audio packet gets its own page (so a convert can be handed exactly one more packet)
+// and this is where the audio pages start.
+std::vector<U8> encode(U32* headerBytes = nullptr) {
     vorbis_info vi;
     vorbis_comment vc;
     vorbis_dsp_state vd;
@@ -57,6 +59,7 @@ std::vector<U8> encode() {
     ogg_stream_packetin(&os, &h2);
     ogg_stream_packetin(&os, &h3);
     while (ogg_stream_flush(&os, &og)) put(og);
+    if (headerBytes) *headerBytes = (U32)out.size();
     for (int done = 0, n = 1; n; done += n) {
         n = std::min(1024, 11025 - done); // the last round (n = 0) ends the stream
         if (n) {
@@ -69,7 +72,7 @@ std::vector<U8> encode() {
             vorbis_bitrate_addblock(&vb);
             while (vorbis_bitrate_flushpacket(&vd, &op)) {
                 ogg_stream_packetin(&os, &op);
-                while (ogg_stream_pageout(&os, &og)) put(og);
+                while (headerBytes ? ogg_stream_flush(&os, &og) : ogg_stream_pageout(&os, &og)) put(og);
             }
         }
     }
@@ -138,7 +141,7 @@ bool convert(const U8* src, U32 len, U32 dstLen, std::vector<U8>& pcm, U32 used 
 
 void testHostAcmConvert() {
     std::vector<U8> ogg = encode();
-    std::vector<U8> whole, pieces;
+    std::vector<U8> whole, pieces, none;
     setup(0x1111);
     if (!convert(ogg.data(), (U32)ogg.size(), 0xE000, whole)) testFail("stream with headers not taken");
     if (whole.size() < 40000) testFail("decoded only %d bytes", (int)whole.size());
@@ -152,9 +155,48 @@ void testHostAcmConvert() {
     for (int i = 0; i < 40 && pieces.size() < whole.size(); i++) convert(nullptr, 0, 3000, pieces, 8);
     if (pieces != whole) testFail("PCM depends on the buffer split: %d vs %d bytes", (int)pieces.size(), (int)whole.size());
     driverProc(0x604d);
+    // A destination that isn't a whole number of samples, or holds less than one: the convert must stop (it spun forever,
+    // with the tab frozen, when a partly written block met 2 spare bytes) and no packet may be lost to the pending block.
+    U32 headerBytes, next = 0x5000;
+    std::vector<U8> paged = encode(&headerBytes), pagedWhole;
+    setup(next++);
+    if (!convert(paged.data(), (U32)paged.size(), 0xE000, pagedWhole) || pagedWhole.size() < 40000) testFail("page-per-packet stream not decoded");
+    driverProc(0x604d);
+    for (std::vector<U32> rooms : std::vector<std::vector<U32>>{ { 3002 }, { 3, 3000 }, { 0, 3000 }, { 3, 3, 3000 }, { 3001, 2, 3003 } }) {
+        std::vector<U8> split;
+        setup(next++);
+        size_t room = 0;
+        if (!convert(paged.data(), headerBytes, rooms[room++ % rooms.size()], split)) testFail("stream with headers not taken");
+        for (U32 pos = headerBytes; pos < paged.size(); pos += 60) convert(paged.data() + pos, std::min(60u, (U32)paged.size() - pos), rooms[room++ % rooms.size()], split);
+        for (int i = 0; i < 400 && split.size() < pagedWhole.size(); i++) convert(nullptr, 0, rooms[room++ % rooms.size()], split);
+        if (split != pagedWhole) testFail("PCM depends on the room left (first room %u): %d vs %d bytes", rooms[0], (int)split.size(), (int)pagedWhole.size());
+        driverProc(0x604d);
+    }
+    // A debug trap (hardware breakpoint set, or TF) on a stream the host owns: the guest decoder saw none of its pages, so
+    // it stays on the host, and its close still frees the host state (the same object then starts from nothing).
+    std::vector<U8> trapped;
+    setup(0x6000);
+    if (!convert(paged.data(), headerBytes, 3000, trapped)) testFail("stream with headers not taken");
+    cpu->debugTrapActive = true;
+    for (U32 pos = headerBytes; pos < paged.size(); pos += 60) {
+        if (!convert(paged.data() + pos, std::min(60u, (U32)paged.size() - pos), 3000, trapped)) testFail("owned stream left to the guest under a debug trap");
+    }
+    for (int i = 0; i < 40 && trapped.size() < pagedWhole.size(); i++) convert(nullptr, 0, 3000, trapped);
+    if (trapped != pagedWhole) testFail("PCM differs with a debug trap on: %d vs %d bytes", (int)trapped.size(), (int)pagedWhole.size());
+    driverProc(0x604d);
+    setup(0x6000);
+    trapped.clear();
+    if (!convert(paged.data(), (U32)paged.size(), 0xE000, trapped) || trapped != pagedWhole) testFail("close under a debug trap did not free the host stream");
+    driverProc(0x604d);
+    // A first convert under a debug trap leaves the stream to the guest for good: its decoder has then seen the headers.
+    setup(0x6100);
+    cpu->debugTrapActive = true;
+    if (convert(ogg.data(), (U32)ogg.size(), 0xE000, none)) testFail("new stream taken under a debug trap");
+    cpu->debugTrapActive = false;
+    if (convert(ogg.data(), (U32)ogg.size(), 0xE000, none)) testFail("stream first seen under a debug trap taken later");
+    driverProc(0x604d);
     // a stream whose first convert has no headers stays with the guest, even when headers come later
     setup(0x3333);
-    std::vector<U8> none;
     if (convert(ogg.data() + ogg.size() / 2, (U32)(ogg.size() - ogg.size() / 2), 0xE000, none)) testFail("headerless stream taken");
     if (convert(ogg.data(), (U32)ogg.size(), 0xE000, none)) testFail("guest stream taken later");
     driverProc(0x604d);

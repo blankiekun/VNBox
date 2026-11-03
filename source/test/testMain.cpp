@@ -911,6 +911,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testRetn16_0x0c3, "Test Retn16 0c3"},
     {testRetn32_0x2c3, "Test Retn32 2c3"},
     {testHostLibcCopy, "Test native libc memcpy/memmove/memset"},
+    {testHostLibcDebugTrap, "Test a hooked export under a debug trap runs the guest function one step"},
     {testHostLibcCompare, "Test native libc memcmp/strcmp/strncmp"},
     {testHostLibcScan, "Test native libc strlen/memchr/strchr/strrchr/strcpy"},
     {testHostLibcStrtol, "Test native libc strtol/strtoul"},

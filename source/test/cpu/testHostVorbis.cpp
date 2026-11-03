@@ -169,9 +169,10 @@ void testHostVorbisDecode() {
     int blocksize1;
     std::vector<ogg_packet> packets = encode(store, blocksize1);
     std::vector<float> want = reference(packets), got;
-    guestInit(blocksize1, VI2);
-    initCalls(packets, VI2); // headers went into VI, the stream decodes with its copy
+    // decodes every packet the way vorbisfile does; a debug trap (hardware breakpoint set, or TF) is on from packet trapAt
+    auto decode = [&](size_t trapAt, std::vector<float>& got) {
     for (size_t i = 3; i < packets.size(); i++) {
+        cpu->debugTrapActive = i >= trapAt;
         putPacket(packets[i]);
         if (!call("vorbis_synthesis", { VB, OP })) testFail("synthesis not done on the host");
         if (!EAX && (!call("vorbis_synthesis_blockin", { VD, VB }) || EAX)) testFail("blockin failed");
@@ -196,8 +197,42 @@ void testHostVorbisDecode() {
             if (!call("vorbis_synthesis_read", { VD, n }) || EAX) testFail("read failed");
         }
     }
+    cpu->debugTrapActive = false;
+    };
+    guestInit(blocksize1, VI2);
+    initCalls(packets, VI2); // headers went into VI, the stream decodes with its copy
+    decode(packets.size(), got);
     if (got.size() < 20000) testFail("decoded only %d samples", (int)got.size() / 2);
     if (got != want) testFail("samples differ from host libvorbis: %d vs %d", (int)got.size(), (int)want.size());
+    clearCalls();
+    // A debug trap on a stream the host already decodes: the guest's state was never advanced, so it stays on the host.
+    std::vector<float> trapped;
+    guestInit(blocksize1, VI2);
+    initCalls(packets, VI2);
+    decode(4, trapped);
+    if (trapped != want) testFail("samples differ with a debug trap on: %d vs %d", (int)trapped.size(), (int)want.size());
+    cpu->debugTrapActive = true;
+    clearCalls(); // the host copies must go even under the trap
+    cpu->debugTrapActive = false;
+    putPacket(packets[3]);
+    if (call("vorbis_synthesis", { VB, OP })) testFail("objects cleared under a debug trap still taken");
+    // Mirrored calls have no guest effect of their own, so they follow under a trap: nothing has diverged yet at the first host-only call.
+    trapped.clear();
+    guestInit(blocksize1, VI2);
+    cpu->debugTrapActive = true;
+    initCalls(packets, VI2);
+    cpu->debugTrapActive = false;
+    decode(packets.size(), trapped);
+    if (trapped != want) testFail("samples differ after init under a debug trap: %d vs %d", (int)trapped.size(), (int)want.size());
+    clearCalls();
+    // That first host-only call is where the stream is decided: under a trap it stays guest code for good.
+    guestInit(blocksize1, VI2);
+    initCalls(packets, VI2);
+    putPacket(packets[3]);
+    cpu->debugTrapActive = true;
+    if (call("vorbis_synthesis", { VB, OP })) testFail("new stream taken under a debug trap");
+    cpu->debugTrapActive = false;
+    if (call("vorbis_synthesis", { VB, OP }) || call("vorbis_synthesis_pcmout", { VD, 0 })) testFail("stream decided under a debug trap taken later");
     clearCalls();
     // a guest vd that doesn't point at the vi it was initialized with (another layout): left to the guest for good
     guestInit(blocksize1, VI + 4);

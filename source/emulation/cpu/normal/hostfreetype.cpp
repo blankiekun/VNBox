@@ -431,17 +431,19 @@ static bool hostFtRenderGlyph(CPU* cpu, HostFtFace& f, U32 mode, S32& result) {
 bool hostFreetypeRun(CPU* cpu, U32 fn) {
 #ifdef BOXEDWINE_HOST_FREETYPE
     KMemory* memory = cpu->memory;
-    if (cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF || cpu->seg[CS].address || cpu->seg[DS].address ||
+    // A debug trap only sends what guest code can do to the guest (a new face, FT_Outline_Get_Bitmap). A host face stays on
+    // the host: its mirror has no driver, so guest code would fault on it. shortcut: its writes don't fire a watchpoint.
+    if (!cpu->isBig() || cpu->stackMask != 0xFFFFFFFF || cpu->seg[CS].address || cpu->seg[DS].address ||
         cpu->seg[ES].address || cpu->seg[SS].address || !memory->canRead(ESP, 24)) return false;
     U32 ret = memory->readd(ESP), a0 = memory->readd(ESP + 4), a1 = memory->readd(ESP + 8), a2 = memory->readd(ESP + 12);
     U32 a3 = memory->readd(ESP + 16), a4 = memory->readd(ESP + 20);
     S32 result = 0;
     switch (fn) {
     case FTH_NEW_MEMORY_FACE:
-        if (!hostFtNewMemoryFace(cpu, a0, a1, a2, (S32)a3, a4, ret, result)) return false;
+        if (cpu->debugTrapActive || !hostFtNewMemoryFace(cpu, a0, a1, a2, (S32)a3, a4, ret, result)) return false;
         break;
     case FTH_OUTLINE_GET_BITMAP:
-        if (!hostFtOutlineGetBitmap(cpu, a0, a1, a2, result)) return false;
+        if (cpu->debugTrapActive || !hostFtOutlineGetBitmap(cpu, a0, a1, a2, result)) return false;
         break;
     case FTH_LIBRARY_SET_LCD_FILTER:
         if (HostFtLibrary* l = hostFtLibrary(cpu->thread->process->id, a0)) FT_Library_SetLcdFilter(l->lib, (FT_LcdFilter)a1);

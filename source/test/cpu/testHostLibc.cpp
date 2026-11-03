@@ -16,6 +16,7 @@
 // would fault (unmapped, read-only, or a page its word reads could reach).
 #include "testHostLibc.h"
 #include "testCPU.h"
+#include "ksignal.h"
 
 U32 hostLibcFnId(const char* name);
 bool hostLibcRun(CPU* cpu, U32 fn);
@@ -23,6 +24,8 @@ bool hostClockRun(CPU* cpu, U32 fn); // hostclock.cpp, fn: 1 NtQueryPerformanceC
 
 #define cpu (testContext().cpu)
 #define memory (testContext().memory)
+
+extern thread_local U32 hostLibcTestAddress, hostLibcTestFn;
 
 namespace {
 
@@ -87,7 +90,7 @@ void testHostLibcCopy() {
     expect("memset result", call("memset", HEAP + K_PAGE_SIZE - 3, 0x1AB, 6, true), HEAP + K_PAGE_SIZE - 3);
     for (U32 i = 0; i < 6; i++) expect("memset byte (low 8 bits of c)", memory->readb(HEAP + K_PAGE_SIZE - 3 + i), 0xAB);
     expect("memset outside", memory->readb(HEAP + K_PAGE_SIZE + 3), 0);
-    call("memmove", UNMAPPED, UNMAPPED, 100, true); // dst == src: glibc touches nothing
+    expect("memmove dst == src result", call("memmove", UNMAPPED, UNMAPPED, 100, true), UNMAPPED); // glibc touches nothing and returns dst
     call("memcpy", UNMAPPED, UNMAPPED, 0, true);    // zero length: nothing read or written
 
     memory->memset(LAST_PAGE - 8, 0x11, 8);
@@ -97,6 +100,59 @@ void testHostLibcCopy() {
     memory->mprotect(testContext().thread, LAST_PAGE, K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE);
     for (U32 i = 0; i < 8; i++) expect("no partial write before a fallback", memory->readb(LAST_PAGE - 8 + i), 0x11);
     call("memcpy", HEAP, UNMAPPED - 4, 8, false); // source runs into an unmapped page
+}
+
+// Catches: a hooked export reached while a debug trap is active (hardware breakpoint set, or TF) raising SIGILL instead
+// of running the guest function, the fallback running on past the single step, and TF's trap landing anywhere but
+// after that one op. The head op is the real one (NormalCPU::getOp), at an address hostLibcAt is told about.
+void testHostLibcDebugTrap() {
+    constexpr U32 CODE = TEST_CODE_ADDRESS, OP2 = CODE + 5, HANDLER = CODE + 0x40;
+    for (bool useTf : { false, true }) {
+        setup();
+        KSigAction& ill = testContext().process->sigActions[K_SIGILL];
+        KSigAction& trap = testContext().process->sigActions[K_SIGTRAP];
+        ill.reset();
+        trap.reset();
+        ill.handlerAndSigAction = trap.handlerAndSigAction = HANDLER;
+        testPushCode8(0xB8); // mov eax, 0x11223344: the guest function's first op
+        for (U8 b : { 0x44, 0x33, 0x22, 0x11 }) testPushCode8(b);
+        testPushCode8(0x43); // inc ebx: must wait for the next step
+        hostLibcTestAddress = CODE;
+        hostLibcTestFn = hostLibcFnId("strlen");
+        ESP = STACK;
+        cpu->eip.u32 = CODE;
+        if (useTf) {
+            cpu->fillFlags();
+            cpu->setFlags(TF, TF);
+        } else {
+            testContext().thread->debugRegs[0] = HEAP + 0x800; // a write watchpoint nothing here touches
+            testContext().thread->debugRegs[7] = 3 | (1u << 16) | (3u << 18);
+            testContext().thread->updateDebugTrapActive();
+        }
+        cpu->nextOp = cpu->getNextOp();
+        if (cpu->nextOp->inst != Custom1) testFail("no head op at the hooked address");
+        cpu->run();
+        hostLibcTestFn = 0;
+        if (ill.sigInfo[0] == K_SIGILL) testFail("hooked export under a debug trap raised SIGILL (tf %d)", useTf);
+        if (useTf) { // the handler was entered: what the op left is in the signal's saved context
+            if (trap.sigInfo[0] != K_SIGTRAP) testFail("TF over a hooked export: no SIGTRAP");
+            U32 context = memory->readd(ESP + 12);
+            expect("first guest op ran", memory->readd(context + 0x40), 0x11223344);
+            expect("second guest op waits", memory->readd(context + 0x34), 0);
+            expect("TF trap eip", memory->readd(context + 0x4c), OP2);
+            expect("handler entered", cpu->eip.u32, HANDLER);
+        } else {
+            expect("first guest op ran", EAX, 0x11223344);
+            expect("second guest op waits", EBX, 0);
+            expect("eip after one op", cpu->eip.u32, OP2);
+        }
+        ill.reset();
+        trap.reset();
+        cpu->debugTrapOnNextInstruction = false;
+        cpu->setFlags(0, TF);
+        testContext().thread->debugRegs[7] = 0;
+        testContext().thread->updateDebugTrapActive();
+    }
 }
 
 // Catches: signed-char compares (0x80 vs 0x01), memcmp's -1/1 (not a byte difference), strcmp's byte
