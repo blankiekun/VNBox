@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "vnboxstats.h"
 
 #include "kpoll.h"
 #include "kscheduler.h"
@@ -163,7 +164,26 @@ U32 kpoll(KThread* thread, U32 pfds, U32 nfds, U32 timeout) {
     return result;
 }
 
+static U32 kselectFds(KThread* thread, U32 nfds, U32 readfds, U32 writefds, U32 errorfds, U32 timeout, bool timeoutIsTimeVal, U32 sigmask, bool time64);
+
+// stats=1 [frames]: a select with no fds is a sleep (Wine's NtDelayExecution); counted once, when it finishes (a
+// blocked call runs again when the thread wakes).
 U32 kselect(KThread* thread, U32 nfds, U32 readfds, U32 writefds, U32 errorfds, U32 timeout, bool timeoutIsTimeVal, U32 sigmask, bool time64) {
+    U32 result = kselectFds(thread, nfds, readfds, writefds, errorfds, timeout, timeoutIsTimeVal, sigmask, time64);
+    if (vnboxStats.on && !nfds && result != (U32)-K_WAIT) {
+        S64 ms = -1;
+        if (timeout) {
+            U32 unit = timeoutIsTimeVal ? 1000 : 1000000;
+            KMemory* memory = thread->memory;
+            ms = time64 ? (S64)memory->readq(timeout) * 1000 + (memory->readd(timeout + 8) + unit - 1) / unit
+                        : (S64)memory->readd(timeout) * 1000 + (memory->readd(timeout + 4) + unit - 1) / unit;
+        }
+        vnboxStatSleep(thread, false, ms);
+    }
+    return result;
+}
+
+static U32 kselectFds(KThread* thread, U32 nfds, U32 readfds, U32 writefds, U32 errorfds, U32 timeout, bool timeoutIsTimeVal, U32 sigmask, bool time64) {
     S32 result = 0;
     int count = 0;
     U32 pollCount = 0;

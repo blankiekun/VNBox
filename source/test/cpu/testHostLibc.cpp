@@ -19,6 +19,7 @@
 
 U32 hostLibcFnId(const char* name);
 bool hostLibcRun(CPU* cpu, U32 fn);
+bool hostClockRun(CPU* cpu, U32 fn); // hostclock.cpp, fn: 1 NtQueryPerformanceCounter, 2 NtQuerySystemTime, 3 RtlGetSystemTimePrecise
 
 #define cpu (testContext().cpu)
 #define memory (testContext().memory)
@@ -193,6 +194,60 @@ void testHostLibcStrtol() {
     memory->strcpy(HEAP, "123");
     expect("strtol without endptr", call("strtol", HEAP, 0, 10, true), 123);
     call("strtol", HEAP, UNMAPPED, 10, false); // endptr store would fault
+}
+
+
+// Native clock (hostclock.cpp) must give the values Wine's unix side computed from the clock_gettime64 syscall
+// (ticks = 100 ns; QPC from CLOCK_BOOTTIME, system time from CLOCK_REALTIME since 1601), return like `ret 8` /
+// `ret 4` / `ret`, and leave an unwritable pointer to the guest. Catches a wrong unit (us vs 100 ns), a missing
+// 1601 epoch, a stdcall return that doesn't pop the arguments, and a write before the fallback.
+void testHostClock() {
+    auto clockTicks = [](U32 clockId) { // what Wine computes from the syscall: tv_sec * 10^7 + tv_nsec / 100
+        U32 ts = HEAP + 0x900;
+        KSystem::clock_gettime64(testContext().thread, clockId, ts);
+        return memory->readq(ts) * 10000000 + memory->readd(ts + 8) / 100;
+    };
+    auto run = [](U32 fn, U32 a0, U32 a1, bool expectNative, U32 pop) {
+        ESP = STACK;
+        memory->writed(STACK, RET);
+        memory->writed(STACK + 4, a0);
+        memory->writed(STACK + 8, a1);
+        EAX = 0xDEADBEEF;
+        cpu->eip.u32 = 0x1000;
+        bool ran = hostClockRun(cpu, fn);
+        if (ran != expectNative) testFail("clock %d: native %d, expected %d", fn, ran, expectNative);
+        if (ran && (ESP != STACK + 4 + pop || cpu->eip.u32 != RET)) testFail("clock %d did not return like `ret %d`", fn, pop);
+        if (!ran && (ESP != STACK || cpu->eip.u32 != 0x1000 || EAX != 0xDEADBEEF)) testFail("clock %d changed registers before falling back", fn);
+    };
+    setup();
+    U32 counter = HEAP + 0x100, freq = HEAP + 0x108;
+    U64 before = clockTicks(7); // CLOCK_BOOTTIME
+    run(1, counter, freq, true, 8);
+    U64 after = clockTicks(7);
+    U64 qpc = memory->readq(counter);
+    if (qpc < before || qpc > after) testFail("QPC %llu not within the syscall's %llu..%llu", qpc, before, after);
+    expect("QPC status", EAX, 0);
+    if (memory->readq(freq) != 10000000) testFail("QPC frequency %llu", memory->readq(freq));
+    memory->writeq(freq, 0);
+    run(1, counter, 0, true, 8); // no frequency asked
+    if (memory->readq(freq) != 0) testFail("QPC wrote a null frequency pointer");
+    run(1, UNMAPPED, freq, false, 0);
+    run(1, counter, UNMAPPED, false, 0);
+    if (memory->readq(freq) != 0) testFail("QPC wrote before falling back");
+
+    U32 time = HEAP + 0x110;
+    before = clockTicks(5) + 116444736000000000ull; // CLOCK_REALTIME_COARSE, the clock NtQuerySystemTime picks
+    run(2, time, 0, true, 4);
+    after = clockTicks(5) + 116444736000000000ull;
+    U64 t = memory->readq(time);
+    if (t < before || t > after) testFail("system time %llu not within the syscall's %llu..%llu", t, before, after);
+    run(2, UNMAPPED, 0, false, 0);
+
+    before = clockTicks(0) + 116444736000000000ull; // CLOCK_REALTIME
+    run(3, 0, 0, true, 0);
+    t = ((U64)EDX << 32) | EAX;
+    after = clockTicks(0) + 116444736000000000ull;
+    if (t < before || t > after) testFail("precise system time %llu not within the syscall's %llu..%llu", t, before, after);
 }
 
 #endif

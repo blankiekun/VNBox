@@ -1,0 +1,93 @@
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -813,7 +813,9 @@
+     /* A test on Windows 2000 shows that Windows always yields during
+        a wait, but a wait that is hit by an event gets a priority
+        boost as well.  This seems to model that behavior the closest.  */
+-    if (ret == STATUS_TIMEOUT) NtYieldExecution();
++    /* VNBox: only a zero-timeout poll yields here; a wait that timed out after a non-zero timeout
++     * already gave up the CPU for that long, so its sched_yield + 2 getrusage were pure cost. */
++    if (ret == STATUS_TIMEOUT && timeout && !timeout->QuadPart) NtYieldExecution();
+     return ret;
+ }
+ 
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2397,21 +2397,13 @@
+ NTSTATUS WINAPI NtYieldExecution(void)
+ {
+ #ifdef HAVE_SCHED_YIELD
+-#ifdef RUSAGE_THREAD
+-    struct rusage u1, u2;
+-    int ret;
+-
+-    ret = getrusage( RUSAGE_THREAD, &u1 );
+-#endif
++    /* VNBox: Boxedwine's getrusage() leaves ru_nvcsw and ru_nivcsw at 0, so the two RUSAGE_THREAD
++     * calls Wine makes around sched_yield() always compared equal and this always returned
++     * STATUS_NO_YIELD_PERFORMED. Same result without them: Sleep(0), SwitchToThread, zero-timeout
++     * waits and every empty PeekMessage get here. */
+     sched_yield();
+-#ifdef RUSAGE_THREAD
+-    if (!ret) ret = getrusage( RUSAGE_THREAD, &u2 );
+-    if (!ret && u1.ru_nvcsw == u2.ru_nvcsw && u1.ru_nivcsw == u2.ru_nivcsw) return STATUS_NO_YIELD_PERFORMED;
+ #endif
+-    return STATUS_SUCCESS;
+-#else
+     return STATUS_NO_YIELD_PERFORMED;
+-#endif
+ }
+ 
+ 
+@@ -2425,6 +2417,15 @@
+     /* if alertable, we need to query the server */
+     if (alertable)
+     {
++        /* VNBox: with ntsync, wait on this thread's user APC alert alone (no objects), as an alertable
++         * WaitForSingleObjectEx already does, instead of a wineserver select round trip per sleep.
++         * SleepEx(0, TRUE) still yields, as it did through server_wait. */
++        if ((status = inproc_wait( 0, NULL, WaitAny, TRUE, timeout )) != STATUS_NOT_IMPLEMENTED)
++        {
++            if (status != STATUS_TIMEOUT) return status;
++            if (timeout && !timeout->QuadPart) NtYieldExecution();
++            return STATUS_SUCCESS;
++        }
+         /* Since server_wait will result in an unconditional implicit yield,
+            we never return STATUS_NO_YIELD_PERFORMED */
+         if ((status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, timeout )) == STATUS_TIMEOUT)
+@@ -2441,26 +2442,25 @@
+         LARGE_INTEGER now;
+         timeout_t when, diff;
+ 
+-        if ((when = timeout->QuadPart) < 0)
+-        {
+-            NtQuerySystemTime( &now );
+-            when = now.QuadPart - when;
+-        }
++        /* VNBox: only a zero timeout (Sleep(0)) yields; it is the only case whose result
++         * (STATUS_NO_YIELD_PERFORMED) depends on the yield. A non-zero sleep blocks in select()
++         * anyway, so its sched_yield and the two getrusage calls around it were pure cost
++         * (Sleep(1) loops run ~1000 times a second per thread). The clock is read once before
++         * the first select() and again only after an interrupted one, instead of twice per sleep. */
++        if (!timeout->QuadPart) return NtYieldExecution();
+ 
+-        /* Note that we yield after establishing the desired timeout, but
+-           we only care about the result of the yield for zero timeouts */
+-        status = NtYieldExecution();
+-        if (!when) return status;
++        NtQuerySystemTime( &now );
++        if ((when = timeout->QuadPart) < 0) when = now.QuadPart - when;
+ 
+         for (;;)
+         {
+             struct timeval tv;
+-            NtQuerySystemTime( &now );
+             diff = (when - now.QuadPart + 9) / 10;
+             if (diff <= 0) break;
+             tv.tv_sec  = diff / 1000000;
+             tv.tv_usec = diff % 1000000;
+             if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
++            NtQuerySystemTime( &now );
+         }
+     }
+     return STATUS_SUCCESS;

@@ -11,6 +11,8 @@ $(MOVIE_DECODER): vnbox-movie-decoder.c $(PROJDIR)/lib/pl_mpeg/pl_mpeg.h
 		-sALLOW_MEMORY_GROWTH -sFILESYSTEM=0 -sEXPORTED_FUNCTIONS=_malloc,_free -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPF32
 	@{ echo "/*!"; cat $(PROJDIR)/lib/pl_mpeg/LICENSE; echo "*/"; cat $@.tmp.js; } > $@ && rm $@.tmp.js
 
+# Host FreeType, every target (vnbox-freetype.mk).
+include vnbox-freetype.mk
 # Host DIB primitives, every target (vnbox-dibdrv.mk).
 include vnbox-dibdrv.mk
 

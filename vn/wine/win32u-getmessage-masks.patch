@@ -1,0 +1,60 @@
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3282,13 +3282,56 @@
+     return counter.QuadPart * 8000 / freq.QuadPart; /* 8kHz */
+ }
+ 
++/* VNBox: 0 when WINE_VNBOX_GETMSG_MASKS=0 (URL option cheapGetMessage=0): check_for_driver_events resets the
++ * queue masks again, as upstream does. */
++static BOOL keep_queue_masks(void)
++{
++    static int keep = -1;
++    if (keep == -1)
++    {
++        const char *env = getenv( "WINE_VNBOX_GETMSG_MASKS" );
++        keep = !env || strcmp( env, "0" );
++    }
++    return keep;
++}
++
++/* VNBox: process_driver_events( QS_ALLINPUT, 0, 0 ) without the set_queue_mask request that only resets the
++ * masks to 0 when nothing was drained. GetMessage's get_message request set them, and resetting them made the
++ * next peek_message miss the shared memory check and ask the server again (set_queue_mask + get_message with
++ * no message = 2 extra wineserver round trips per message whenever an 8 kHz tick passed in between, which in
++ * VNBox is nearly every message). The masks only decide when the queue is signaled, and every wait sets
++ * them first (wait_message), so this is the state native Wine is in whenever no tick passed. */
++static void process_driver_events_keep_masks(void)
++{
++    if (check_internal_bits( QS_DRIVER ) && user_driver->pProcessEvents( QS_ALLINPUT ))
++    {
++        SERVER_START_REQ( set_queue_mask )
++        {
++            req->poll_events = TRUE;
++            req->wake_mask = 0;
++            req->changed_mask = 0;
++            wine_server_call( req );
++        }
++        SERVER_END_REQ;
++    }
++
++    /* process every pending internal hardware messages */
++    if (check_internal_bits( QS_HARDWARE ))
++    {
++        struct peek_message_filter filter = {.internal = TRUE};
++        MSG msg;
++        peek_message( &msg, &filter );
++    }
++}
++
+ /* check for driver events if we detect that the app is not properly consuming messages */
+ static inline void check_for_driver_events(void)
+ {
+     if (get_user_thread_info()->last_driver_time != get_driver_check_time())
+     {
+         flush_window_surfaces( FALSE );
+-        process_driver_events( QS_ALLINPUT, 0, 0 );
++        if (keep_queue_masks()) process_driver_events_keep_masks();
++        else process_driver_events( QS_ALLINPUT, 0, 0 );
+         get_user_thread_info()->last_driver_time = get_driver_check_time();
+     }
+ }
