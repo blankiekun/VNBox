@@ -25,6 +25,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeDibdrv",
+      "label": "Native GDI drawing",
+      "description": "Runs Wine's per-pixel GDI drawing into bitmaps (text, fills, blits, blends) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "cheapGetMessage",
       "label": "Cheap message retrieval",
       "description": "GetMessage asks Wine's server only for the message itself, not twice more to reset and re-read its queue state.",
