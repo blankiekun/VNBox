@@ -32,6 +32,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeFreetype",
+      "label": "Native FreeType",
+      "description": "Loads and draws Windows text glyphs (GDI fonts) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "hotGroup",
       "label": "Hot code groups",
       "description": "Compiles code that runs hot together into one module, so it runs faster.",

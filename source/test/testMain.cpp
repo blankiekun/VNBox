@@ -32,6 +32,7 @@
 #include "cpu/testHostLibc.h"
 #include "cpu/testHostAcm.h"
 #include "cpu/testHostVorbis.h"
+#include "cpu/testHostFreetype.h"
 #include "cpu/testHostWined3d.h"
 #include "opengl/testHostWined3dWgl.h"
 #include "cpu/testCMov.h"
@@ -916,6 +917,9 @@ const TestEntry TEST_ENTRIES[] = {
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
+#endif
+#ifdef BOXEDWINE_HOST_FREETYPE
+    {testHostFreetypeGlyphs, "Test host FreeType faces and glyphs as win32u uses them"},
 #endif
 #ifdef BOXEDWINE_HOST_WINED3D
     {testHostWined3dNo3d, "Test host wined3d links and creates a no-3D wined3d", TEST_ENTRY_SERIAL},
