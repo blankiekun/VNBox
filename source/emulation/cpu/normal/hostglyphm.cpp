@@ -62,26 +62,24 @@ static U32 gmCalls[GM_FNS], gmGuest[GM_FNS];
 static const char* gmWhy; // why the last call was left to the guest (logged for the first one per function)
 
 #if !defined(BOXEDWINE_MULTI_THREADED)
-static U32 gmElf16(const U8* p) { return p[0] | (p[1] << 8); }
-static U32 gmElf32(const U8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((U32)p[3] << 24); }
+U32 hostElf16(const U8* p); // hosthooks.cpp
+U32 hostElf32(const U8* p);
+bool hostFileRead(KFile* file, U64 offset, std::vector<U8>& buf, U32 len);
+void hostHookOff(const char* what); // hosthooks.cpp: tells the page a hook pinned to this root fs did not take
 
 // Reads both exports from .dynsym and the file (i386 REL: a pointer's link address is stored in place).
 static bool hostGlyphmParse(KFile* file) {
-    auto read = [file](U64 offset, std::vector<U8>& buf, U32 len) {
-        buf.resize(len);
-        return file->preadNative(buf.data(), (S64)offset, len) == len;
-    };
     std::vector<U8> eh, ph, sh, syms, names, buf;
-    if (!read(0, eh, 52) || memcmp(eh.data(), "\x7f" "ELF\x01\x01", 6) || gmElf16(&eh[18]) != 3) return false;
-    U32 phoff = gmElf32(&eh[28]), phentsize = gmElf16(&eh[42]), phnum = gmElf16(&eh[44]);
-    U32 shoff = gmElf32(&eh[32]), shentsize = gmElf16(&eh[46]), shnum = gmElf16(&eh[48]);
-    if (phentsize != 32 || shentsize != 40 || !read(phoff, ph, phnum * 32) || !shnum || !read(shoff, sh, shnum * 40)) return false;
+    if (!hostFileRead(file, 0, eh, 52) || memcmp(eh.data(), "\x7f" "ELF\x01\x01", 6) || hostElf16(&eh[18]) != 3) return false;
+    U32 phoff = hostElf32(&eh[28]), phentsize = hostElf16(&eh[42]), phnum = hostElf16(&eh[44]);
+    U32 shoff = hostElf32(&eh[32]), shentsize = hostElf16(&eh[46]), shnum = hostElf16(&eh[48]);
+    if (phentsize != 32 || shentsize != 40 || !hostFileRead(file, phoff, ph, phnum * 32) || !shnum || !hostFileRead(file, shoff, sh, shnum * 40)) return false;
     // vaddr -> file offset through the PT_LOAD segments; exec: must be in an executable one
     auto fileOffset = [&](U32 vaddr, bool exec, U32 len, U32& out) {
         for (U32 i = 0; i < phnum; i++) {
             const U8* p = &ph[i * 32];
-            U32 offset = gmElf32(p + 4), va = gmElf32(p + 8), filesz = gmElf32(p + 16), flags = gmElf32(p + 24);
-            if (gmElf32(p) != 1 || vaddr < va || (U64)vaddr + len > (U64)va + filesz || (exec && !(flags & 1))) continue;
+            U32 offset = hostElf32(p + 4), va = hostElf32(p + 8), filesz = hostElf32(p + 16), flags = hostElf32(p + 24);
+            if (hostElf32(p) != 1 || vaddr < va || (U64)vaddr + len > (U64)va + filesz || (exec && !(flags & 1))) continue;
             out = vaddr - va + offset;
             return true;
         }
@@ -90,25 +88,25 @@ static bool hostGlyphmParse(KFile* file) {
     U32 infoVaddr = 0, ftVaddr = 0;
     for (U32 i = 0; i < shnum; i++) {
         const U8* s = &sh[i * 40];
-        U32 link = gmElf32(s + 24);
-        if (gmElf32(s + 4) != 11 || link >= shnum) continue; // SHT_DYNSYM
+        U32 link = hostElf32(s + 24);
+        if (hostElf32(s + 4) != 11 || link >= shnum) continue; // SHT_DYNSYM
         const U8* str = &sh[link * 40];
-        if (!read(gmElf32(s + 16), syms, gmElf32(s + 20)) || !read(gmElf32(str + 16), names, gmElf32(str + 20))) return false;
+        if (!hostFileRead(file, hostElf32(s + 16), syms, hostElf32(s + 20)) || !hostFileRead(file, hostElf32(str + 16), names, hostElf32(str + 20))) return false;
         for (U32 off = 0; off + 16 <= syms.size(); off += 16) {
             const U8* sym = &syms[off];
-            U32 name = gmElf32(sym), size = gmElf32(sym + 8);
+            U32 name = hostElf32(sym), size = hostElf32(sym + 8);
             if ((sym[12] & 0xf) != 1 || name >= names.size() || !memchr(&names[name], 0, names.size() - name)) continue; // STT_OBJECT
             const char* n = (const char*)&names[name];
-            if (!strcmp(n, "vnbox_glyphm") && size == GI_COUNT * 4) infoVaddr = gmElf32(sym + 4);
-            else if (!strcmp(n, "vnbox_glyphm_ft") && size == GF_COUNT * 4) ftVaddr = gmElf32(sym + 4);
+            if (!strcmp(n, "vnbox_glyphm") && size == GI_COUNT * 4) infoVaddr = hostElf32(sym + 4);
+            else if (!strcmp(n, "vnbox_glyphm_ft") && size == GF_COUNT * 4) ftVaddr = hostElf32(sym + 4);
         }
         break;
     }
     U32 offset;
-    if (!infoVaddr || !ftVaddr || !fileOffset(infoVaddr, false, GI_COUNT * 4, offset) || !read(offset, buf, GI_COUNT * 4)) return false;
-    for (U32 i = 0; i < GI_COUNT; i++) gmInfo[i] = gmElf32(&buf[i * 4]);
-    if (!fileOffset(ftVaddr, false, GF_COUNT * 4, offset) || !read(offset, buf, GF_COUNT * 4)) return false;
-    for (U32 i = 0; i < GF_COUNT; i++) gmFt[i] = gmElf32(&buf[i * 4]);
+    if (!infoVaddr || !ftVaddr || !fileOffset(infoVaddr, false, GI_COUNT * 4, offset) || !hostFileRead(file, offset, buf, GI_COUNT * 4)) return false;
+    for (U32 i = 0; i < GI_COUNT; i++) gmInfo[i] = hostElf32(&buf[i * 4]);
+    if (!fileOffset(ftVaddr, false, GF_COUNT * 4, offset) || !hostFileRead(file, offset, buf, GF_COUNT * 4)) return false;
+    for (U32 i = 0; i < GF_COUNT; i++) gmFt[i] = hostElf32(&buf[i * 4]);
     if (gmInfo[GI_VERSION] != 1 || gmFt[GF_VERSION] != 1 || !gmInfo[GI_GM_BLOCK] || gmInfo[GI_GM_SIZE] < 36) return false;
     for (U32 f = 0; f < GM_FNS; f++) {
         if (!fileOffset(gmInfo[GI_EXTENT + f], true, 1, gmFnOffset[f])) return false;
@@ -135,6 +133,7 @@ bool hostGlyphmMapped(KFile* file, std::vector<U32>& offsets) {
     }
     gmState = ok ? 1 : -1;
     klog_fmt("[vnbox] native glyph metrics: %s%s", path.c_str(), ok ? "" : " (no vnbox_glyphm export)");
+    if (!ok) hostHookOff("native glyph metrics");
     return ok;
 }
 
@@ -146,6 +145,15 @@ U32 hostGlyphmAt(const BString& path, U32 offset) {
     }
     return 0;
 }
+
+#ifdef __TEST
+// testHostGlyphm.cpp stands in for hostGlyphmParse: both export tables, or none (no win32u.so mapped).
+void hostGlyphmTestTables(const U32* info, const U32* ft) {
+    if (info) ::memcpy(gmInfo, info, sizeof(gmInfo));
+    if (ft) ::memcpy(gmFt, ft, sizeof(gmFt));
+    gmState = info ? 1 : 0;
+}
+#endif
 
 // Guest memory, plain RAM pages only (the soft MMU's own fast-path test); false leaves the call to the guest.
 struct GmMem {

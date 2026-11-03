@@ -29,6 +29,8 @@
 
 bool libcRange(KMemory* memory, U32 address, U32 len, bool write); // hosthooks.cpp
 
+void hostHookOff(const char* what); // hosthooks.cpp: tells the page a hook pinned to this root fs did not take
+
 namespace {
 
 // glibc 2.38 i386 /lib/libc.so.6 of TinyCore15Wine11.0 (vaddr == file offset in every segment)
@@ -83,6 +85,7 @@ void hostMutexCheck(KFile* file) {
         buf.resize(r.end - r.start);
         if (file->preadNative(buf.data(), r.start, (U32)buf.size()) != (S64)buf.size() || fnv(buf.data(), (U32)buf.size()) != r.fnv) {
             klog_fmt("[vnbox] native mutex: libc.so.6 is not the known build, mutexes stay guest");
+            hostHookOff("native mutex");
             return;
         }
     }

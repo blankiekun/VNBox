@@ -67,27 +67,25 @@ static const char* dibWhy; // why the last call was left to the guest (logged on
 extern "C" void (*vnbox_dibdrv_host_fn(unsigned table, unsigned slot))(void); // lib/wine-dibdrv/host.c
 extern "C" const void* vnbox_dibdrv_host_table(unsigned table);
 
-static U32 dibElf16(const U8* p) { return p[0] | (p[1] << 8); }
-static U32 dibElf32(const U8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((U32)p[3] << 24); }
+U32 hostElf16(const U8* p); // hosthooks.cpp
+U32 hostElf32(const U8* p);
+bool hostFileRead(KFile* file, U64 offset, std::vector<U8>& buf, U32 len);
+void hostHookOff(const char* what); // hosthooks.cpp: tells the page a hook pinned to this root fs did not take
 
 // Reads vnbox_dibdrv_funcs from .dynsym, then the tables it points at from the file (i386 REL: a pointer's link
 // address is stored in place), into file offsets of the hosted functions.
 static bool hostDibdrvParse(KFile* file) {
-    auto read = [file](U64 offset, std::vector<U8>& buf, U32 len) {
-        buf.resize(len);
-        return file->preadNative(buf.data(), (S64)offset, len) == len;
-    };
     std::vector<U8> eh, ph, sh, syms, names, buf;
-    if (!read(0, eh, 52) || memcmp(eh.data(), "\x7f" "ELF\x01\x01", 6) || dibElf16(&eh[18]) != 3) return false;
-    U32 phoff = dibElf32(&eh[28]), phentsize = dibElf16(&eh[42]), phnum = dibElf16(&eh[44]);
-    U32 shoff = dibElf32(&eh[32]), shentsize = dibElf16(&eh[46]), shnum = dibElf16(&eh[48]);
-    if (phentsize != 32 || shentsize != 40 || !read(phoff, ph, phnum * 32) || !shnum || !read(shoff, sh, shnum * 40)) return false;
+    if (!hostFileRead(file, 0, eh, 52) || memcmp(eh.data(), "\x7f" "ELF\x01\x01", 6) || hostElf16(&eh[18]) != 3) return false;
+    U32 phoff = hostElf32(&eh[28]), phentsize = hostElf16(&eh[42]), phnum = hostElf16(&eh[44]);
+    U32 shoff = hostElf32(&eh[32]), shentsize = hostElf16(&eh[46]), shnum = hostElf16(&eh[48]);
+    if (phentsize != 32 || shentsize != 40 || !hostFileRead(file, phoff, ph, phnum * 32) || !shnum || !hostFileRead(file, shoff, sh, shnum * 40)) return false;
     // vaddr -> file offset through the PT_LOAD segments; exec: must be in an executable one
     auto fileOffset = [&](U32 vaddr, bool exec, U32 len, U32& out) {
         for (U32 i = 0; i < phnum; i++) {
             const U8* p = &ph[i * 32];
-            U32 offset = dibElf32(p + 4), va = dibElf32(p + 8), filesz = dibElf32(p + 16), flags = dibElf32(p + 24);
-            if (dibElf32(p) != 1 || vaddr < va || (U64)vaddr + len > (U64)va + filesz || (exec && !(flags & 1))) continue;
+            U32 offset = hostElf32(p + 4), va = hostElf32(p + 8), filesz = hostElf32(p + 16), flags = hostElf32(p + 24);
+            if (hostElf32(p) != 1 || vaddr < va || (U64)vaddr + len > (U64)va + filesz || (exec && !(flags & 1))) continue;
             out = vaddr - va + offset;
             return true;
         }
@@ -96,27 +94,27 @@ static bool hostDibdrvParse(KFile* file) {
     U32 exportVaddr = 0;
     for (U32 i = 0; i < shnum && !exportVaddr; i++) {
         const U8* s = &sh[i * 40];
-        U32 link = dibElf32(s + 24);
-        if (dibElf32(s + 4) != 11 || link >= shnum) continue; // SHT_DYNSYM
+        U32 link = hostElf32(s + 24);
+        if (hostElf32(s + 4) != 11 || link >= shnum) continue; // SHT_DYNSYM
         const U8* str = &sh[link * 40];
-        if (!read(dibElf32(s + 16), syms, dibElf32(s + 20)) || !read(dibElf32(str + 16), names, dibElf32(str + 20))) return false;
+        if (!hostFileRead(file, hostElf32(s + 16), syms, hostElf32(s + 20)) || !hostFileRead(file, hostElf32(str + 16), names, hostElf32(str + 20))) return false;
         for (U32 off = 0; off + 16 <= syms.size(); off += 16) {
             const U8* sym = &syms[off];
-            U32 name = dibElf32(sym);
-            if ((sym[12] & 0xf) != 1 || dibElf32(sym + 8) != DIB_TABLES * 4 || name >= names.size()) continue; // STT_OBJECT
+            U32 name = hostElf32(sym);
+            if ((sym[12] & 0xf) != 1 || hostElf32(sym + 8) != DIB_TABLES * 4 || name >= names.size()) continue; // STT_OBJECT
             if (!memchr(&names[name], 0, names.size() - name) || strcmp((const char*)&names[name], "vnbox_dibdrv_funcs")) continue;
-            exportVaddr = dibElf32(sym + 4);
+            exportVaddr = hostElf32(sym + 4);
             break;
         }
     }
     U32 offset;
-    if (!exportVaddr || !fileOffset(exportVaddr, false, DIB_TABLES * 4, offset) || !read(offset, buf, DIB_TABLES * 4)) return false;
-    for (U32 t = 0; t < DIB_TABLES; t++) dibTableVaddr[t] = dibElf32(&buf[t * 4]);
+    if (!exportVaddr || !fileOffset(exportVaddr, false, DIB_TABLES * 4, offset) || !hostFileRead(file, offset, buf, DIB_TABLES * 4)) return false;
+    for (U32 t = 0; t < DIB_TABLES; t++) dibTableVaddr[t] = hostElf32(&buf[t * 4]);
     std::vector<U8> table;
     for (U32 t = 0; t < DIB_TABLES - 1; t++) { // funcs_null's functions do nothing: not worth a head op
-        if (!fileOffset(dibTableVaddr[t], false, DIB_SLOTS * 4, offset) || !read(offset, table, DIB_SLOTS * 4)) return false;
+        if (!fileOffset(dibTableVaddr[t], false, DIB_SLOTS * 4, offset) || !hostFileRead(file, offset, table, DIB_SLOTS * 4)) return false;
         for (U32 slot = 0; slot < DIB_SLOTS; slot++) {
-            U32 vaddr = dibElf32(&table[slot * 4]);
+            U32 vaddr = hostElf32(&table[slot * 4]);
             if (!fileOffset(vaddr, true, 1, offset)) return false;
             if (!dibHosted[slot]) continue;
             bool seen = false;
@@ -145,6 +143,7 @@ bool hostDibdrvMapped(KFile* file, std::vector<U32>& offsets) {
     if (ok) dibPath = path;
     dibState = ok ? 1 : -1;
     klog_fmt("[vnbox] native dibdrv: %s, %d functions%s", path.c_str(), (int)dibEntries.size(), ok ? "" : " (no vnbox_dibdrv_funcs export)");
+    if (!ok) hostHookOff("native dibdrv");
     return ok;
 }
 
@@ -156,6 +155,15 @@ U32 hostDibdrvAt(const BString& path, U32 offset) {
     }
     return 0;
 }
+
+#ifdef __TEST
+// testHostDibdrv.cpp stands in for hostDibdrvParse: a table's link address and a hosted primitive; its hostDibdrvRun index.
+U32 hostDibdrvTestEntry(U32 table, U32 slot, U32 tableVaddr, U32 vaddr) {
+    dibTableVaddr[table] = tableVaddr;
+    dibEntries.push_back({ 0, vaddr, (U8)table, (U8)slot });
+    return (U32)dibEntries.size() - 1;
+}
+#endif
 
 static U8* dibRam(KMemory* memory, U32 address, bool write) {
     MMU& mmu = getMemData(memory)->mmu[address >> K_PAGE_SHIFT];

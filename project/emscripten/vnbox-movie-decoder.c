@@ -57,11 +57,25 @@ EMSCRIPTEN_KEEPALIVE int vm_audio_count(movie_t *m) { return m->audio_count; }
 EMSCRIPTEN_KEEPALIVE double vm_audio_time(movie_t *m, int i) { return m->audio_time[i]; }
 EMSCRIPTEN_KEEPALIVE float *vm_audio(movie_t *m, int i) { return m->audio[i]; }
 
-// Decodes up to seconds further; bit 1: a new frame is in vm_rgba, bit 2: the movie has ended.
+// plm_decode returns at once, and never reports the end, while it has no streams: the system header lists
+// none, or the headers are not in the whole file (a stream it can't read fails one pack header per call,
+// so this gets through them all rather than one per frame).
+static int cannot_decode(movie_t *m) {
+    plm_demux_t *demux = m->plm->demux;
+    size_t left;
+    do {
+        left = plm_buffer_get_remaining(m->buffer);
+        if (plm_demux_has_headers(demux)) return !plm_demux_get_num_video_streams(demux) && !plm_demux_get_num_audio_streams(demux);
+    } while (plm_buffer_get_remaining(m->buffer) < left);
+    return plm_buffer_has_ended(m->buffer);
+}
+
+// Decodes up to seconds further; bit 1: a new frame is in vm_rgba, bit 2: the movie has ended, bit 4: nothing here can be decoded.
 EMSCRIPTEN_KEEPALIVE int vm_decode(movie_t *m, double seconds) {
     m->frame = NULL;
     m->audio_count = 0;
     plm_decode(m->plm, seconds);
+    if (cannot_decode(m)) return 4;
     int flags = plm_has_ended(m->plm) ? 2 : 0;
     if (m->frame) {
         if (!m->rgba) {

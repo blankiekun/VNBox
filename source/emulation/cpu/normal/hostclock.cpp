@@ -38,32 +38,30 @@ struct HostClockModule { BString path; U32 offsets[CLOCK_COUNT]; }; // file offs
 static std::vector<HostClockModule> hostClockModules;
 static std::vector<BString> hostClockSeen; // ntdll.dll.so paths already looked at
 
-static U32 clk16(const U8* p) { return p[0] | (p[1] << 8); }
-static U32 clk32(const U8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((U32)p[3] << 24); }
+U32 hostElf16(const U8* p); // hosthooks.cpp
+U32 hostElf32(const U8* p);
+bool hostFileRead(KFile* file, U64 offset, std::vector<U8>& buf, U32 len);
+void hostHookOff(const char* what); // hosthooks.cpp: tells the page a hook pinned to this root fs did not take
 
 // Wine's i386 syscall thunk: mov eax, id; mov edx, dispatcher; call edx; ret n.
 static bool hostClockThunk(const std::vector<U8>& code, U32 id, U32 ret) {
-    return code.size() >= 15 && code[0] == 0xb8 && clk32(&code[1]) == id && code[5] == 0xba && code[10] == 0xff &&
-        code[11] == 0xd2 && code[12] == 0xc2 && clk16(&code[13]) == ret;
+    return code.size() >= 15 && code[0] == 0xb8 && hostElf32(&code[1]) == id && code[5] == 0xba && code[10] == 0xff &&
+        code[11] == 0xd2 && code[12] == 0xc2 && hostElf16(&code[13]) == ret;
 }
 
 // Fills the export file offsets of a builtin ELF ntdll.dll.so (host-side reads). winebuild puts the PE NT header
 // (__wine_spec_nt_header, the RVA base of the export directory and its name tables) in .data; the function table
 // holds absolute link-time addresses (relocated by ld.so).
 static bool hostClockParse(KFile* file, U32* offsets) {
-    auto read = [file](U64 offset, std::vector<U8>& buf, U32 len) {
-        buf.resize(len);
-        return file->preadNative(buf.data(), (S64)offset, len) == len;
-    };
     std::vector<U8> eh, ph, data, code;
-    if (!read(0, eh, 52) || memcmp(eh.data(), "\x7f" "ELF\x01\x01", 6) || clk16(&eh[18]) != 3) return false; // ELF32 LE i386
-    U32 phoff = clk32(&eh[28]), phentsize = clk16(&eh[42]), phnum = clk16(&eh[44]);
-    if (phentsize != 32 || !phnum || !read(phoff, ph, phnum * 32)) return false;
+    if (!hostFileRead(file, 0, eh, 52) || memcmp(eh.data(), "\x7f" "ELF\x01\x01", 6) || hostElf16(&eh[18]) != 3) return false; // ELF32 LE i386
+    U32 phoff = hostElf32(&eh[28]), phentsize = hostElf16(&eh[42]), phnum = hostElf16(&eh[44]);
+    if (phentsize != 32 || !phnum || !hostFileRead(file, phoff, ph, phnum * 32)) return false;
     auto fileOffset = [&](U32 vaddr) -> U32 { // 0 when not in a PT_LOAD's file bytes
         for (U32 i = 0; i < phnum; i++) {
             const U8* p = &ph[i * 32];
-            U32 offset = clk32(p + 4), va = clk32(p + 8), size = clk32(p + 16);
-            if (clk32(p) == 1 && vaddr >= va && vaddr - va < size) return vaddr - va + offset;
+            U32 offset = hostElf32(p + 4), va = hostElf32(p + 8), size = hostElf32(p + 16);
+            if (hostElf32(p) == 1 && vaddr >= va && vaddr - va < size) return vaddr - va + offset;
         }
         return 0;
     };
@@ -71,44 +69,44 @@ static bool hostClockParse(KFile* file, U32* offsets) {
     U32 nt = 0, ntVaddr = 0;
     for (U32 i = 0; i < phnum && !nt; i++) {
         const U8* p = &ph[i * 32];
-        if (clk32(p) != 1 || !(clk32(p + 24) & 2) || !read(clk32(p + 4), data, clk32(p + 16))) continue;
+        if (hostElf32(p) != 1 || !(hostElf32(p + 24) & 2) || !hostFileRead(file, hostElf32(p + 4), data, hostElf32(p + 16))) continue;
         for (U32 o = 0; o + 24 + 96 + 8 <= data.size(); o += 4) {
-            if (!memcmp(&data[o], "PE\0\0\x4c\x01", 6) && clk16(&data[o + 24]) == 0x10b) {
-                nt = clk32(p + 4) + o;
-                ntVaddr = clk32(p + 8) + o;
+            if (!memcmp(&data[o], "PE\0\0\x4c\x01", 6) && hostElf16(&data[o + 24]) == 0x10b) {
+                nt = hostElf32(p + 4) + o;
+                ntVaddr = hostElf32(p + 8) + o;
                 break;
             }
         }
     }
     std::vector<U8> ntHeader, dir, names, ordinals, functions;
-    if (!nt || !read(nt, ntHeader, 24 + 96 + 8)) return false;
-    U32 dirOffset = fileOffset(ntVaddr + clk32(&ntHeader[24 + 96]));
-    if (!dirOffset || !read(dirOffset, dir, 40)) return false;
-    U32 count = clk32(&dir[24]), functionCount = clk32(&dir[20]);
-    U32 namesOffset = fileOffset(ntVaddr + clk32(&dir[32])), ordinalsOffset = fileOffset(ntVaddr + clk32(&dir[36]));
-    U32 functionsOffset = fileOffset(ntVaddr + clk32(&dir[28]));
+    if (!nt || !hostFileRead(file, nt, ntHeader, 24 + 96 + 8)) return false;
+    U32 dirOffset = fileOffset(ntVaddr + hostElf32(&ntHeader[24 + 96]));
+    if (!dirOffset || !hostFileRead(file, dirOffset, dir, 40)) return false;
+    U32 count = hostElf32(&dir[24]), functionCount = hostElf32(&dir[20]);
+    U32 namesOffset = fileOffset(ntVaddr + hostElf32(&dir[32])), ordinalsOffset = fileOffset(ntVaddr + hostElf32(&dir[36]));
+    U32 functionsOffset = fileOffset(ntVaddr + hostElf32(&dir[28]));
     if (!count || count > 0x10000 || functionCount > 0x10000 || !namesOffset || !ordinalsOffset || !functionsOffset ||
-        !read(namesOffset, names, count * 4) || !read(ordinalsOffset, ordinals, count * 2) ||
-        !read(functionsOffset, functions, functionCount * 4)) return false;
+        !hostFileRead(file, namesOffset, names, count * 4) || !hostFileRead(file, ordinalsOffset, ordinals, count * 2) ||
+        !hostFileRead(file, functionsOffset, functions, functionCount * 4)) return false;
     static const char* const wanted[CLOCK_COUNT] = { "", "NtQueryPerformanceCounter", "NtQuerySystemTime", "RtlGetSystemTimePrecise" };
     U32 found = 0;
     for (U32 i = 0; i < count; i++) {
-        U32 nameOffset = fileOffset(ntVaddr + clk32(&names[i * 4]));
+        U32 nameOffset = fileOffset(ntVaddr + hostElf32(&names[i * 4]));
         std::vector<U8> name;
-        if (!nameOffset || !read(nameOffset, name, 32)) continue; // all wanted names are shorter, a short read is another name
+        if (!nameOffset || !hostFileRead(file, nameOffset, name, 32)) continue; // all wanted names are shorter, a short read is another name
         for (U32 fn = 1; fn < CLOCK_COUNT; fn++) {
             size_t len = strlen(wanted[fn]) + 1;
             if (offsets[fn] || memcmp(name.data(), wanted[fn], len)) continue;
-            U32 ordinal = clk16(&ordinals[i * 2]);
+            U32 ordinal = hostElf16(&ordinals[i * 2]);
             if (ordinal >= functionCount) return false;
-            offsets[fn] = fileOffset(clk32(&functions[ordinal * 4]));
+            offsets[fn] = fileOffset(hostElf32(&functions[ordinal * 4]));
             if (offsets[fn]) found++;
         }
     }
     if (found != CLOCK_COUNT - 1) return false;
     // NtQueryPerformanceCounter(counter, frequency) is syscall 0x31, NtQuerySystemTime(time) 0x5a in Wine 11.0.
-    if (!read(offsets[CLOCK_QPC], code, 15) || !hostClockThunk(code, 0x31, 8)) return false;
-    if (!read(offsets[CLOCK_SYSTEM_TIME], code, 15) || !hostClockThunk(code, 0x5a, 4)) return false;
+    if (!hostFileRead(file, offsets[CLOCK_QPC], code, 15) || !hostClockThunk(code, 0x31, 8)) return false;
+    if (!hostFileRead(file, offsets[CLOCK_SYSTEM_TIME], code, 15) || !hostClockThunk(code, 0x5a, 4)) return false;
     return true;
 }
 
@@ -130,6 +128,7 @@ bool hostClockMapped(KFile* file, U32* offsets) {
     HostClockModule m = { path, {} };
     if (!hostClockParse(file, m.offsets)) {
         klog_fmt("[vnbox] native clock: %s is not the known Wine 11 ntdll.dll.so layout, left to the guest", path.c_str());
+        hostHookOff("native clock");
         return false;
     }
     hostClockModules.push_back(m);
