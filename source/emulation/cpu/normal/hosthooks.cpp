@@ -238,7 +238,8 @@ enum : U32 {
     LIBC_STRCMP, LIBC_STRNCMP, LIBC_STRCHR, LIBC_STRRCHR, LIBC_STRCPY, LIBC_STRTOL, LIBC_STRTOUL,
     LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_COUNT,
     HOST_ACM = LIBC_COUNT, // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
-    HOST_VORBIS, // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
+    HOST_CLOCK, // + CLOCK_* - 1: ntdll.dll.so's clock reads (hostclock.cpp)
+    HOST_VORBIS = HOST_CLOCK + 3, // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
     HOST_FREETYPE = HOST_VORBIS + 32 // + FTH_*: libfreetype.so.6's exports win32u uses (hostfreetype.cpp)
 };
 static const char* const hostLibcNames[LIBC_COUNT] = {
@@ -325,17 +326,27 @@ bool hostAcmMapped(KFile* file, U32& driverProc); // hostacm.cpp
 bool hostAcmAt(const BString& path, U32 fileOffset);
 bool hostAcmRun(CPU* cpu);
 static std::atomic<bool> hostAcmAny;
+bool hostClockMapped(KFile* file, U32* offsets); // hostclock.cpp
+U32 hostClockAt(const BString& path, U32 fileOffset);
+bool hostClockRun(CPU* cpu, U32 fn);
+static std::atomic<bool> hostClockAny;
 U32 hostVorbisAt(CPU* cpu, U32 eip); // hostvorbis.cpp
 bool hostVorbisRun(CPU* cpu, U32 fn);
 
 // Called by KMemory::mmap for every file mapping; the first libc.so.6 (libfreetype.so.6) mapped loads
-// its table, a known vorbis.acm adds its DriverProc.
+// its table, a known vorbis.acm adds its DriverProc, ntdll.dll.so its clock exports.
 void hostLibcMapped(KFile* file) {
     if (!file || !file->openFile || !file->openFile->node) return;
     U32 driverProc;
     if (hostAcmMapped(file, driverProc)) {
         hostLibcPageOffsets[(driverProc & K_PAGE_MASK) >> 3] |= 1 << (driverProc & 7);
         hostAcmAny = true;
+        return;
+    }
+    U32 clockOffsets[4];
+    if (hostClockMapped(file, clockOffsets)) {
+        for (U32 i = 1; i < 4; i++) hostLibcPageOffsets[(clockOffsets[i] & K_PAGE_MASK) >> 3] |= 1 << (clockOffsets[i] & 7);
+        hostClockAny = true;
         return;
     }
     const BString& path = file->openFile->node->path;
@@ -354,11 +365,11 @@ void hostLibcMapped(KFile* file) {
     }
 }
 
-// LIBC_* (or HOST_ACM, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
+// LIBC_* (or HOST_ACM, HOST_CLOCK + CLOCK_* - 1, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
 // process, else LIBC_NONE.
 U32 hostLibcAt(CPU* cpu, U32 eip) {
     if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
-    if ((!hostElfAny && !hostAcmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
+    if ((!hostElfAny && !hostAcmAny && !hostClockAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();
     U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
     if (!offset) return LIBC_NONE;
@@ -369,6 +380,9 @@ U32 hostLibcAt(CPU* cpu, U32 eip) {
             if (e.first == offset) return e.second;
         }
         return LIBC_NONE;
+    }
+    if (hostClockAny) {
+        if (U32 clock = hostClockAt(name, offset)) return HOST_CLOCK + clock - 1;
     }
     return hostAcmAny && hostAcmAt(name, offset) ? HOST_ACM : LIBC_NONE;
 }
@@ -524,6 +538,7 @@ static bool libcStrtol(KMemory* memory, U32 nptr, U32 endptr, S32 base, bool isS
 bool hostLibcRun(CPU* cpu, U32 fn) {
     if (fn == HOST_ACM) return hostAcmRun(cpu);
     if (fn >= HOST_FREETYPE) return hostFreetypeRun(cpu, fn - HOST_FREETYPE);
+    if (fn >= HOST_CLOCK && fn < HOST_VORBIS) return hostClockRun(cpu, fn - HOST_CLOCK + 1);
     if (fn >= HOST_VORBIS) return hostVorbisRun(cpu, fn - HOST_VORBIS);
     KMemory* memory = cpu->memory;
     if (cpu->getDirection() < 0 || cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF ||
