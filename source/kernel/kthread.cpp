@@ -279,6 +279,9 @@ U32 KThread::signal(U32 signal, bool wait) {
             BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(this->waitingForSignalToEndCond);
             BOXEDWINE_CONDITION_WAIT_TIMEOUT(this->waitingForSignalToEndCond, 1000);
         }        
+        if (this==KThread::currentThread()) {
+            return -K_CONTINUE; // EAX and eip are already set, and eip may now be the handler's: ksyscall must leave them
+        }
     } else {
         this->queuePendingSignal(signal);
         this->process->signalFd(this, signal);
@@ -578,21 +581,19 @@ struct k_robust_list_head {
     U32 next;
     U32 futex_offset;
     U32 list_op_pending;
-    U32 address;
 };
 
 
 // copied/ported from https://cregit.linuxsources.org/code/5.18/kernel/futex/core.c.html
 
-static U32 fetch_robust_entry(KThread* thread, struct k_robust_list_head* entry, U32 headAddress, U32* pi) {
-    *pi = headAddress & 1;
-    headAddress &= ~1;
-    entry->address = headAddress;
-
-    if (!thread->memory->canRead(headAddress, 12)) {
+// Reads the list pointer stored at address. Its low bit says the lock it points to is a PI one.
+static U32 fetch_robust_entry(KThread* thread, U32* entry, U32 address, U32* pi) {
+    if (!thread->memory->canRead(address, 4)) {
         return -K_EFAULT;
     }
-    thread->memory->memcpy(entry, headAddress, 12);
+    U32 value = thread->memory->readd(address);
+    *pi = value & 1;
+    *entry = value & ~1;
     return 0;
 }
 
@@ -622,7 +623,7 @@ U32 KThread::handleFutexDeath(U32 uaddr, bool pi, bool pending_op) {
     U32 uval, nval, mval;
 
     /* Futex address must be 32bit aligned */
-    if ((((unsigned long)uaddr) % 4) != 0)
+    if ((((unsigned long)uaddr) % 4) != 0 || !memory->canWrite(uaddr, 4))
         return -1;
 
 retry:
@@ -717,12 +718,11 @@ void KThread::exitRobustList()
     BOXEDWINE_CRITICAL_SECTION;
 
     struct k_robust_list_head head;
-    struct k_robust_list_head entry;
-    struct k_robust_list_head next_entry;
-    struct k_robust_list_head pending;
+    U32 entry;
+    U32 next_entry;
+    U32 pending;
     unsigned int limit = ROBUST_LIST_LIMIT, pi, pip;
     unsigned int next_pi;
-    U32 futex_offset = 0;
     int rc;
 
     if (!this->robustList || !memory->canRead(this->robustList, 12)) {
@@ -730,41 +730,35 @@ void KThread::exitRobustList()
     }    
     
     memory->memcpy(&head, this->robustList, 12);
-    head.address = this->robustList;        
 
     /*
      * Fetch the list head (which was registered earlier, via
      * sys_set_robust_list()):
      */
-    if (fetch_robust_entry(this, &entry, head.next, &pi)) {
+    if (fetch_robust_entry(this, &entry, this->robustList, &pi)) {
         return;
     }
-
-    /*
-     * Fetch the relative futex offset:
-     */
-    //U32 futexOffset = head.futex_offset;
 
     /*
      * Fetch any possibly pending lock-add first, and handle it
      * if it exists:
      */
-    if (fetch_robust_entry(this, &pending, head.list_op_pending, &pip))
+    if (fetch_robust_entry(this, &pending, this->robustList + 8, &pip))
         return;
 
-    next_entry.address = 0;	/* avoid warning with gcc */
-    while (entry.address != head.address) {
+    next_entry = 0;	/* avoid warning with gcc */
+    while (entry != this->robustList) {
         /*
          * Fetch the next entry in the list before calling
          * handle_futex_death:
          */
-        rc = fetch_robust_entry(this, &next_entry, entry.next, &next_pi);
+        rc = fetch_robust_entry(this, &next_entry, entry, &next_pi);
         /*
          * A pending lock might already be on the list, so
          * don't process it twice:
          */
-        if (entry.address != pending.address) {
-            if (handleFutexDeath(entry.address + futex_offset, pi, HANDLE_DEATH_LIST)) {
+        if (entry != pending) {
+            if (handleFutexDeath(entry + head.futex_offset, pi, HANDLE_DEATH_LIST)) {
                 return;
             }
         }
@@ -783,8 +777,8 @@ void KThread::exitRobustList()
         // cond_resched(); // give the scheduler a chance to run a higher-priority process
     }
 
-    if (pending.address) {
-        handleFutexDeath(pending.address + futex_offset, pip, HANDLE_DEATH_PENDING);
+    if (pending) {
+        handleFutexDeath(pending + head.futex_offset, pip, HANDLE_DEATH_PENDING);
     }
 }
 
