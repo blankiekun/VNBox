@@ -2091,6 +2091,11 @@
                 params.push("-env");
                 params.push("WINEDLLOVERRIDES=" + dllOverrides);
             }
+            // cheapGetMessage=0: win32u resets the queue masks on every driver event check again (vn/wine/win32u-getmessage-masks.patch)
+            if (vnboxParam("cheapGetMessage") === "0") {
+                params.push("-env");
+                params.push("WINE_VNBOX_GETMSG_MASKS=0");
+            }
             // cheapSpi=0: win32u builds SystemParametersInfo(SPI_GETNONCLIENTMETRICS) again on every call (vn/wine/win32u-spi-cache.patch)
             if (vnboxParam("cheapSpi") === "0") {
                 params.push("-env");

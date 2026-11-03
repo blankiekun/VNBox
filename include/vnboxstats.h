@@ -32,6 +32,12 @@ struct VnboxStats {
     // guest time by thread: (process id << 24 | thread id) -> ms in slices, and how many slices it ran
     std::unordered_map<unsigned long long, double> threadMs;
     std::unordered_map<unsigned long long, unsigned> threadRuns;
+    // frame pacing, same keys: frames a thread put (XPutImage into a window, GL swap), ms it spent blocked in a syscall,
+    // its sleeps = select/pselect with no fds (Wine's NtDelayExecution: Sleep(n > 0)) by timeout, 0 ms vs > 0 ms (ms
+    // asked summed; no timeout counts as > 0 with 0 ms), and its sched_yield calls (every Sleep and SwitchToThread
+    // yields first; Sleep(0) only yields)
+    std::unordered_map<unsigned long long, unsigned> threadPuts, threadSleep0, threadSleepN, threadYields;
+    std::unordered_map<unsigned long long, double> threadBlockedMs, threadSleepNMs;
 };
 extern VnboxStats vnboxStats;
 
@@ -56,6 +62,8 @@ class KThread;
 void vnboxStatSliceRecord(KThread* thread, U64 diffUs, U64 sysUs);
 void vnboxStatSyscallRecord(CPU* cpu, U32 no, U32 arg2, U32 len, U32 result, U64 diffUs, U32 padInstr);
 void vnboxStatGl(CPU* cpu, void (*fn)(CPU*), int kind); // runs fn timed; kind 1 GetError, 2 buffer readback, 3 pixel readback
+void vnboxStatPutRecord(KThread* thread);
+void vnboxStatSleepRecord(KThread* thread, bool yield, S64 ms);
 
 // clock for vnboxStatDraw, 0 while off
 inline double vnboxStatNow() {
@@ -85,6 +93,12 @@ inline void vnboxStatSlice(KThread* thread, U64 diffUs, U64 sysUs) { if (vnboxSt
 // EAX is guest-chosen; the arrays cover the known syscalls
 inline void vnboxStatSyscall(CPU* cpu, U32 no, U32 arg2, U32 len, U32 result, U64 diffUs, U32 padInstr) {
     if (vnboxStats.on && no < 440) vnboxStatSyscallRecord(cpu, no, arg2, len, result, diffUs, padInstr);
+}
+// a frame put into a window by thread (XPutImage, GL swap)
+inline void vnboxStatPut(KThread* thread) { if (vnboxStats.on && thread) vnboxStatPutRecord(thread); }
+// a sched_yield (yield) or a finished select with no fds asking ms (< 0: no timeout)
+inline void vnboxStatSleep(KThread* thread, bool yield, S64 ms) {
+    if (vnboxStats.on) vnboxStatSleepRecord(thread, yield, ms);
 }
 // one run of chained JIT blocks: ranInstr counted since the first block, padStart = sysPadInstr then
 inline void vnboxStatJit(U32 ranInstr, unsigned long long padStart) {

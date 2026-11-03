@@ -20,6 +20,7 @@
 #include "../../tools/x11/X11_def.h"
 #include "x11.h"
 #include "x11flush.h"
+#include "vnboxstats.h"
 #include "knativesystem.h"
 
 Int99Callback int9BCallback[X11_COUNT];
@@ -550,6 +551,7 @@ static void x11_UngrabPointer(CPU* cpu) {
 // int XWarpPointer(Display* display, Window src_w, Window dest_w, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y)
 static void x11_WarpPointer(CPU* cpu) {
     KNativeSystem::getCurrentInput()->setMousePos(ARG8, ARG9);
+    XServer::getServer()->pointerWarped();
     EAX = Success;
 }
 
@@ -1623,6 +1625,7 @@ static void x11_PutImage(CPU* cpu) {
     U32 width = ARG9;
     U32 height = ARG10;
     EAX = d->putImage(thread, gc, &image, src_x, src_y, dest_x, dest_y, width, height);
+    if (d->isWindow) vnboxStatPut(thread); // stats=1 [frames]
 }
 
 static X11FlushState x11FlushState;

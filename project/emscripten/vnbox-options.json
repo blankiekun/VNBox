@@ -32,9 +32,72 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeMutex",
+      "label": "Native mutexes",
+      "description": "Takes and releases uncontended Linux-side locks (Wine's font, GDI and window locks) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "cheapFxsave",
+      "label": "Cheap FPU state save",
+      "description": "Saves and restores the FPU/SSE state (FXSAVE/FXRSTOR, done on every Wine system call) in one step instead of field by field. Same results.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeGlyphMetrics",
+      "label": "Native text measuring",
+      "description": "Answers Wine's cached text measuring (text extents, glyph metrics) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeDibdrv",
+      "label": "Native GDI drawing",
+      "description": "Runs Wine's per-pixel GDI drawing into bitmaps (text, fills, blits, blends) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "cheapGetMessage",
+      "label": "Cheap message retrieval",
+      "description": "GetMessage asks Wine's server only for the message itself, not twice more to reset and re-read its queue state.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeClock",
+      "label": "Native clock reads",
+      "description": "Reads QueryPerformanceCounter, timeGetTime and the system time as browser code instead of an emulated system call.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeFreetype",
+      "label": "Native FreeType",
+      "description": "Loads and draws Windows text glyphs (GDI fonts) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "hotGroup",
       "label": "Hot code groups",
       "description": "Compiles code that runs hot together into one module, so it runs faster.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "jitInline",
+      "label": "Inline small calls",
+      "description": "Compiles calls to small functions into the code that calls them, so a call and its return cost no jumps between compiled blocks.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "cheapHop",
+      "label": "Cheaper block jumps",
+      "description": "Jumps between compiled blocks read the next block through the address they already hold instead of loading it again for every check.",
       "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
       "group": "Speed", "restart": true, "experimental": false
     },

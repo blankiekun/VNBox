@@ -1199,6 +1199,7 @@ static U32 syscall_sched_getscheduler(CPU* cpu, U32 eipCount) {
 }
 
 static U32 syscall_sched_yield(CPU* cpu, U32 eipCount) {
+    vnboxStatSleep(cpu->thread, true, 0); // stats=1 [frames]
 #ifndef BOXEDWINE_MULTI_THREADED
     cpu->yield = true;
 #endif

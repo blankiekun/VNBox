@@ -1304,6 +1304,14 @@ void XServer::clampPointerToGrab(S32& x, S32& y) {
 	confined->windowToScreen(x, y);
 }
 
+bool XServer::samePointerPos(S32 x, S32 y) {
+	bool same = lastMotionValid && x == lastMotionX && y == lastMotionY;
+	lastMotionX = x;
+	lastMotionY = y;
+	lastMotionValid = true;
+	return same;
+}
+
 void XServer::mouseMove(S32 x, S32 y, bool relative) {
 	if (relative) {
 		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(grabbedMutex);
@@ -1344,7 +1352,9 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 			}
 			mapCapturedMouse(x, y);
 			clampPointerToGrab(x, y);
-			grabbed->motionNotify(grabbedDisplay, x, y);
+			if (!samePointerPos(x, y)) {
+				grabbed->motionNotify(grabbedDisplay, x, y);
+			}
 			return;
 		} else {
 			ungrabPointer(0);
@@ -1357,10 +1367,14 @@ void XServer::mouseMove(S32 x, S32 y, bool relative) {
 		}
 		XWindowPtr wnd = root->getWindowFromPoint(x, y);
 		if (wnd) {
-			if (wnd != pointerWindow) {
+			bool crossed = wnd != pointerWindow;
+			if (crossed) {
 				pointerMoved(pointerWindow, wnd, x, y, NotifyNormal);
 				pointerWindow = wnd;
 				KNativeSystem::getScreen()->setCursor(wnd->getCursor());
+			}
+			if (samePointerPos(x, y) && !crossed) {
+				return;
 			}
 			while (wnd && !wnd->mouseMoveScreenCoords(x, y)) {
 				wnd = wnd->parent;

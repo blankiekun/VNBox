@@ -236,17 +236,50 @@ void hostHookHit(CPU* cpu) {
 enum : U32 {
     LIBC_NONE, LIBC_MEMCPY, LIBC_MEMMOVE, LIBC_MEMSET, LIBC_MEMCMP, LIBC_MEMCHR, LIBC_STRLEN, LIBC_STRNLEN,
     LIBC_STRCMP, LIBC_STRNCMP, LIBC_STRCHR, LIBC_STRRCHR, LIBC_STRCPY, LIBC_STRTOL, LIBC_STRTOUL,
-    LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_COUNT,
+    LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_MUTEX_LOCK, LIBC_MUTEX_UNLOCK, LIBC_COUNT, // mutex ones: hostmutex.cpp
     HOST_ACM = LIBC_COUNT, // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
-    HOST_VORBIS // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
+    HOST_CLOCK, // + CLOCK_* - 1: ntdll.dll.so's clock reads (hostclock.cpp)
+    HOST_VORBIS = HOST_CLOCK + 3, // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
+    HOST_FREETYPE = HOST_VORBIS + 32, // + FTH_*: libfreetype.so.6's exports win32u uses (hostfreetype.cpp)
+    HOST_DIBDRV = HOST_FREETYPE + 32, // + entry: win32u.so's DIB primitives (hostdibdrv.cpp)
+    HOST_GLYPHM = 0x1000 // + GM_*: win32u.so's text measuring (hostglyphm.cpp)
 };
 static const char* const hostLibcNames[LIBC_COUNT] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
-    "strchr", "strrchr", "strcpy", "strtol", "strtoul", "__isoc23_strtol", "__isoc23_strtoul"
+    "strchr", "strrchr", "strcpy", "strtol", "strtoul", "__isoc23_strtol", "__isoc23_strtoul",
+    "pthread_mutex_lock", "pthread_mutex_unlock"
 };
-static std::atomic<int> hostLibcState; // 0: no libc mapped yet, 1: table ready (set after the table), -1: off or unusable
-static BString hostLibcPath;
-static std::vector<std::pair<U64, U32>> hostLibcEntries; // file offset of an export, LIBC_*
+U32 hostFreetypeFnId(const char* name); // hostfreetype.cpp
+bool hostFreetypeEnabled();
+bool hostFreetypeRun(CPU* cpu, U32 fn);
+U32 hostLibcFnId(const char* name);
+static bool hostLibcEnabled() {
+#ifdef __EMSCRIPTEN__
+    if (vnboxUrlIs("nativeLibc", "0")) {
+        klog_fmt("[vnbox] native libc off (nativeLibc=0)");
+        return false;
+    }
+#endif
+    return true;
+}
+
+// The root fs ELF libraries whose exports get a head op: the first file mapped whose path ends in `suffix` (or holds
+// it, for a versioned soname) loads its table. fnId gives an export's id (0: not hooked), added to `base`.
+struct HostElfLib {
+    const char* suffix;
+    bool versioned;
+    U32 base;
+    U32 (*fnId)(const char*);
+    bool (*enabled)();
+    std::atomic<int> state; // 0: not mapped yet, 1: table ready (set after the table), -1: off or unusable
+    BString path;
+    std::vector<std::pair<U64, U32>> entries; // file offset of an export, base + id
+};
+static HostElfLib hostElfLibs[] = {
+    { "/libc.so.6", false, 0, hostLibcFnId, hostLibcEnabled, {}, {}, {} }, // LIBC_*
+    { "/libfreetype.so.6", true, HOST_FREETYPE - 1, hostFreetypeFnId, hostFreetypeEnabled, {}, {}, {} },
+};
+static std::atomic<bool> hostElfAny; // some table is ready
 static U8 hostLibcPageOffsets[K_PAGE_SIZE / 8]; // bit per page offset of an entry: getOp's cheap filter
 
 U32 hostLibcFnId(const char* name) {
@@ -259,8 +292,12 @@ U32 hostLibcFnId(const char* name) {
 static U32 elf16(const U8* p) { return p[0] | (p[1] << 8); }
 static U32 elf32(const U8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((U32)p[3] << 24); }
 
+bool hostMutexWanted(U32 symValue, U32 index); // hostmutex.cpp
+void hostMutexCheck(KFile* file);
+bool hostMutexRun(CPU* cpu, U32 fn, U32 a0, U32& result);
+
 // Reads the exports from the file's section headers and .dynsym (host-side reads, the guest isn't involved).
-static bool hostLibcParse(KFile* file) {
+static bool hostLibcParse(KFile* file, HostElfLib& lib) {
     auto read = [file](U64 offset, std::vector<U8>& buf, U32 len) {
         buf.resize(len);
         return file->preadNative(buf.data(), (S64)offset, len) == len;
@@ -280,14 +317,14 @@ static bool hostLibcParse(KFile* file) {
             U32 name = elf32(sym), value = elf32(sym + 4), shndx = elf16(sym + 14);
             if ((sym[12] & 0xf) != 2 || !shndx || shndx >= shnum || name >= names.size()) continue; // STT_FUNC only (an IFUNC is a resolver)
             if (!memchr(&names[name], 0, names.size() - name)) continue;
-            U32 fn = hostLibcFnId((const char*)&names[name]);
-            if (!fn) continue;
+            U32 fn = lib.fnId((const char*)&names[name]);
+            if (!fn || (lib.fnId == hostLibcFnId && fn >= LIBC_MUTEX_LOCK && fn < LIBC_COUNT && !hostMutexWanted(value, fn - LIBC_MUTEX_LOCK))) continue;
             const U8* sec = &sh[shndx * 40];
             U64 fileOffset = (U64)value - elf32(sec + 12) + elf32(sec + 16); // st_value - sh_addr + sh_offset
-            hostLibcEntries.push_back({ fileOffset, fn });
+            lib.entries.push_back({ fileOffset, lib.base + fn });
             hostLibcPageOffsets[(fileOffset & K_PAGE_MASK) >> 3] |= 1 << (fileOffset & 7);
         }
-        return !hostLibcEntries.empty();
+        return !lib.entries.empty();
     }
     return false;
 }
@@ -296,11 +333,23 @@ bool hostAcmMapped(KFile* file, U32& driverProc); // hostacm.cpp
 bool hostAcmAt(const BString& path, U32 fileOffset);
 bool hostAcmRun(CPU* cpu);
 static std::atomic<bool> hostAcmAny;
+bool hostClockMapped(KFile* file, U32* offsets); // hostclock.cpp
+U32 hostClockAt(const BString& path, U32 fileOffset);
+bool hostClockRun(CPU* cpu, U32 fn);
+static std::atomic<bool> hostClockAny;
 U32 hostVorbisAt(CPU* cpu, U32 eip); // hostvorbis.cpp
 bool hostVorbisRun(CPU* cpu, U32 fn);
+bool hostDibdrvMapped(KFile* file, std::vector<U32>& offsets); // hostdibdrv.cpp
+U32 hostDibdrvAt(const BString& path, U32 offset);
+bool hostDibdrvRun(CPU* cpu, U32 index);
+static std::atomic<bool> hostDibdrvAny;
+bool hostGlyphmMapped(KFile* file, std::vector<U32>& offsets); // hostglyphm.cpp
+U32 hostGlyphmAt(const BString& path, U32 offset);
+bool hostGlyphmRun(CPU* cpu, U32 fn);
+static std::atomic<bool> hostGlyphmAny;
 
-// Called by KMemory::mmap for every file mapping; the first libc.so.6 mapped loads the table, a known
-// vorbis.acm adds its DriverProc.
+// Called by KMemory::mmap for every file mapping; the first libc.so.6 (libfreetype.so.6) mapped loads
+// its table, a known vorbis.acm adds its DriverProc, ntdll.dll.so its clock exports.
 void hostLibcMapped(KFile* file) {
     if (!file || !file->openFile || !file->openFile->node) return;
     U32 driverProc;
@@ -309,37 +358,61 @@ void hostLibcMapped(KFile* file) {
         hostAcmAny = true;
         return;
     }
-    if (hostLibcState) return;
-    const BString& path = file->openFile->node->path;
-    if (!path.endsWith("/libc.so.6")) return;
-#ifdef __EMSCRIPTEN__
-    if (vnboxUrlIs("nativeLibc", "0")) {
-        hostLibcState = -1;
-        klog_fmt("[vnbox] native libc off (nativeLibc=0)");
+    U32 clockOffsets[4];
+    if (hostClockMapped(file, clockOffsets)) {
+        for (U32 i = 1; i < 4; i++) hostLibcPageOffsets[(clockOffsets[i] & K_PAGE_MASK) >> 3] |= 1 << (clockOffsets[i] & 7);
+        hostClockAny = true;
         return;
     }
-#endif
-    bool ok = hostLibcParse(file);
-    if (ok) hostLibcPath = path;
-    hostLibcState = ok ? 1 : -1;
-    klog_fmt("[vnbox] native libc: %s, %d functions", path.c_str(), (int)hostLibcEntries.size());
+    std::vector<U32> glyphmOffsets; // win32u.so; not a return: other hooks may want the same file
+    if (hostGlyphmMapped(file, glyphmOffsets)) {
+        for (U32 offset : glyphmOffsets) hostLibcPageOffsets[(offset & K_PAGE_MASK) >> 3] |= 1 << (offset & 7);
+        hostGlyphmAny = true;
+    }
+    std::vector<U32> dibOffsets;
+    if (hostDibdrvMapped(file, dibOffsets)) {
+        for (U32 offset : dibOffsets) hostLibcPageOffsets[(offset & K_PAGE_MASK) >> 3] |= 1 << (offset & 7);
+        hostDibdrvAny = true;
+        return;
+    }
+    const BString& path = file->openFile->node->path;
+    for (HostElfLib& lib : hostElfLibs) {
+        if (lib.state || !(lib.versioned ? strstr(path.c_str(), lib.suffix) != nullptr : path.endsWith(lib.suffix))) continue;
+        if (!lib.enabled()) {
+            lib.state = -1;
+            return;
+        }
+        if (lib.fnId == hostLibcFnId) hostMutexCheck(file); // before parse: hostMutexWanted needs it
+        bool ok = hostLibcParse(file, lib);
+        if (ok) lib.path = path;
+        lib.state = ok ? 1 : -1;
+        if (ok) hostElfAny = true;
+        klog_fmt("[vnbox] native %s: %s, %d functions", lib.suffix + 1, path.c_str(), (int)lib.entries.size());
+        return;
+    }
 }
 
-// LIBC_* (or HOST_ACM, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
+// LIBC_* (or HOST_ACM, HOST_CLOCK + CLOCK_* - 1, HOST_VORBIS + VB_*) when the block at eip (linear) starts one of the wrapped exports in this
 // process, else LIBC_NONE.
 U32 hostLibcAt(CPU* cpu, U32 eip) {
     if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
-    if ((hostLibcState != 1 && !hostAcmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
+    if ((!hostElfAny && !hostAcmAny && !hostClockAny && !hostDibdrvAny && !hostGlyphmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();
     U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
     if (!offset) return LIBC_NONE;
     BString name = process->getModuleName(eip);
-    if (hostLibcState == 1 && name == hostLibcPath) {
-        for (auto& e : hostLibcEntries) {
+    for (HostElfLib& lib : hostElfLibs) {
+        if (lib.state != 1 || name != lib.path) continue;
+        for (auto& e : lib.entries) {
             if (e.first == offset) return e.second;
         }
         return LIBC_NONE;
     }
+    if (U32 gm = hostGlyphmAny ? hostGlyphmAt(name, offset) : 0) return HOST_GLYPHM + gm - 1;
+    if (hostClockAny) {
+        if (U32 clock = hostClockAt(name, offset)) return HOST_CLOCK + clock - 1;
+    }
+    if (U32 dib = hostDibdrvAny ? hostDibdrvAt(name, offset) : 0) return HOST_DIBDRV + dib - 1;
     return hostAcmAny && hostAcmAt(name, offset) ? HOST_ACM : LIBC_NONE;
 }
 
@@ -350,7 +423,7 @@ static U8* libcRam(KMemory* memory, U32 address, bool write) {
     return ramPageGet((RamPage)mmu.ramIndex) + (address & K_PAGE_MASK);
 }
 
-static bool libcRange(KMemory* memory, U32 address, U32 len, bool write) {
+bool libcRange(KMemory* memory, U32 address, U32 len, bool write) {
     if (!len) return true;
     if ((U64)address + len > 0x100000000ull) return false;
     for (U32 page = address >> K_PAGE_SHIFT; page <= (address + len - 1) >> K_PAGE_SHIFT; page++) {
@@ -492,7 +565,11 @@ static bool libcStrtol(KMemory* memory, U32 nptr, U32 endptr, S32 base, bool isS
 // above it); on success sets EAX and pops the return address into eip, as the function's `ret` would.
 // False (nothing changed) means the guest function has to run.
 bool hostLibcRun(CPU* cpu, U32 fn) {
+    if (fn >= HOST_GLYPHM) return hostGlyphmRun(cpu, fn - HOST_GLYPHM);
     if (fn == HOST_ACM) return hostAcmRun(cpu);
+    if (fn >= HOST_DIBDRV) return hostDibdrvRun(cpu, fn - HOST_DIBDRV);
+    if (fn >= HOST_FREETYPE) return hostFreetypeRun(cpu, fn - HOST_FREETYPE);
+    if (fn >= HOST_CLOCK && fn < HOST_VORBIS) return hostClockRun(cpu, fn - HOST_CLOCK + 1);
     if (fn >= HOST_VORBIS) return hostVorbisRun(cpu, fn - HOST_VORBIS);
     KMemory* memory = cpu->memory;
     if (cpu->getDirection() < 0 || cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF ||
@@ -605,6 +682,10 @@ bool hostLibcRun(CPU* cpu, U32 fn) {
     case LIBC_STRTOL23:
     case LIBC_STRTOUL23:
         if (!libcStrtol(memory, a0, a1, (S32)a2, fn == LIBC_STRTOL || fn == LIBC_STRTOL23, fn >= LIBC_STRTOL23, result)) return false;
+        break;
+    case LIBC_MUTEX_LOCK:
+    case LIBC_MUTEX_UNLOCK:
+        if (!hostMutexRun(cpu, fn - LIBC_MUTEX_LOCK, a0, result)) return false;
         break;
     default:
         return false;
