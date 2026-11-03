@@ -289,8 +289,13 @@ U32 hostLibcFnId(const char* name) {
     return LIBC_NONE;
 }
 
-static U32 elf16(const U8* p) { return p[0] | (p[1] << 8); }
-static U32 elf32(const U8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((U32)p[3] << 24); }
+// The hook files' readers of ELF and PE files on the host (only when a file is mapped, never per call).
+U32 hostElf16(const U8* p) { return p[0] | (p[1] << 8); }
+U32 hostElf32(const U8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((U32)p[3] << 24); }
+bool hostFileRead(KFile* file, U64 offset, std::vector<U8>& buf, U32 len) {
+    buf.resize(len);
+    return file->preadNative(buf.data(), (S64)offset, len) == len;
+}
 
 bool hostMutexWanted(U32 symValue, U32 index); // hostmutex.cpp
 void hostMutexCheck(KFile* file);
@@ -298,29 +303,25 @@ bool hostMutexRun(CPU* cpu, U32 fn, U32 a0, U32& result);
 
 // Reads the exports from the file's section headers and .dynsym (host-side reads, the guest isn't involved).
 static bool hostLibcParse(KFile* file, HostElfLib& lib) {
-    auto read = [file](U64 offset, std::vector<U8>& buf, U32 len) {
-        buf.resize(len);
-        return file->preadNative(buf.data(), (S64)offset, len) == len;
-    };
     std::vector<U8> eh, sh, syms, names;
-    if (!read(0, eh, 52) || memcmp(eh.data(), "\x7f" "ELF\x01\x01", 6) || elf16(&eh[18]) != 3) return false; // ELF32 LE i386
-    U32 shoff = elf32(&eh[32]), shentsize = elf16(&eh[46]), shnum = elf16(&eh[48]);
-    if (shentsize != 40 || !shnum || !read(shoff, sh, shnum * 40)) return false;
+    if (!hostFileRead(file, 0, eh, 52) || memcmp(eh.data(), "\x7f" "ELF\x01\x01", 6) || hostElf16(&eh[18]) != 3) return false; // ELF32 LE i386
+    U32 shoff = hostElf32(&eh[32]), shentsize = hostElf16(&eh[46]), shnum = hostElf16(&eh[48]);
+    if (shentsize != 40 || !shnum || !hostFileRead(file, shoff, sh, shnum * 40)) return false;
     for (U32 i = 0; i < shnum; i++) {
         const U8* s = &sh[i * 40];
-        U32 link = elf32(s + 24);
-        if (elf32(s + 4) != 11 || link >= shnum) continue; // SHT_DYNSYM
+        U32 link = hostElf32(s + 24);
+        if (hostElf32(s + 4) != 11 || link >= shnum) continue; // SHT_DYNSYM
         const U8* str = &sh[link * 40];
-        if (!read(elf32(s + 16), syms, elf32(s + 20)) || !read(elf32(str + 16), names, elf32(str + 20))) return false;
+        if (!hostFileRead(file, hostElf32(s + 16), syms, hostElf32(s + 20)) || !hostFileRead(file, hostElf32(str + 16), names, hostElf32(str + 20))) return false;
         for (U32 off = 0; off + 16 <= syms.size(); off += 16) {
             const U8* sym = &syms[off];
-            U32 name = elf32(sym), value = elf32(sym + 4), shndx = elf16(sym + 14);
+            U32 name = hostElf32(sym), value = hostElf32(sym + 4), shndx = hostElf16(sym + 14);
             if ((sym[12] & 0xf) != 2 || !shndx || shndx >= shnum || name >= names.size()) continue; // STT_FUNC only (an IFUNC is a resolver)
             if (!memchr(&names[name], 0, names.size() - name)) continue;
             U32 fn = lib.fnId((const char*)&names[name]);
             if (!fn || (lib.fnId == hostLibcFnId && fn >= LIBC_MUTEX_LOCK && fn < LIBC_COUNT && !hostMutexWanted(value, fn - LIBC_MUTEX_LOCK))) continue;
             const U8* sec = &sh[shndx * 40];
-            U64 fileOffset = (U64)value - elf32(sec + 12) + elf32(sec + 16); // st_value - sh_addr + sh_offset
+            U64 fileOffset = (U64)value - hostElf32(sec + 12) + hostElf32(sec + 16); // st_value - sh_addr + sh_offset
             lib.entries.push_back({ fileOffset, lib.base + fn });
             hostLibcPageOffsets[(fileOffset & K_PAGE_MASK) >> 3] |= 1 << (fileOffset & 7);
         }
