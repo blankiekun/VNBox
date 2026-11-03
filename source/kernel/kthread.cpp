@@ -339,7 +339,7 @@ static void initFutex(struct futex* f, KThread* thread, U64 address, U32 millies
     f->address = address;
     f->expireTimeInMillies = millies;
     f->wake = false;
-    f->mask = 0;
+    f->mask = 0xFFFFFFFF; // FUTEX_WAIT matches every FUTEX_WAKE_BITSET
     f->waiting = false;
 }
 
@@ -437,29 +437,32 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
         struct futex* f;
         U32 expireTime = 0xFFFFFFFF;
 
+        if (cmd == FUTEX_WAIT_BITSET && !val3) {
+            return -K_EINVAL;
+        }
         if (pTime != 0) {
-            if (time64) {
-                U64 seconds = memory->readq(pTime);
-                U32 nano = memory->readd(pTime + 8);
+            S64 seconds = time64 ? (S64)memory->readq(pTime) : (S64)(S32)memory->readd(pTime);
+            U32 nano = memory->readd(pTime + (time64 ? 8 : 4));
 
-                if (cmd == FUTEX_WAIT) {
-                    // FUTEX_WAIT timeout is relative
-                    expireTime = (U32)(seconds * 1000 + nano / 1000000);
-                } else {
-                    expireTime = (U32)((seconds * 1000 + nano / 1000000) - KSystem::getSystemTimeAsMicroSeconds() / 1000);
+            if (seconds < 0 || nano >= 1000000000) {
+                return -K_EINVAL;
+            }
+            // A deadline this far off is never (it also keeps the milliseconds in range).
+            if (seconds < (1LL << 40)) {
+                S64 millies = seconds * 1000 + nano / 1000000; // FUTEX_WAIT timeout is relative
+                if (cmd == FUTEX_WAIT_BITSET) {
+                    // absolute, on the clock the flag names: the same ones clock_gettime reports
+                    U64 now = (op & FUTEX_CLOCK_REALTIME) ? KSystem::getSystemTimeAsMicroSeconds() : KSystem::getMicroCounter();
+                    millies -= (S64)(now / 1000);
                 }
-            } else {
-                U32 seconds = memory->readd(pTime);
-                U32 nano = memory->readd(pTime + 4);
-
-                if (cmd == FUTEX_WAIT) {
-                    // FUTEX_WAIT timeout is relative
-                    expireTime = seconds * 1000 + nano / 1000000;
-                } else {
-                    expireTime = (U32)((seconds * 1000 + nano / 1000000) - KSystem::getSystemTimeAsMicroSeconds() / 1000);
+                if (millies < 0) {
+                    millies = 0; // already past: expires in the loop below, after the value compare
+                }
+                U32 start = KSystem::getMilliesSinceStart();
+                if (millies < (S64)(0x7FFFFFFF - start)) { // at or above 0x7FFFFFFF means no timeout
+                    expireTime = start + (U32)millies;
                 }
             }
-            expireTime += KSystem::getMilliesSinceStart();
         }
 
         f = getFutex(this, ramAddress);
