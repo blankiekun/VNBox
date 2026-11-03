@@ -1383,6 +1383,7 @@ void wasmJitTestOomTick(double nowMs); // one main loop tick of the OOM retry at
 U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
 U64 wasmJitTestInlinedCalls();
+U32 wasmJitTestInlineDepCount();
 bool wasmJitTestRelocAllocationTransfer();
 U32 wasmJitTestSealedCount();
 extern "C" U32 wasmJitTestRuntimeGroupCount();

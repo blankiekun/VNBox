@@ -1108,11 +1108,21 @@ static void wasmJitAddInlineDep(KMemory* memory, U32 start, U32 end, U32 callerE
     for (U32 page = start >> K_PAGE_SHIFT; page <= ((end - 1) >> K_PAGE_SHIFT); ++page) {
         std::vector<WasmJitInlineDep>& deps = g_wasmJitInlineDeps[page];
         bool known = false;
-        for (const WasmJitInlineDep& dep : deps) {
-            if (dep.memory == memory && dep.start == start && dep.end == end && dep.caller == caller && dep.callerEip == callerEip) {
-                known = true;
-                break;
+        for (size_t i = 0; i < deps.size();) {
+            const WasmJitInlineDep& dep = deps[i];
+            if (dep.memory == memory) {
+                // The caller's op is gone: its code was unmapped or rewritten. A callee page that is never
+                // invalidated (ntdll) would otherwise keep one entry per caller load for good.
+                if (memory->getDecodedOp(dep.callerEip) != dep.caller) {
+                    deps[i] = deps.back();
+                    deps.pop_back();
+                    continue;
+                }
+                if (dep.start == start && dep.end == end && dep.caller == caller && dep.callerEip == callerEip) {
+                    known = true;
+                }
             }
+            ++i;
         }
         if (!known) deps.push_back({memory, start, end, callerEip, caller});
     }
@@ -2539,11 +2549,15 @@ EM_JS(int, boxedwine_wasm_instantiate,
 
         // Build the helper imports object.  Each entry in importFns is a C++
         // function pointer that already lives in wasmTable (since all Emscripten
-        // functions are in the table).
-        var helpers = {};
-        var view = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
-        for (var i = 0; i < importCount; i++) {
-            helpers['fn_' + i] = wasmTable.get(view[i]);
+        // functions are in the table). The table of helpers never changes: build it once.
+        var helpers = Module.wasmJitHelpers;
+        if (!helpers) {
+            helpers = {};
+            var view = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
+            for (var i = 0; i < importCount; i++) {
+                helpers['fn_' + i] = wasmTable.get(view[i]);
+            }
+            Module.wasmJitHelpers = helpers;
         }
 
         var inst = new WebAssembly.Instance(mod, {
@@ -2654,10 +2668,14 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int siz
         var statsT = performance.now();
         var module = new WebAssembly.Module(new Uint8Array(HEAPU8.buffer, bytes >>> 0, size));
         if (Module.vnboxJit) { Module.vnboxJit.ms += performance.now() - statsT; Module.vnboxJit.n++; }
-        var helpers = {};
-        var imports = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
-        for (var i = 0; i < importCount; ++i) {
-            helpers['fn_' + i] = wasmTable.get(imports[i]);
+        var helpers = Module.wasmJitHelpers;
+        if (!helpers) {
+            helpers = {};
+            var imports = new Int32Array(HEAP32.buffer, importFns >>> 0, importCount);
+            for (var i = 0; i < importCount; ++i) {
+                helpers['fn_' + i] = wasmTable.get(imports[i]);
+            }
+            Module.wasmJitHelpers = helpers;
         }
         var instance = new WebAssembly.Instance(module, {
             env: {memory: wasmMemory, table: wasmTable}, helpers: helpers
@@ -5704,6 +5722,12 @@ U32 wasmJitTestHotQueueSize() {
 
 U64 wasmJitTestHotModules() {
     return g_wasmJitHotModules;
+}
+
+U32 wasmJitTestInlineDepCount() {
+    U32 count = 0;
+    for (const auto& page : g_wasmJitInlineDeps) count += (U32)page.second.size();
+    return count;
 }
 
 U64 wasmJitTestInlinedCalls() {
@@ -16468,6 +16492,7 @@ void commitWasmJitCodeInvalidation(void* opaque) noexcept {
     bool releasedSlot = false;
     for (S32 tableIndex : prepared->tableSlots) {
         boxedwine_wasm_free_block(tableIndex);
+        wasmJitHotForgetSlot(tableIndex);
         releasedSlot = true;
         if ((size_t)tableIndex < g_wasmRelocBaseByTable.size() && g_wasmRelocBaseByTable[tableIndex]) {
             delete[] g_wasmRelocBaseByTable[tableIndex];
