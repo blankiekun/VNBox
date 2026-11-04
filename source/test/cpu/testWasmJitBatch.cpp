@@ -201,6 +201,25 @@ void testWasmJitHotGroups() {
     if (wasmJitTestRuntimeGroupCount() != 0) {
         testFail("the hot group must be released with its last block");
     }
+    // Catches: code invalidation (what an unmap or a write does) freeing a slot and keeping its queue entry. The freed
+    // op can come back at another address with the same slot, and the flush would then compile it under the old eip.
+    DecodedOp* requeued = cpu->getOp(TEST_CODE_ADDRESS, 0);
+    startNewJIT(cpu, TEST_CODE_ADDRESS, requeued);
+    requeued->runCount = JIT_RUN_COUNT + 1;
+    wasmJitTestClearHotCounts();
+    for (U32 i = 0; i < hotEntries; ++i) {
+        cpu->eip.u32 = 0;
+        cpu->nextOp = requeued;
+        cpu->yield = false;
+        cpu->blockInstructionCount = 0;
+        cpu->run();
+    }
+    const U32 queued = wasmJitTestHotQueueSize();
+    cpu->nextOp = nullptr;
+    context.memory->removeCodeBlock(TEST_CODE_ADDRESS, requeued, false);
+    if (!queued || wasmJitTestHotQueueSize() != queued - 1) {
+        testFail("invalidated code must drop its hot queue entry (%u queued, %u after)", queued, wasmJitTestHotQueueSize());
+    }
     wasmJitTestResetRuntimeBatching();
 }
 
@@ -483,6 +502,41 @@ void testWasmJitInlineCall() {
     context.memory->mprotect(context.thread, page, K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE);
     context.process->sigActions[K_SIGSEGV] = savedAction;
     memcpy(cpu->seg, savedSegs, sizeof(savedSegs));
+
+    // Catches: inline dependencies piling up on a callee page nothing ever writes to, when the caller (a plugin DLL)
+    // is unloaded and loaded again, at the same address or another one. Callers on their own page: removing one
+    // never scans the callee's page.
+    constexpr U32 deadCallerA = K_PAGE_SIZE;
+    constexpr U32 deadCallerB = K_PAGE_SIZE + 0x40;
+    code(0x400, {0x83, 0xc2, 0x01, 0xc3}); // add edx,1; ret
+    call(deadCallerA, 0x400); code(deadCallerA + 5, {0xcd, 0x97});
+    call(deadCallerB, 0x400); code(deadCallerB + 5, {0xcd, 0x97});
+    auto compileDeadCaller = [&](U32 offset) {
+        cpu->getOp(TEST_CODE_ADDRESS + 0x400, 0);
+        return compile(offset);
+    };
+    before = wasmJitTestInlinedCalls();
+    compileDeadCaller(deadCallerA);
+    if (wasmJitTestInlinedCalls() - before != 1) testFail("a caller on another page must inline its callee");
+    const U32 depsOfOneCaller = wasmJitTestInlineDepCount();
+    for (U32 i = 0; i < 4; ++i) {
+        context.memory->removeCode(context.thread, TEST_CODE_ADDRESS + deadCallerA, 0x10, false);
+        compileDeadCaller(deadCallerA);
+        if (wasmJitTestInlineDepCount() != depsOfOneCaller) {
+            testFail("a caller loaded again at its address must not add inline deps (%u, expected %u)", wasmJitTestInlineDepCount(), depsOfOneCaller);
+        }
+    }
+    context.memory->removeCode(context.thread, TEST_CODE_ADDRESS + deadCallerA, 0x10, false);
+    DecodedOp* liveCaller = compileDeadCaller(deadCallerB);
+    if (wasmJitTestInlineDepCount() != depsOfOneCaller) {
+        testFail("a caller loaded at another address must drop the old inline deps (%u, expected %u)", wasmJitTestInlineDepCount(), depsOfOneCaller);
+    }
+    // A live caller's dep survives that pruning: a write to the callee still reaches it.
+    compileDeadCaller(deadCallerA);
+    context.memory->writeb(TEST_CODE_ADDRESS + 0x402, 2);
+    if (context.memory->getDecodedOp(TEST_CODE_ADDRESS + deadCallerB) == liveCaller && liveCaller->pfnJitCode) {
+        testFail("a write to an inlined callee must still invalidate a caller whose page's deps were pruned");
+    }
 
     cpu->nextOp = nullptr;
 }

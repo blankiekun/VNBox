@@ -25,6 +25,7 @@
 #include "../emulation/cpu/normal/normalCPU.h"
 #include "vnboxstats.h"
 #include <cstdlib>
+#include <unordered_set>
 
 #ifdef BOXEDWINE_JIT
 #include "../emulation/cpu/jit/jitCodeLifecycle.h"
@@ -1465,9 +1466,12 @@ void KMemory::prepareCodeInvalidation(U32 address, U32 len) {
 
     try {
 #if defined(BOXEDWINE_JIT)
+        // Every blockStart in preparedCodeBlocks: an unload can collect thousands of blocks and tens of thousands of ops.
+        std::unordered_set<DecodedOp*> preparedBlockStarts;
         struct CollectContext {
             std::vector<PreparedCodeInvalidationBlock>* blocks;
-        } context = {&preparedCodeBlocks};
+            std::unordered_set<DecodedOp*>* blockStarts;
+        } context = {&preparedCodeBlocks, &preparedBlockStarts};
         data->opCache.iterateOps(address, len,
             [](U32 opAddress, DecodedOp* op, void* opaque) {
                 if (!op->blockStart) {
@@ -1475,16 +1479,15 @@ void KMemory::prepareCodeInvalidation(U32 address, U32 len) {
                 }
                 CollectContext& context = *static_cast<CollectContext*>(opaque);
                 DecodedOp* blockStart = op->blockStart;
-                for (const PreparedCodeInvalidationBlock& block : *context.blocks) {
-                    if (block.blockStart == blockStart) {
-                        return;
-                    }
+                if (context.blockStarts->count(blockStart)) {
+                    return;
                 }
                 U32 prefixLen = 0;
                 if (!getCodeBlockOffset(blockStart, op, prefixLen)) {
                     return;
                 }
                 context.blocks->push_back({opAddress - prefixLen, blockStart, {}, {}, nullptr});
+                context.blockStarts->insert(blockStart);
             }, &context);
 
         // Wasm JIT blocks can overlap. Removing one block's range removes ops
@@ -1492,13 +1495,10 @@ void KMemory::prepareCodeInvalidation(U32 address, U32 len) {
         // is the earliest-starting block covering it (claimJitBlockOps), so
         // every overlapping block is an owner of a collected block's op or
         // starts inside a collected block's chain.
-        auto isPreparedBlock = [this](DecodedOp* blockStart) {
-            for (const PreparedCodeInvalidationBlock& block : preparedCodeBlocks) {
-                if (block.blockStart == blockStart) {
-                    return true;
-                }
+        auto addPreparedBlock = [&](U32 blockAddress, DecodedOp* blockStart) {
+            if (preparedBlockStarts.insert(blockStart).second) {
+                preparedCodeBlocks.push_back({blockAddress, blockStart, {}, {}, nullptr});
             }
-            return false;
         };
         // Blocks that inlined code from a removed range (wasm leaf-call inlining) go with it.
         std::vector<std::pair<U32, DecodedOp*>> dependents;
@@ -1508,8 +1508,8 @@ void KMemory::prepareCodeInvalidation(U32 address, U32 len) {
                 return;
             }
             for (const auto& dependent : dependents) {
-                if (dependent.second->blockOpCount && !isPreparedBlock(dependent.second)) {
-                    preparedCodeBlocks.push_back({dependent.first, dependent.second, {}, {}, nullptr});
+                if (dependent.second->blockOpCount) {
+                    addPreparedBlock(dependent.first, dependent.second);
                 }
             }
         };
@@ -1522,11 +1522,11 @@ void KMemory::prepareCodeInvalidation(U32 address, U32 len) {
             for (U32 i = 0; i < blockStart->blockOpCount && current && current->inst != Done; ++i) {
                 DecodedOp* owner = current->blockStart;
                 U32 prefixLen = 0;
-                if (owner && owner != blockStart && !isPreparedBlock(owner) && getCodeBlockOffset(owner, current, prefixLen)) {
-                    preparedCodeBlocks.push_back({opAddress - prefixLen, owner, {}, {}, nullptr});
+                if (owner && owner != blockStart && !preparedBlockStarts.count(owner) && getCodeBlockOffset(owner, current, prefixLen)) {
+                    addPreparedBlock(opAddress - prefixLen, owner);
                 }
-                if (current != blockStart && current->blockOpCount && !isPreparedBlock(current)) {
-                    preparedCodeBlocks.push_back({opAddress, current, {}, {}, nullptr});
+                if (current != blockStart && current->blockOpCount) {
+                    addPreparedBlock(opAddress, current);
                 }
                 opAddress += current->len;
                 current = current->next;
