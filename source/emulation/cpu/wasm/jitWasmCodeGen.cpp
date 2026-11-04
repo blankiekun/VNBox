@@ -1345,14 +1345,12 @@ static std::atomic<U32> g_wasmJitTestMemHelperCalls{0};
 extern "C" U32 wasmJitTestMemHelperCalls() { return g_wasmJitTestMemHelperCalls.load(); }
 // Counts in the emitted code, so a test can tell a register reload or a lazy type store from none.
 static std::atomic<U32> g_wasmJitTestRegLoads[24]; // general registers, then 16 + xmm index
-static std::atomic<U32> g_wasmJitTestLazyTypeStores{0};
 void wasmJitTestResetRegLoads() { for (auto& count : g_wasmJitTestRegLoads) count = 0; }
 U32 wasmJitTestMaxRegLoads() {
     U32 most = 0;
     for (const auto& count : g_wasmJitTestRegLoads) most = std::max(most, count.load());
     return most;
 }
-U32 wasmJitTestLazyTypeStores() { return g_wasmJitTestLazyTypeStores.load(); }
 #define WASM_JIT_TEST_COUNT(counter) counter++
 // shouldStopBlockBefore is off under __TEST unless a test turns it on (ST only).
 static bool g_wasmJitTestStopBlocks = false;
@@ -12920,56 +12918,8 @@ void JitWasmCodeGen::movValue(JitWidth w, RegPtr dst, DYN_PTR_SIZE imm) {
 // (the generated WASM reads/writes these via readCPU/writeCPU which delegate
 //  to emitI32Load/emitI32Store with the appropriate offsets)
 // ---------------------------------------------------------------------------
-bool JitWasmCodeGen::canKeepPublishedFlagType(DecodedOp* op) const {
-    if (!op || op->lock) return false;
-    const auto& info = instructionInfo[op->inst];
-    if (info.branch || info.readMemWidth || info.writeMemWidth || (info.flagsSets & MAYBE)) return false;
-    if (op->isSetCC() || op->isCMovCC()) {
-        U32 used = info.flagsUsed & WASM_FMASK_TEST;
-        return !(used & ~(ZF | SF | PF)) && (!(used & PF) || !std::getenv("BOXEDWINE_WASM_PARITY_SLOW"));
-    }
-    switch (op->inst) {
-    case AddR8R8: case AddR8I8:
-    case AddR16R16: case AddR16I16:
-    case AddR32R32: case AddR32I32:
-    case SubR8R8: case SubR8I8:
-    case SubR16R16: case SubR16I16:
-    case SubR32R32: case SubR32I32:
-    case CmpR8R8: case CmpR8I8:
-    case CmpR16R16: case CmpR16I16:
-    case CmpR32R32: case CmpR32I32:
-    case TestR8R8: case TestR8I8:
-    case TestR16R16: case TestR16I16:
-    case TestR32R32: case TestR32I32:
-    case AndR8R8: case AndR8I8:
-    case AndR16R16: case AndR16I16:
-    case AndR32R32: case AndR32I32:
-    case OrR8R8: case OrR8I8:
-    case OrR16R16: case OrR16I16:
-    case OrR32R32: case OrR32I32:
-    case XorR8R8: case XorR8I8:
-    case XorR16R16: case XorR16I16:
-    case XorR32R32: case XorR32I32:
-        return true;
-    case Nop:
-    case MovR8R8: case MovR16R16: case MovR32R32:
-    case MovR8I8: case MovR16I16: case MovR32I32:
-    case LeaR16: case LeaR32:
-        return true;
-    default: return false;
-    }
-}
-
-// shortcut: off (audit finding 76): no gain measured so far; turn on only if a paired timing shows one.
-static constexpr bool WASM_JIT_LAZY_TYPE_DSE_AND_SPAN_FORWARD = false;
-
 void JitWasmCodeGen::storeLazyFlagType(LazyFlagType flags) {
-    const bool certified = WASM_JIT_LAZY_TYPE_DSE_AND_SPAN_FORWARD && canKeepPublishedFlagType(currentOp) &&
-        flags != FLAGS_NULL && flags != FLAGS_CFOF;
-    if (certified && m_publishedLazyFlagType == flags) return;
-    WASM_JIT_TEST_COUNT(g_wasmJitTestLazyTypeStores);
     writeCPUValue(JitWidth::b8, (U32)offsetof(CPU, lazyFlagType), (DYN_PTR_SIZE)flags);
-    m_publishedLazyFlagType = certified ? flags : FLAGS_NULL;
 }
 void JitWasmCodeGen::storeLazyFlagsDest(RegPtr reg) {
     // isHigh regs point at the high byte of reg[0..3]; pushRegValue already
@@ -12985,36 +12935,19 @@ void JitWasmCodeGen::storeLazyFlagsSrc(RegPtr reg) {
 void JitWasmCodeGen::storeLazyFlagsSrc(U32 value) {
     writeCPUValue(JitWidth::b32, (U32)offsetof(CPU, src.u32), value);
 }
-U32 JitWasmCodeGen::findFlagResultForwardEnd(DecodedOp* producer) const {
-    const auto& info = instructionInfo[producer->inst];
-    if (producer->lock || info.branch || info.readMemWidth || info.writeMemWidth ||
-            (info.flagsSets & (ZF | SF | MAYBE)) != (ZF | SF)) return 0;
-    U32 end = 0, eip = currentEip + producer->len;
-    DecodedOp* op = producer->next;
-    for (U32 count = 0; op && count < 32 && eip <= lastOpEip; ++count, eip += op->len, op = op->next) {
-        if ((op->flags2 & OP_FLAG2_JUMP_TARGET) || instructionInfo[op->inst].flagsSets ||
-                !canKeepPublishedFlagType(op)) break;
-        if (op->isSetCC() || op->isCMovCC()) end = eip;
-    }
-    return end;
-}
-
 void JitWasmCodeGen::storeLazyFlagsResult(RegPtr reg) {
     writeCPU(reg->isHigh ? JitWidth::b8 : JitWidth::b32,
              (U32)offsetof(CPU, result.u32), reg);
-    U32 end = WASM_JIT_LAZY_TYPE_DSE_AND_SPAN_FORWARD ? findFlagResultForwardEnd(currentOp) : 0;
-    if (end || canForwardFlagResult(currentOp)) {
+    if (canForwardFlagResult(currentOp)) {
         // Keep the architectural store for faults, exits, and later flag
         // consumers. The dedicated local cannot alias later instructions' scratch.
         pushRegValue(reg);
         m_emitter.emitLocalSet(WASM_FLAG_RESULT_LOCAL);
         m_forwardedResultConsumer = currentOp->next;
-        m_forwardedResultEndEip = end;
     }
 }
 void JitWasmCodeGen::pushLazyFlagResult() {
-    if (m_forwardedResultConsumer == currentOp ||
-            (m_forwardedResultEndEip && currentEip <= m_forwardedResultEndEip)) {
+    if (m_forwardedResultConsumer == currentOp) {
         m_emitter.emitLocalGet(WASM_FLAG_RESULT_LOCAL);
     } else {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
@@ -13026,8 +12959,6 @@ void JitWasmCodeGen::storeLazyFlagsOldCF(RegPtr reg) {
 }
 void JitWasmCodeGen::fillFlags(U32 flags) {
     m_forwardedResultConsumer = nullptr;
-    m_forwardedResultEndEip = 0;
-    m_publishedLazyFlagType = FLAGS_NULL;
     // Materialize lazy flags: call common_fillFlags(cpu).
     syncDirtyRegsToHost();
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
@@ -13595,9 +13526,7 @@ RegPtr JitWasmCodeGen::getCondition(JitConditional cond, RegPtr res) {
         emitMaterializedCondition(cond, tmp->hardwareReg());
         m_emitter.emitElse();
     }
-    m_publishedLazyFlagType = FLAGS_NULL;
     m_forwardedResultConsumer = nullptr;
-    m_forwardedResultEndEip = 0;
     // The per-condition helper has signature (CPU*)->void and writes tmpReg.
     // Other incoming lazy states still need their original flag formula.
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
@@ -13628,7 +13557,6 @@ void JitWasmCodeGen::finishIf() {
 }
 
 void JitWasmCodeGen::branchBoundary() {
-    m_publishedLazyFlagType = FLAGS_NULL;
     // The enclosing scope preloads its inputs and preserves local mappings
     // on returning paths; failure paths synchronize before leaving the block.
     if (m_preserveCpuRegisterState) return;
@@ -14448,9 +14376,7 @@ void JitWasmCodeGen::hintLikelyStringLoopContinue() {
 // ---------------------------------------------------------------------------
 void JitWasmCodeGen::callHostFunction(void* address, const std::vector<DynParam>& params,
                                        bool restoreCache, bool saveCache) {
-    m_publishedLazyFlagType = FLAGS_NULL;
     m_forwardedResultConsumer = nullptr;
-    m_forwardedResultEndEip = 0;
     // This legacy helper entry point accepts only the signature void(CPU*).
     // Any additional operands are pre-stored in CPU fields (dst, src, etc.) before
     // the call by the caller, so params must contain exactly one CPU entry.
@@ -14510,9 +14436,7 @@ void JitWasmCodeGen::withCpuRegisterState(U32 readRegs, U32 writtenRegs, const s
 }
 
 void JitWasmCodeGen::callNonFaultingCpuHelper(void (*helper)(CPU*, U32), U32 arg, U32 readRegs, U32 writtenRegs) {
-    m_publishedLazyFlagType = FLAGS_NULL;
     m_forwardedResultConsumer = nullptr;
-    m_forwardedResultEndEip = 0;
     U32 index = HELPER_CPU_FIRST;
     while (index < WASM_HELPER_COUNT && g_wasmHelperTable[index] != (const void*)helper) ++index;
     if (index == WASM_HELPER_COUNT) kpanic("Non-faulting CPU helper is not imported");
@@ -14562,8 +14486,6 @@ void JitWasmCodeGen::dynamic_wait(DecodedOp* op) {
 
 void JitWasmCodeGen::emulateSingleOp() {
     m_forwardedResultConsumer = nullptr;
-    m_forwardedResultEndEip = 0;
-    m_publishedLazyFlagType = FLAGS_NULL;
     // A helper can replace x87 state or redirect control flow. Its return path
     // leaves this activation, while a conditional arm that skips the helper
     // must retain its original compile-time cache mapping.
@@ -14639,7 +14561,6 @@ void JitWasmCodeGen::emulateSingleOp() {
     // Reset the compile-time cache so getCondition uses the safe runtime-read
     // path rather than emitting a guard based on a stale expected flag type.
     currentLazyFlags = FLAGS_NULL;
-    m_publishedLazyFlagType = FLAGS_NULL;
     if (savedFpuCache.entryTop) {
         // The interpreter owns CPU state now: return without writing the old
         // cached values over its result, then restore metadata for the hot arm.
@@ -15338,11 +15259,9 @@ void JitWasmCodeGen::preCompileInlined(DecodedOp* op) {
     m_emulatedCurrentOp = false;
     currentOp = op;
     m_currentWasmOp = op;
-    if ((op->flags2 & OP_FLAG2_JUMP_TARGET) || !canKeepPublishedFlagType(op)) m_publishedLazyFlagType = FLAGS_NULL;
     if (m_forwardedResultConsumer != op || (op->flags2 & OP_FLAG2_JUMP_TARGET)) {
         m_forwardedResultConsumer = nullptr;
     }
-    m_forwardedResultEndEip = 0;
     m_scratchInUse.fill(false);
     m_f64ScratchInUse.fill(false);
     m_v128ScratchInUse.fill(false);
@@ -15355,7 +15274,6 @@ void JitWasmCodeGen::preCompileInlined(DecodedOp* op) {
             m_emitter.emitEnd();
             target.token = 0;
             currentLazyFlags = FLAGS_NULL;
-            m_publishedLazyFlagType = FLAGS_NULL;
             m_forwardedResultConsumer = nullptr;
         }
     }
@@ -15387,8 +15305,6 @@ bool JitWasmCodeGen::emitInlinedCall(DecodedOp* op) {
     m_inlinedRanges.push_back({callee.eip, callee.end});
     g_wasmJitInlinedCalls++;
     m_forwardedResultConsumer = nullptr;
-    m_forwardedResultEndEip = 0;
-    m_publishedLazyFlagType = FLAGS_NULL;
     m_readGroupActive = false;
     m_inlineTargets.clear();
     for (U32 target : callee.targets) {
@@ -15427,7 +15343,7 @@ bool JitWasmCodeGen::emitInlinedCall(DecodedOp* op) {
         auto xmmLoaded = m_xmmLoaded, xmmDirty = m_xmmDirty;
         auto segLoaded = m_segLoaded;
         auto fpu = fpuStackCache;
-        auto lazy = currentLazyFlags, published = m_publishedLazyFlagType;
+        auto lazy = currentLazyFlags;
         pushRegValue(popped);
         m_emitter.emitI32Const((S32)(returnEip - cpu->seg[CS].address));
         m_emitter.emitOp(WASM_I32_NE);
@@ -15439,7 +15355,7 @@ bool JitWasmCodeGen::emitInlinedCall(DecodedOp* op) {
         m_xmmLoaded = xmmLoaded; m_xmmDirty = xmmDirty;
         m_segLoaded = segLoaded;
         fpuStackCache = fpu;
-        currentLazyFlags = lazy; m_publishedLazyFlagType = published;
+        currentLazyFlags = lazy;
     }
     popped = nullptr;
     // The dispatcher counts the caller's ops (blockOpCount); count the callee's here.
@@ -15454,8 +15370,6 @@ bool JitWasmCodeGen::emitInlinedCall(DecodedOp* op) {
     m_inlineDepth--;
     m_scratchInUse.fill(false);
     m_forwardedResultConsumer = nullptr;
-    m_forwardedResultEndEip = 0;
-    m_publishedLazyFlagType = FLAGS_NULL;
     m_readGroupActive = false;
     m_readGroupReady = false;
     this->currentEip = callEip;
@@ -15553,12 +15467,8 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
     // warmup state, just as they do in the native backends.
     currentOp = op;
     m_currentWasmOp = op;
-    if ((op->flags2 & OP_FLAG2_JUMP_TARGET) || !canKeepPublishedFlagType(op)) m_publishedLazyFlagType = FLAGS_NULL;
-    const bool insideResultSpan = m_forwardedResultEndEip && currentEip <= m_forwardedResultEndEip &&
-        !instructionInfo[op->inst].flagsSets && canKeepPublishedFlagType(op);
-    if ((!insideResultSpan && m_forwardedResultConsumer != op) || (op->flags2 & OP_FLAG2_JUMP_TARGET)) {
+    if (m_forwardedResultConsumer != op || (op->flags2 & OP_FLAG2_JUMP_TARGET)) {
         m_forwardedResultConsumer = nullptr;
-        m_forwardedResultEndEip = 0;
     }
     m_scratchInUse.fill(false);
     if (skippedOp || !m_readGroupActive || currentEip > m_readGroup.lastEip) {
@@ -15587,9 +15497,7 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
                 m_emitter.emitEnd();
                 target.token = 0;
                 currentLazyFlags = FLAGS_NULL;
-                m_publishedLazyFlagType = FLAGS_NULL;
                 m_forwardedResultConsumer = nullptr;
-                m_forwardedResultEndEip = 0;
             }
         }
     }
@@ -15600,9 +15508,7 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
             m_emitter.emitEnd();
             target.token = 0;
             currentLazyFlags = FLAGS_NULL;
-            m_publishedLazyFlagType = FLAGS_NULL;
             m_forwardedResultConsumer = nullptr;
-            m_forwardedResultEndEip = 0;
         }
     }
     if (op->isDirectJumpBranch()) syncForwardMemoryJoin();
@@ -15705,9 +15611,7 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
             m_segLoaded.fill(false);
         }
         currentLazyFlags = FLAGS_NULL;
-        m_publishedLazyFlagType = FLAGS_NULL;
         m_forwardedResultConsumer = nullptr;
-        m_forwardedResultEndEip = 0;
     }
     JitCodeGen::preCompile(op, skippedOp);
 #ifdef BOXEDWINE_MULTI_THREADED
@@ -15753,7 +15657,7 @@ void JitWasmCodeGen::emitSseDivSlowPath() {
     auto xmmLoaded = m_xmmLoaded, xmmDirty = m_xmmDirty;
     auto segLoaded = m_segLoaded;
     auto fpu = fpuStackCache;
-    auto lazy = currentLazyFlags, published = m_publishedLazyFlagType;
+    auto lazy = currentLazyFlags;
     bool emulated = m_emulatedCurrentOp;
     emulateSingleOp();
     blockExit();
@@ -15761,7 +15665,7 @@ void JitWasmCodeGen::emitSseDivSlowPath() {
     m_xmmLoaded = xmmLoaded; m_xmmDirty = xmmDirty;
     m_segLoaded = segLoaded;
     fpuStackCache = fpu;
-    currentLazyFlags = lazy; m_publishedLazyFlagType = published;
+    currentLazyFlags = lazy;
     m_emulatedCurrentOp = emulated;
 }
 

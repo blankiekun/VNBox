@@ -720,9 +720,8 @@ void testWasmJitColdArmsKeepRegisters() {
     cpu->nextOp = nullptr;
 }
 
-// Catches: the type store of a repeated flag op being dropped while WASM_JIT_LAZY_TYPE_DSE_AND_SPAN_FORWARD is off, a
-// stale type in the CPU struct, and a setcc or cmov some ops after its producer reading the wrong value (a register
-// overwritten since, a high-byte result).
+// Catches: a stale type in the CPU struct, and a setcc or cmov some ops after its producer reading the wrong value (a
+// register overwritten since, a high-byte result).
 void testWasmJitLazyFlagStores() {
     extern S32 contextTimeRemaining;
     const S32 savedBudget = contextTimeRemaining;
@@ -732,11 +731,9 @@ void testWasmJitLazyFlagStores() {
     enum { rEax, rEcx, rEdx, rEbx, rEsp, rEbp, rEsi, rEdi };
     auto zf = [&]() { cpu->fillFlags(); return (cpu->flags & ZF) != 0; };
 
-    // Two adds with live flags: each stores its type. Fails on purpose if the store removal comes back on by accident.
+    // Two adds with live flags: each stores its type.
     t.code(0x00, {0x01, 0xd8, 0x0f, 0x94, 0xc2, 0x01, 0xd9, 0x0f, 0x94, 0xc6, 0xcd, 0x97}); // add eax,ebx; setz dl; add ecx,ebx; setz dh; int 97
-    U32 before = wasmJitTestLazyTypeStores();
     DecodedOp* op = t.compile(0x00);
-    if (wasmJitTestLazyTypeStores() - before != 2) testFail("two adds store the lazy type %u times", wasmJitTestLazyTypeStores() - before);
     t.regs(1, 5, 0, (U32)-1, 0, 0, 0);
     t.run(op, 0x00);
     if ((cpu->reg[rEdx].u32 & 0xffff) != 0x0001 || zf()) testFail("add setz add setz (1): edx=%x", cpu->reg[rEdx].u32);
@@ -782,10 +779,10 @@ void testWasmJitLazyFlagStores() {
     cpu->nextOp = nullptr;
 }
 
-// Catches: a result forwarded to the next op, a cmov's select or a side exit giving other flags or registers than the
-// CPU struct path would (and a dropped type store or a span's forwarded result, if those come back on). Random runs of
-// register ops in one block against the same ops one block each: there nothing is forwarded and each setcc, cmov and
-// jcc reads the type and values in the CPU struct.
+// Catches: a result forwarded to the next op or a side exit giving other flags or registers than the CPU struct path
+// would. Random runs of register ops in one block against the same ops one block each: there nothing is forwarded and
+// each setcc, cmov and jcc reads the type and values in the CPU struct. Both sides are JIT-compiled, so a wrong cmov
+// select changes both alike: 105 and 106 catch that.
 void testWasmJitFlagsMatchOneBlockPerOp() {
     extern S32 contextTimeRemaining;
     const S32 savedBudget = contextTimeRemaining;
