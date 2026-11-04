@@ -1539,10 +1539,12 @@
         }, false);
         dropzone.addEventListener("drop", async function(event){
             event.preventDefault();
+            // A running game shows nothing for a drop: the copy would use storage quota, unseen and for good.
+            if (isRunning) return;
             // the dropped items are only readable until the first await
             let entries = Array.from(event.dataTransfer.items, (item) => item.webkitGetAsEntry()).filter(Boolean);
             // with auto run off, list the dropped programs so one can be started
-            let showExecute = !Config.isAutoRunSet && !isRunning;
+            let showExecute = !Config.isAutoRunSet;
             let message = document.getElementById('message');
             if (showExecute) {
                 document.getElementById('modalLinkExe').click();
@@ -2451,11 +2453,11 @@
               Atomics.store(presentState, 0, 0);
             }
           }
-          return function(width, height, buffer, presentState) {
+          return function(width, height, pixels, presentState) {
             if (!canvas) {
               canvas = document.getElementById('boxedwine-webgl-canvas-0');
             }
-            if (!canvas || !buffer) {
+            if (!canvas || !pixels) {
               finishPresent(presentState);
               return;
             }
@@ -2474,7 +2476,8 @@
               context = canvas.getContext("2d");
             }
             if (context) {
-              context.putImageData(new ImageData(new Uint8ClampedArray(buffer), width, height), 0, 0);
+              // pixels: a view of wasm memory, or from a worker an ArrayBuffer
+              context.putImageData(new ImageData(ArrayBuffer.isView(pixels) ? pixels : new Uint8ClampedArray(pixels), width, height), 0, 0);
             }
             finishPresent(presentState);
           };

@@ -13,7 +13,7 @@ jobs:
   # vnbox-movie.js command order and decoder lifetime,
   # boxedwine-shell.js (URL options, CUE/BIN, zips), source/io/readahead.h, and VNBox options read in
   # code but missing from vnbox-options.json (or listed but read nowhere), the audio worklet's buffering
-  # and clock (boxedwine-audio-worklet.js) and the page's mouse button handling (knativeinputSDL.cpp).
+  # and clock (boxedwine-audio-worklet.js), the page's mouse button handling (knativeinputSDL.cpp) and the main loop's wake and frame wait (mainloop.cpp).
   checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 6
@@ -45,6 +45,9 @@ jobs:
 
       - name: testBrowserMouseButtons.mjs
         run: node --test project/emscripten/testBrowserMouseButtons.mjs
+
+      - name: testMainLoopWake.mjs
+        run: node --test project/emscripten/testMainLoopWake.mjs
 
       - name: test_read_ahead.cpp
         run: |

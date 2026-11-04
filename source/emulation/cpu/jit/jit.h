@@ -525,7 +525,7 @@ protected:
     void scas(JitWidth valueWidth, U32 size, JitWidth regWidth, LazyFlagType lazyFlags);
     void scasr(JitWidth valueWidth, U32 size, JitWidth regWidth, U32 rep_zero, LazyFlagType lazyFlags);
     void dynamic_jump(DecodedOp* op, JitConditional condition);
-    void dynamic_cmov_R(JitWidth width, DecodedOp* op, JitConditional condition);
+    virtual void dynamic_cmov_R(JitWidth width, DecodedOp* op, JitConditional condition);
     void dynamic_cmov_M(JitWidth width, DecodedOp* op, JitConditional condition);
     void dynamic_set_R(DecodedOp* op, JitConditional condition);
     void dynamic_set_M(DecodedOp* op, JitConditional condition);

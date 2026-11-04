@@ -86,8 +86,19 @@ void testWaitPid();
 void testX11ConcurrentInitialization();
 void testX11ImageIncludeInferiors();
 void testX11ImageScanlinePadding();
+void testX11OversizedDrawable();
+void testX11BadGuestValues();
+void testX11JisKeys();
 void testX11GetImageBounds();
 void testX11ImageReadback();
+void testX11CopyBounds();
+void testX11CopyWithinDrawable();
+void testX11CapsLockKeys();
+void testX11ResizeMarksDirty();
+void testX11DestroyWindowTree();
+void testX11ClientWindowsGoWithIt();
+void testX11ClipboardOwnerGone();
+void testX11FreeCursor();
 void testX11PalettedDrawing();
 void testX11PatternFills();
 void testX11PaletteInvalidation();
@@ -394,6 +405,12 @@ const TestEntry TEST_ENTRIES[] = {
     {testWasmJitSingleOpOomPropagates, "Test ST WASM JIT single op allocation failure", TEST_ENTRY_SERIAL},
     {testWasmJitOomProbe, "Test ST WASM JIT out of memory retry by time", TEST_ENTRY_SERIAL},
     {testWasmJitInlineCall, "Test ST WASM JIT leaf-call inlining", TEST_ENTRY_SERIAL},
+    {testWasmJitColdArmsKeepRegisters, "Test ST WASM JIT side exit, cmov and divide guard keep registers", TEST_ENTRY_SERIAL},
+    {testWasmJitLazyFlagStores, "Test ST WASM JIT lazy type stores and forwarded results", TEST_ENTRY_SERIAL},
+    {testWasmJitStopBlockBefore, "Test ST WASM JIT block stop before a block start", TEST_ENTRY_SERIAL},
+    {testWasmJitInlineCalleeShapes, "Test ST WASM JIT inlined callee below its caller", TEST_ENTRY_SERIAL},
+    {testWasmJitFailedGroupSplits, "Test ST WASM JIT failed group splits", TEST_ENTRY_SERIAL},
+    {testWasmJitFlagsMatchOneBlockPerOp, "Test ST WASM JIT flags in one block match one block per op", TEST_ENTRY_SERIAL},
     {testWasmJitRuntimeGrouping, "Test WASM JIT runtime grouping"},
     {testWasmJitPendingLifecycle, "Test WASM JIT pending lifecycle"},
     {testWasmJitTinyAnonymousPromotion, "Test WASM JIT tiny anonymous promotion"},
@@ -1168,8 +1185,19 @@ const TestEntry TEST_ENTRIES[] = {
     {testWaitPid, "Test waitpid child selection"},
     {testX11ImageIncludeInferiors, "Test X11 image IncludeInferiors and child coordinates"},
     {testX11ImageScanlinePadding, "Test X11 image scanline padding"},
+    {testX11OversizedDrawable, "Test X11 drawables too large to have pixels"},
+    {testX11BadGuestValues, "Test X11 calls with bad guest values"},
+    {testX11JisKeys, "Test X11 JIS keys"},
     {testX11GetImageBounds, "Test X11 image capture bounds and padding"},
     {testX11ImageReadback, "Test X11 window readback and cursor save/restore"},
+    {testX11CopyBounds, "Test X11 image and area copies stay inside both drawables"},
+    {testX11CopyWithinDrawable, "Test X11 area copy within one drawable"},
+    {testX11CapsLockKeys, "Test X11 Caps Lock changes letters only"},
+    {testX11ResizeMarksDirty, "Test X11 resize marks the window dirty"},
+    {testX11DestroyWindowTree, "Test X11 destroying a window destroys its subwindows"},
+    {testX11ClientWindowsGoWithIt, "Test X11 a closed display or exited process takes its windows"},
+    {testX11ClipboardOwnerGone, "Test X11 clipboard owner gone"},
+    {testX11FreeCursor, "Test X11 XFreeCursor keeps a cursor in use"},
     {testX11PalettedDrawing, "Test X11 paletted drawing and clipping"},
     {testX11PatternFills, "Test X11 tiled and stippled rectangle fills"},
     {testX11PaletteInvalidation, "Test X11 shared palette invalidation"},

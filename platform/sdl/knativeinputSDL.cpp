@@ -90,6 +90,11 @@ extern "C" EMSCRIPTEN_KEEPALIVE void boxedwineEmscriptenKey(U32 sdlScanCode, U32
     }
 }
 
+// The page listeners take modifier keys before SDL, so SDL's own state never changes: the page tells it.
+extern "C" EMSCRIPTEN_KEEPALIVE void boxedwineEmscriptenModifiers(U32 mods) {
+    SDL_SetModState((SDL_Keymod)mods);
+}
+
 static void boxedwineInstallEmscriptenInputHandlers() {
 #if defined(BOXEDWINE_MULTI_THREADED)
     MAIN_THREAD_ASYNC_EM_ASM((function() {
@@ -112,6 +117,23 @@ static void boxedwineInstallEmscriptenInputHandlers() {
 
     var capturingMouse = 0;
     var lastMousePoint = {x: 0, y: 0};
+
+    // SDL_Keymod: KMOD_LSHIFT, KMOD_LCTRL, KMOD_LALT, KMOD_NUM, KMOD_CAPS
+    var MOD_SHIFT = 0x0001, MOD_CTRL = 0x0040, MOD_ALT = 0x0100, MOD_NUM = 0x1000, MOD_CAPS = 0x2000;
+    var lastMods = 0;
+
+    function setMods(mods) {
+        if (mods !== lastMods) {
+            lastMods = mods;
+            _boxedwineEmscriptenModifiers(mods);
+        }
+    }
+
+    // Every key and mouse event says what is held and which locks are on, so the state is right before the next X event.
+    function syncMods(event) {
+        setMods((event.shiftKey ? MOD_SHIFT : 0) | (event.ctrlKey ? MOD_CTRL : 0) | (event.altKey ? MOD_ALT : 0) |
+            (event.getModifierState('NumLock') ? MOD_NUM : 0) | (event.getModifierState('CapsLock') ? MOD_CAPS : 0));
+    }
 
     function releaseCapturedMouseButtons() {
         var buttons = capturingMouse;
@@ -196,7 +218,8 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82,
         NumLock: 83, NumpadDivide: 84, NumpadMultiply: 85, NumpadSubtract: 86, NumpadAdd: 87, NumpadEnter: 88,
         Numpad1: 89, Numpad2: 90, Numpad3: 91, Numpad4: 92, Numpad5: 93, Numpad6: 94, Numpad7: 95, Numpad8: 96, Numpad9: 97,
-        Numpad0: 98, NumpadDecimal: 99
+        Numpad0: 98, NumpadDecimal: 99,
+        IntlRo: 135, KanaMode: 136, IntlYen: 137, Convert: 138, NonConvert: 139, Lang1: 144, Lang2: 145
     };
 
     function boxedwineKey(event) {
@@ -221,6 +244,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
     var heldKeys = new Set();
 
     function releaseHeldKeys() {
+        setMods(lastMods & (MOD_NUM | MOD_CAPS)); // focus loss lets go of what is held; locks stay on
         heldKeys.forEach(function(scanCode) {
             _boxedwineEmscriptenKey(scanCode, 0, 0);
         });
@@ -237,6 +261,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
     // stopPropagation, not stopImmediatePropagation: SDL's handlers are further along the path,
     // while the main loop's wake and audio's resume are later listeners on window and must still run.
     window.addEventListener('keydown', function(event) {
+        syncMods(event); // also for the Ctrl+letter keys left to SDL
         var key = boxedwineKey(event);
         if (!key) {
             return;
@@ -248,6 +273,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
     }, true);
 
     window.addEventListener('keyup', function(event) {
+        syncMods(event);
         var key = boxedwineKey(event);
         var scanCode = keyCodeToSDLScanCode[event.code];
         // A key down in the guest is released whatever the event's target or modifiers are now.
@@ -270,6 +296,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
             return;
         }
         lastMousePoint = point;
+        syncMods(event);
         _boxedwineEmscriptenMouseMove(point.x, point.y);
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -286,6 +313,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         capturingMouse |= 1 << event.button;
         lastMousePoint = point;
         canvas.focus();
+        syncMods(event);
         _boxedwineEmscriptenMouseButton(1, boxedwineButton(event.button), point.x, point.y);
         event.preventDefault();
         event.stopPropagation();
@@ -301,6 +329,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         }
         capturingMouse &= ~(1 << event.button);
         lastMousePoint = point;
+        syncMods(event);
         _boxedwineEmscriptenMouseButton(0, boxedwineButton(event.button), point.x, point.y);
         event.preventDefault();
         event.stopPropagation();

@@ -500,6 +500,7 @@ public:
     void direct_neg(JitWidth w, RegPtr dst) override;
     void direct_jump(JitConditional cond, U32 address) override;
     void direct_cmov(JitWidth w, JitConditional cond, RegPtr dst, RegPtr src) override;
+    void dynamic_cmov_R(JitWidth width, DecodedOp* op, JitConditional condition) override;
     void direct_setcc(JitConditional cond, RegPtr dst) override;
     bool directDoesAffectFlags(DecodedOp* op) override;
 
@@ -965,6 +966,7 @@ public:
     void preCompile(DecodedOp* op, bool skippedOp = false) override;
     void compile(DecodedOp* op) override;
     bool compileScalarSseRegion(DecodedOp* op);
+    void guardSseDiv() override;
     void emitSseDivSlowPath() override;
     void postCompile(DecodedOp* op) override;
     bool shouldStopBlockBefore(U32 eip, DecodedOp* op) override;
@@ -1098,6 +1100,7 @@ protected:
     void findDirectLoopCandidates();
     void findForwardTargets();
     bool emitDirectLoopBackedge(U32 address);
+    bool isForwardBranchTarget(U32 address) const;
     bool emitForwardBranch(U32 address);
 
     // Emit cpu_ptr onto WASM stack (local.get 0)
@@ -1356,6 +1359,10 @@ void wasmJitOomTick();
 
 #ifdef __TEST
 extern "C" U32 wasmJitTestEmissionCount();
+void wasmJitTestResetRegLoads();
+U32 wasmJitTestMaxRegLoads();
+U32 wasmJitTestLazyTypeStores();
+void wasmJitTestSetStopBlocks(bool enabled);
 extern "C" U32 wasmJitTestMemHelperCalls();
 void wasmJitTestPrintSizeStats();
 void wasmJitTestSetFailInvalidationPreparation(bool fail);
@@ -1374,6 +1381,7 @@ void wasmJitTestSetMappedFileKeyOverride(S32 mappedFileKey);
 void wasmJitTestSetTinyAdditionalHits(U32 hits);
 extern "C" void wasmJitTestFailBatchAfterSlots(S32 slotCount);
 void wasmJitTestResetRuntimeBatching();
+void wasmJitTestCorruptPendingBlock(DecodedOp* op);
 U32 wasmJitTestPendingCount();
 void wasmJitTestSetHotGroups(U32 entries, double waitMs);
 void wasmJitTestClearHotCounts();
@@ -1383,6 +1391,7 @@ void wasmJitTestOomTick(double nowMs); // one main loop tick of the OOM retry at
 U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
 U64 wasmJitTestInlinedCalls();
+U32 wasmJitTestInlineDepCount();
 bool wasmJitTestRelocAllocationTransfer();
 U32 wasmJitTestSealedCount();
 extern "C" U32 wasmJitTestRuntimeGroupCount();

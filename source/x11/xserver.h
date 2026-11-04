@@ -96,6 +96,7 @@ public:
 	
 	void addCursor(const XCursorPtr& cursor);
 	XCursorPtr getCursor(U32 id);
+	void removeCursor(U32 id); // XFreeCursor: the id goes, the cursor lives on while a window or the page uses it
 	void updateCursor(const XWindowPtr& wnd);
 
 	void iterateEventMask(U32 wndId, U32 mask, std::function<void(const DisplayDataPtr& data)> callback);
@@ -114,6 +115,7 @@ public:
 	static U64 nextDrawUs; // KSystem::getMicroCounter() time the next frame may be drawn
 	static bool composited; // set by draw() when it composited a frame
 	static bool hidden; // the web page is in the background: nothing is drawn, the frame stays dirty for the next visible tick
+	static bool canvasLost; // the browser may have dropped the 2D canvas's contents: the next composite sends its frame even if unchanged
 	void colorMapChanged(const XColorMapPtr& colorMap);
 	const XWindowPtr& getRoot();
 	U32 getEventTime();
@@ -155,6 +157,8 @@ public:
 	void iterateFbConfigs(std::function<bool(const CLXFBConfigPtr& cfg)> callback);
 
 private:
+	void destroyWindowsOfDisplays(const std::vector<DisplayDataPtr>& gone);
+
 	BOXEDWINE_MUTEX inputFocusMutex;
 	XWindowPtr inputFocus;
 	bool inputFocusIsPointerRoot = false;

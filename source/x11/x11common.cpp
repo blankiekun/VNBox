@@ -129,6 +129,10 @@ static void x11_CreateWindow(CPU* cpu) {
         U32 visualId = X11_READD(Visual, visualAddress, visualid);
         visual = server->getVisual(visualId);
     }
+    if (!data || !visual) {
+        EAX = 0; // no window; an error number here would read as a window id
+        return;
+    }
 
     // Visual visual;
     // visual.read(memory, ARG10);
@@ -256,6 +260,10 @@ static void x11_ChangeWindowAttributes(CPU* cpu) {
     }
     XSetWindowAttributes tmpAttributes;
     XSetWindowAttributes* attributes = XSetWindowAttributes::get(memory, ARG4, &tmpAttributes);
+    if (!data || (mask && !attributes)) {
+        EAX = BadValue;
+        return;
+    }
     EAX = w->setAttributes(data, attributes, mask);
 }
 
@@ -1334,6 +1342,10 @@ static void x11_QueryColors(CPU* cpu) {
 
     for (U32 i = 0; i < count; i++) {
         U32 pixel = memory->readd(colorsAddress);
+        if (pixel >= MAX_COLORMAP_SIZE) {
+            EAX = BadValue;
+            return;
+        }
         const XColorMapColor& c = colorMap->colors[pixel];
         memory->writew(colorsAddress + 4, (U16)c.r << 8);
         memory->writew(colorsAddress + 6, (U16)c.g << 8);
@@ -1740,7 +1752,7 @@ static void x11_CreatePixmapCursor(CPU* cpu) {
     bg.read(memory, ARG5);
     XPixmapPtr pixmap = server->getPixmap(ARG2);
     XPixmapPtr mask = server->getPixmap(ARG3);
-    XCursorPtr cursor = std::make_shared<XCursor>(pixmap, mask, fg, bg, ARG6, ARG7);
+    XCursorPtr cursor = std::make_shared<XCursor>(fg, bg, ARG6, ARG7);
     server->addCursor(cursor);
     EAX = cursor->id;
     // winex11 makes every 1 bpp Windows cursor this way (no Xcursor for mono): give it its picture, source bit
@@ -1754,7 +1766,7 @@ static void x11_CreatePixmapCursor(CPU* cpu) {
         width = std::min(width, mask->width());
         height = std::min(height, mask->height());
     }
-    if (!width || !height) {
+    if (!width || !height || width > X_CURSOR_MAX_SIDE || height > X_CURSOR_MAX_SIDE || !pixmap->getData() || (mask && !mask->getData())) {
         return;
     }
     auto bit = [](const XPixmapPtr& p, U32 x, U32 y) {
@@ -1798,13 +1810,21 @@ static void x11_DefineCursor(CPU* cpu) {
         EAX = BadWindow;
         return;
     }
-    window->cursor = server->getCursor(ARG3);
+    XCursorPtr cursor = server->getCursor(ARG3);
+    if (!cursor && window == server->getRoot()) {
+        // None means "as the parent", and the root has none: it keeps the cursor it has
+        EAX = Success;
+        return;
+    }
+    window->cursor = cursor;
     server->updateCursor(window);
     EAX = Success;
 }
 
+// int XFreeCursor(Display* display, Cursor cursor)
 static void x11_FreeCursor(CPU* cpu) {
-    kwarn("x11_FreeCursor");
+    XServer::getServer()->removeCursor(ARG2);
+    EAX = Success;
 }
 
 // int XSetFunction(Display* display, GC gc, int function)
@@ -3041,6 +3061,10 @@ void x11_CursorImageCreate(CPU* cpu) {
     KMemory* memory = cpu->memory;
     U32 width = ARG1;
     U32 height = ARG2;
+    if (width > X_CURSOR_MAX_SIDE || height > X_CURSOR_MAX_SIDE) {
+        EAX = 0;
+        return;
+    }
     U32 result = thread->process->alloc(thread, sizeof(XcursorImage) + width * height * 4);
     XcursorImage::write(memory, result, width, height, result + sizeof(XcursorImage));
     EAX = result;

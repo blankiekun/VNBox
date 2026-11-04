@@ -88,11 +88,16 @@ void XDrawable::readImage(U8* dst, U32 dstPitch, S32 x, S32 y, U32 width, U32 he
 	}
 }
 
-U32 XDrawable::calculateBytesPerLine(U32 bitsPerPixel, U32 width) {
-	U32 result = (width * bitsPerPixel + 7) / 8;
+U64 XDrawable::calculateBytesPerLine(U32 bitsPerPixel, U32 width) {
+	U64 result = ((U64)width * bitsPerPixel + 7) / 8;
 	result = (result + 3) / 4 * 4;
 	return result;
 }
+
+// The largest drawable that gets pixels (8192x8192 at 32 bpp). An X server keeps none for an unmapped window, here every
+// window has them: a game's huge hidden popup must not end the emulator. Larger ones keep their size for the guest and
+// have no pixels, drawing on them does nothing and the composite skips them (bytes_per_line 0, as putBitsOnWnd checks).
+static const U64 MAX_DRAWABLE_BYTES = 256 * 1024 * 1024;
 
 void XDrawable::lockData() {
 	BOXEDWINE_MUTEX_LOCK(mutex);
@@ -106,16 +111,22 @@ void XDrawable::setSize(U32 width, U32 height) {
 	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex);
 	w = width;
 	h = height;
-	bytes_per_line = calculateBytesPerLine(visual?visual->bits_per_rgb:32, width);
-	size = isPBuffer ? 0 : height * bytes_per_line;
+	U64 pitch = calculateBytesPerLine(visual?visual->bits_per_rgb:32, width);
 	if (data) {
 		delete[] data;
 		data = nullptr;
 	}
-	if (size) {
-		data = new U8[size];
-		memset(data, 0, size);
+	size = 0;
+	bytes_per_line = (U32)pitch;
+	if (isPBuffer || !pitch || !height) {
+		return;
 	}
+	if (pitch > MAX_DRAWABLE_BYTES / height || !(data = new (std::nothrow) U8[pitch * height])) {
+		bytes_per_line = 0;
+		return;
+	}
+	size = (U32)(pitch * height);
+	memset(data, 0, size);
 }
 
 int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage* image, S32 src_x, S32 src_y, S32 dest_x, S32 dest_y, U32 width, U32 height) {
@@ -127,7 +138,7 @@ int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage*
 
 // n bytes equal? 64 at a time with wasm SIMD (emscripten's memcmp is a byte loop, and a U64 loop
 // made the compare of an 800x600 frame cost more than the copy it saves)
-static bool sameBytes(const U8* a, const U8* b, U32 n) {
+bool sameBytes(const U8* a, const U8* b, U32 n) {
 	U32 i = 0;
 #ifdef __wasm_simd128__
 	for (; i + 64 <= n; i += 64) {
@@ -161,7 +172,19 @@ static bool sameAsGuest(KMemory* memory, U32 src, const U8* dst, U32 len) {
 	return same;
 }
 
+// Clips a copy to [0, limitW) x [0, limitH) at (x, y), moving the other side's corner with it. false = nothing left.
+static bool clipCopy(S64& x, S64& y, S64& otherX, S64& otherY, S64& width, S64& height, U32 limitW, U32 limitH) {
+	if (x < 0) { otherX -= x; width += x; x = 0; }
+	if (y < 0) { otherY -= y; height += y; y = 0; }
+	width = std::min<S64>(width, (S64)limitW - x);
+	height = std::min<S64>(height, (S64)limitH - y);
+	return width > 0 && height > 0;
+}
+
 int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U32 data, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height) {
+	if (!this->data) { // no pixels: a PBuffer, or too large to have any (setSize)
+		return Success;
+	}
 	if (bits_per_pixel != this->visual->bits_per_rgb) {
 		return BadMatch;
 	}
@@ -169,21 +192,15 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 		//klog("XDrawable::copyImageData clipping not implemented");
 	}
 	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex);
-	U32 src = data + bytes_per_line * src_y + (bits_per_pixel * src_x + 7) / 8;
-	U8* dst = this->data + this->bytes_per_line * dst_y + (bits_per_pixel * dst_x + 7) / 8;
+	S64 srcX = src_x, srcY = src_y, dstX = dst_x, dstY = dst_y, copyW = width, copyH = height;
+	if (!this->data || !clipCopy(dstX, dstY, srcX, srcY, copyW, copyH, w, h)) {
+		return Success;
+	}
+	width = (U32)copyW;
+	height = (U32)copyH;
+	U32 src = data + bytes_per_line * (U32)srcY + (U32)((bits_per_pixel * srcX + 7) / 8);
+	U8* dst = this->data + this->bytes_per_line * dstY + (bits_per_pixel * dstX + 7) / 8;
 	KMemory* memory = thread->memory;
-	if (dst_x + width > w) {
-		if ((S32)w < dst_x) {
-			return Success;
-		}
-		width = w - dst_x;
-	}
-	if (dst_y + (S32)height > (S32)h) {
-		if ((S32)h < dst_y) {
-			return Success;
-		}
-		height = h - dst_y;
-	}
 	U32 copyPerLine = (bits_per_pixel * width + 7) / 8;
 
 	if (!gc || gc->values.function == GXcopy) {
@@ -225,49 +242,58 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 static U32 readPixel(const U8* row, U32 x, U32 bits);
 
 int XDrawable::copy(KThread* thread,const std::shared_ptr<XGC>& gc, const std::shared_ptr<XDrawable>& srcDrawable, S32 srcX, S32 srcY, U32 width, U32 height, S32 dstX, S32 dstY) {
+	if (!data || !srcDrawable->data) { // no pixels: a PBuffer, or too large to have any (setSize)
+		return Success;
+	}
 	if (srcDrawable->visual->bits_per_rgb != this->visual->bits_per_rgb) {
 		return BadMatch;
 	}
 	if (gc && (gc->clip_rects.size() || gc->values.clip_mask || gc->values.clip_x_origin || gc->values.clip_y_origin)) {
 		//klog("XDrawable::copyImageData clipping not implemented");
 	}
-	U8* src = srcDrawable->data + srcDrawable->bytes_per_line * srcY + (srcDrawable->visual->bits_per_rgb * srcX + 7) / 8;
-	U8* dst = this->data + this->bytes_per_line * dstY + (this->visual->bits_per_rgb * dstX + 7) / 8;
-
-	if (dstX + width > w) {
-		if ((S32)w < dstX) {
+	// Lower id first so two copies between the same pair can't deadlock. The mutex is recursive: a copy within one drawable is fine.
+	XDrawable* first = id < srcDrawable->id ? this : srcDrawable.get();
+	XDrawable* second = first == this ? srcDrawable.get() : this;
+	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(first->mutex);
+	{
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(second->mutex);
+		// The rectangle must lie in both drawables; a PBuffer or an empty drawable has no pixels.
+		S64 sx = srcX, sy = srcY, dx = dstX, dy = dstY, copyW = width, copyH = height;
+		if (!data || !srcDrawable->data || !clipCopy(dx, dy, sx, sy, copyW, copyH, w, h) || !clipCopy(sx, sy, dx, dy, copyW, copyH, srcDrawable->w, srcDrawable->h)) {
 			return Success;
 		}
-		width = w - dstX;
-	}
-	if (dstY + (S32)height > (S32)h) {
-		if ((S32)h < dstY) {
-			return Success;
-		}
-		height = h - dstY;
-	}
-	U32 copyPerLine = (this->visual->bits_per_rgb * width + 7) / 8;
+		width = (U32)copyW;
+		height = (U32)copyH;
+		U32 bits = this->visual->bits_per_rgb;
 
-	if (this->visual->bits_per_rgb == 1) {
-		// Bitmaps (cursor masks: winex11 builds them with GXandReverse/GXorReverse/GXand/GXor copies at 1-pixel
-		// offsets): byte copies would ignore the GC function and shift by whole bytes. Pixel by pixel through the
-		// GC, from a copy of the source rows so a copy within one bitmap reads the original bits.
-		if (srcX < 0 || srcY < 0 || (U32)srcX >= srcDrawable->w || (U32)srcY >= srcDrawable->h) return Success;
-		width = std::min(width, srcDrawable->w - srcX);
-		height = std::min(height, srcDrawable->h - srcY);
-		std::vector<U8> rows(srcDrawable->data + srcDrawable->bytes_per_line * srcY, srcDrawable->data + srcDrawable->bytes_per_line * (srcY + height));
-		for (U32 y = 0; y < height; y++) {
-			for (U32 x = 0; x < width; x++) {
-				drawPixel(*gc, dstX + x, dstY + y, readPixel(rows.data() + y * srcDrawable->bytes_per_line, srcX + x, 1));
+		if (bits == 1) {
+			// Bitmaps (cursor masks: winex11 builds them with GXandReverse/GXorReverse/GXand/GXor copies at 1-pixel
+			// offsets): byte copies would ignore the GC function and shift by whole bytes. Pixel by pixel through the
+			// GC, from a copy of the source rows so a copy within one bitmap reads the original bits.
+			std::vector<U8> rows(srcDrawable->data + srcDrawable->bytes_per_line * sy, srcDrawable->data + srcDrawable->bytes_per_line * (sy + height));
+			for (U32 y = 0; y < height; y++) {
+				for (U32 x = 0; x < width; x++) {
+					drawPixel(*gc, (S32)dx + x, (S32)dy + y, readPixel(rows.data() + y * srcDrawable->bytes_per_line, (U32)sx + x, 1));
+				}
+			}
+		} else {
+			U8* src = srcDrawable->data + srcDrawable->bytes_per_line * sy + (bits * sx + 7) / 8;
+			U8* dst = data + bytes_per_line * dy + (bits * dx + 7) / 8;
+			S64 srcStep = srcDrawable->bytes_per_line, dstStep = bytes_per_line;
+			if (srcDrawable.get() == this && dy > sy) {
+				// Moving down within one drawable: from the bottom up, or a row overwrites one not yet read.
+				src += srcStep * (height - 1);
+				dst += dstStep * (height - 1);
+				srcStep = -srcStep;
+				dstStep = -dstStep;
+			}
+			U32 copyPerLine = (bits * width + 7) / 8;
+			for (U32 y = 0; y < height; y++) {
+				memmove(dst, src, copyPerLine);
+				src += srcStep;
+				dst += dstStep;
 			}
 		}
-		setDirty();
-		return Success;
-	}
-	for (U32 y = 0; y < height; y++) {
-		memcpy(dst, src, copyPerLine);
-		src += srcDrawable->bytes_per_line;
-		dst += this->bytes_per_line;
 	}
 	setDirty();
 	return Success;
@@ -290,7 +316,7 @@ static void writePixel(U8* row, U32 x, U32 bits, U32 value) {
 }
 
 void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src) {
-	if (x < 0 || y < 0 || (U32)x >= w || (U32)y >= h) return;
+	if (!data || x < 0 || y < 0 || (U32)x >= w || (U32)y >= h) return;
 	S64 cx = (S64)x - gc.values.clip_x_origin, cy = (S64)y - gc.values.clip_y_origin;
 	if (gc.hasClipRects) {
 		bool visible = false;
@@ -304,7 +330,7 @@ void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src) {
 	}
 	if (gc.values.clip_mask) {
 		auto mask = XServer::getServer()->getPixmap(gc.values.clip_mask);
-		if (!mask || cx < 0 || cy < 0 || cx >= mask->width() || cy >= mask->height() ||
+		if (!mask || !mask->getData() || cx < 0 || cy < 0 || cx >= mask->width() || cy >= mask->height() ||
 			!(mask->getData()[cy * mask->getBytesPerLine() + cx / 8] & (1 << (cx & 7)))) return;
 	}
 	U8* row = data + y * bytes_per_line;

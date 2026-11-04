@@ -49,6 +49,9 @@
 
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
 #include <emscripten/emscripten.h>
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#endif
 #include "vnboxstats.h"
 
 #ifdef __EMSCRIPTEN_PTHREADS__
@@ -57,7 +60,7 @@ EM_JS_DEPS(boxedwine_present_software_frame_deps, "$bwCallHandlerCmd");
 #endif
 
 // 0 when an earlier frame is still being shown (the caller keeps this one for the next present)
-EM_JS(int, boxedwinePresentSoftwareFrame, (const U32* pixels, int width, int height), {
+EM_JS(int, boxedwinePresentSoftwareFrame, (const U8* pixels, int width, int height), {
     var presentState = null;
     if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') {
         if (!Module.__boxedwineSoftwarePresentState) {
@@ -68,32 +71,25 @@ EM_JS(int, boxedwinePresentSoftwareFrame, (const U32* pixels, int width, int hei
             return 0;
         }
     }
-    var count = width * height;
-    var rgba;
+    var bytes = width * height * 4;
     if (typeof document !== 'undefined') {
-        // The frame is drawn before this returns, so one buffer serves every frame. A new
-        // frame sized buffer each time stalls the browser for a full garbage collection
-        // every second or so, long enough to break up audio.
-        rgba = Module.__boxedwineSoftwareFrame;
-        if (!rgba || rgba.length !== count * 4) {
-            rgba = Module.__boxedwineSoftwareFrame = new Uint8ClampedArray(count * 4);
+        // putImageData copies before this returns, so the page can read wasm memory directly. A shared
+        // heap can't back an ImageData: that build copies into one buffer that serves every frame (a new
+        // frame sized buffer each time stalls the browser for a full garbage collection every second or so,
+        // long enough to break up audio).
+        var frame;
+        if (typeof SharedArrayBuffer !== 'undefined' && HEAPU8.buffer instanceof SharedArrayBuffer) {
+            frame = Module.__boxedwineSoftwareFrame;
+            if (!frame || frame.length !== bytes) {
+                frame = Module.__boxedwineSoftwareFrame = new Uint8ClampedArray(bytes);
+            }
+            frame.set(HEAPU8.subarray(pixels, pixels + bytes));
+        } else {
+            frame = new Uint8ClampedArray(HEAPU8.buffer, pixels, bytes);
         }
+        Module.boxedwinePresentSoftwareFrame(width, height, frame, presentState);
     } else {
-        rgba = new Uint8ClampedArray(count * 4); // transferred to the main thread
-    }
-    var source = pixels >>> 2;
-    // Refresh the heap view once per frame, avoiding a memory-growth check per pixel.
-    var softwareHeap = HEAPU32;
-    for (var i = 0, j = 0; i < count; ++i, j += 4) {
-        var pixel = softwareHeap[source + i];
-        rgba[j] = (pixel >> 16) & 0xff;
-        rgba[j + 1] = (pixel >> 8) & 0xff;
-        rgba[j + 2] = pixel & 0xff;
-        rgba[j + 3] = 0xff;
-    }
-    if (typeof document !== 'undefined') {
-        Module.boxedwinePresentSoftwareFrame(width, height, rgba.buffer, presentState);
-    } else {
+        var rgba = HEAPU8.slice(pixels, pixels + bytes); // transferred to the main thread
         postMessage({
             cmd: bwCallHandlerCmd,
             handler: 'boxedwinePresentSoftwareFrame',
@@ -123,14 +119,23 @@ EM_JS(void, boxedwineSetWebGLPresentSize, (int width, int height), {
 #endif
 
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
-// memcmp is a byte loop in emscripten's libc: compare 8 bytes at a time (frames are 4-byte pixels)
-static bool sameFrame(const U8* a, const U8* b, U32 bytes) {
-    const U64* x = (const U64*)a;
-    const U64* y = (const U64*)b;
-    for (U32 i = 0, n = bytes / 8; i < n; ++i) {
-        if (x[i] != y[i]) return false;
+// 0x..RRGGBB pixels to the R,G,B,255 bytes a canvas takes
+static void pixelsToRgba(const U8* src, U8* dst, U32 count) {
+    U32 i = 0;
+#ifdef __wasm_simd128__
+    const v128_t opaque = wasm_u32x4_splat(0xff000000);
+    for (; i + 4 <= count; i += 4, src += 16, dst += 16) {
+        v128_t v = wasm_v128_load(src);
+        v = wasm_i8x16_shuffle(v, v, 2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+        wasm_v128_store(dst, wasm_v128_or(v, opaque));
     }
-    return memcmp(a + (bytes & ~7u), b + (bytes & ~7u), bytes & 7) == 0;
+#endif
+    for (; i < count; ++i, src += 4, dst += 4) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = 0xff;
+    }
 }
 
 static bool useEmscriptenSoftwareRenderer(bool skipRenderer) {
@@ -179,6 +184,7 @@ KNativeScreenSDL::~KNativeScreenSDL() {
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
     delete[] emscriptenSoftwareBuffer;
     delete[] emscriptenShownFrame;
+    delete[] emscriptenRgbaBuffer;
 #endif
 }
 
@@ -371,11 +377,7 @@ void KNativeScreenSDL::clear() {
             emscriptenSoftwareBuffer = new U8[size];
             emscriptenSoftwareBufferSize = size;
         }
-        U32* pixels = (U32*)emscriptenSoftwareBuffer;
-        U32 count = screenWidth() * screenHeight();
-        for (U32 i = 0; i < count; ++i) {
-            pixels[i] = (58 << 16) | (110 << 8) | 165;
-        }
+        emscriptenDesktopFillPending = true; // done by the first window drawn or by present: most often a full screen window makes it needless
         emscriptenSoftwareDirty = true;
     }
 #endif
@@ -564,6 +566,10 @@ void KNativeScreenSDL::putBitsOnWnd(U32 id, U8* bits, U32 bitsPerPixel, U32 srcP
         if (copyY + copyH > (S32)screenHeight()) {
             copyH = screenHeight() - copyY;
         }
+        if (copyW == (S32)screenWidth() && copyH == (S32)screenHeight()) {
+            emscriptenDesktopFillPending = false;
+        }
+        fillEmscriptenDesktop();
         if (copyW > 0 && copyH > 0) {
             U32 softwareSrcPitch = bitsPerPixel == 32 ? srcPitch : dstPitch;
             for (S32 y = 0; y < copyH; ++y) {
@@ -577,6 +583,20 @@ void KNativeScreenSDL::putBitsOnWnd(U32 id, U8* bits, U32 bitsPerPixel, U32 srcP
     }
 #endif
 }
+
+#if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
+void KNativeScreenSDL::fillEmscriptenDesktop() {
+    if (!emscriptenDesktopFillPending) {
+        return;
+    }
+    emscriptenDesktopFillPending = false;
+    U32* pixels = (U32*)emscriptenSoftwareBuffer;
+    U32 count = screenWidth() * screenHeight();
+    for (U32 i = 0; i < count; ++i) {
+        pixels[i] = (58 << 16) | (110 << 8) | 165;
+    }
+}
+#endif
 
 void KNativeScreenSDL::present() {
 #ifdef BOXEDWINE_LOCAL_SERVER
@@ -600,9 +620,14 @@ void KNativeScreenSDL::present() {
             showWindow(true);
             emscriptenShownValid = false; // the canvas may hold a GL frame or nothing yet
         }
+        if (XServer::canvasLost) {
+            XServer::canvasLost = false;
+            emscriptenShownValid = false;
+        }
+        fillEmscriptenDesktop(); // no window drew
         U32 frameBytes = screenWidth() * screenHeight() * 4;
         if (emscriptenSoftwareDirty && emscriptenShownValid && emscriptenShownWidth == screenWidth()
-                && emscriptenShownHeight == screenHeight() && sameFrame(emscriptenSoftwareBuffer, emscriptenShownFrame, frameBytes)) {
+                && emscriptenShownHeight == screenHeight() && sameBytes(emscriptenSoftwareBuffer, emscriptenShownFrame, frameBytes)) {
             // Every draw composites every window again (overlapping ones too): a frame equal to
             // the one on the canvas skips the RGBA conversion and putImageData.
             emscriptenSoftwareDirty = false;
@@ -610,7 +635,13 @@ void KNativeScreenSDL::present() {
         }
         if (emscriptenSoftwareDirty) {
             double presentStart = vnboxStats.on ? emscripten_get_now() : 0;
-            bool shown = boxedwinePresentSoftwareFrame((const U32*)emscriptenSoftwareBuffer, screenWidth(), screenHeight());
+            if (emscriptenRgbaBufferSize < frameBytes) {
+                delete[] emscriptenRgbaBuffer;
+                emscriptenRgbaBuffer = new U8[frameBytes];
+                emscriptenRgbaBufferSize = frameBytes;
+            }
+            pixelsToRgba(emscriptenSoftwareBuffer, emscriptenRgbaBuffer, frameBytes / 4);
+            bool shown = boxedwinePresentSoftwareFrame(emscriptenRgbaBuffer, screenWidth(), screenHeight());
             if (vnboxStats.on) vnboxStats.presentSwMs += emscripten_get_now() - presentStart;
             if (shown) {
                 emscriptenSoftwareDirty = false;
@@ -620,7 +651,9 @@ void KNativeScreenSDL::present() {
                     emscriptenShownFrame = new U8[frameBytes];
                     emscriptenShownFrameSize = frameBytes;
                 }
-                memcpy(emscriptenShownFrame, emscriptenSoftwareBuffer, frameBytes);
+                // Swapped, not copied: the next composite writes the whole buffer again
+                std::swap(emscriptenShownFrame, emscriptenSoftwareBuffer);
+                std::swap(emscriptenShownFrameSize, emscriptenSoftwareBufferSize);
                 emscriptenShownValid = true;
                 emscriptenShownWidth = screenWidth();
                 emscriptenShownHeight = screenHeight();
@@ -648,8 +681,18 @@ bool KNativeScreenSDL::presentedSinceLastCheck() {
 }
 
 void KNativeScreenSDL::clearTextureCache(U32 id) {
-    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(wndCacheMutex);
-    wndCache.clear();
+    {
+        // a window never drawn has no entry, so nothing needs the main thread
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(wndCacheMutex);
+        if (!wndCache.get(id)) {
+            return;
+        }
+    }
+    // on the main thread: the entry can hold an SDL texture
+    DISPATCH_MAIN_THREAD_BLOCK_THIS_BEGIN
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(wndCacheMutex);
+        wndCache.remove(id);
+    DISPATCH_MAIN_THREAD_BLOCK_END
 }
 
 bool KNativeScreenSDL::canBltToScreen() {
@@ -910,7 +953,7 @@ bool KNativeScreenSDL::saveBmp(const BString& filepath, U8* buffer, U32 bpp, U32
 }
 
 void KNativeScreenSDL::buildCursor(KThread* thread, const std::shared_ptr<XCursor>& cursor, U32 pixelsAddress, U32 width, U32 height, S32 xHot, S32 yHot, U32 frame, U32 delayMs) {
-    if (KSystem::videoOption == VIDEO_NO_WINDOW) {
+    if (KSystem::videoOption == VIDEO_NO_WINDOW || !width || !height || width > X_CURSOR_MAX_SIDE || height > X_CURSOR_MAX_SIDE) {
         return;
     }
     // X cursor images are premultiplied ARGB (Xcursor; winex11 draws them with DrawIconEx onto black), SDL
@@ -1051,6 +1094,35 @@ void KNativeScreenSDL::setCursor(const std::shared_ptr<XCursor>& cursor) {
 #ifdef __APPLE__
         macCursorUpdate();
 #endif
+    DISPATCH_MAIN_THREAD_BLOCK_END
+    // Only now, with the page on the new cursor, can the old one be freed (at the end of this function, outside the lock).
+    std::shared_ptr<XCursor> previous = cursor;
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);
+    shownCursor.swap(previous);
+}
+
+void KNativeScreenSDL::freeCursor(U32 id) {
+    SDL_Cursor* sdlCursor;
+    KNativeInputSDL::CursorFramesPtr frames;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);
+        sdlCursor = cursors.get(id);
+        frames = cursorFrames.get(id);
+        cursors.remove(id);
+        cursorFrames.remove(id);
+    }
+    if (!sdlCursor && !frames) {
+        return;
+    }
+    DISPATCH_MAIN_THREAD_BLOCK_BEGIN
+        if (frames) {
+            // frame 0 is sdlCursor too
+            for (const auto& frame : *frames) {
+                SDL_FreeCursor(frame.cursor);
+            }
+        } else {
+            SDL_FreeCursor(sdlCursor);
+        }
     DISPATCH_MAIN_THREAD_BLOCK_END
 }
 

@@ -257,6 +257,109 @@ void testXInputValuatorLayout() {
 	if (memory->readd(address + 48) != 0xcccccccc) testFail("XInput valuator write overran guest structure");
 }
 
+// Bug: a game's huge hidden popup asked for 1.6 GB and ended the emulator, and 32768x32768 wrapped the
+// size to 0, kept w and h, and writes then landed at the bottom of wasm memory.
+void testX11OversizedDrawable() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto thread = testContext().thread;
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 32;
+    const U32 sizes[][2] = {{20000, 20000}, {32768, 32768}, {0x40000000, 4}, {4, 0xffffffff}};
+    auto small = server->createNewPixmap(2, 2, 32, visual);
+    auto gc = server->createGC(small);
+    memset(small->getData(), 0x5a, small->getDataSize());
+    for (const auto& size : sizes) {
+        auto big = server->createNewPixmap(size[0], size[1], 32, visual);
+        if (big->getData() || big->getDataSize() || big->getBytesPerLine()) testFail("Oversized drawable has pixels");
+        if (big->width() != size[0] || big->height() != size[1]) testFail("Oversized drawable lost its size");
+        if (big->copyImageData(thread, gc, TEST_HEAP_ADDRESS, 4, 32, 0, 0, 0, 0, 1, 1) != Success ||
+            big->copy(thread, gc, small, 0, 0, 2, 2, 0, 0) != Success ||
+            small->copy(thread, gc, big, 0, 0, 2, 2, 0, 0) != Success ||
+            big->fillRectangle(thread, gc, 0, 0, 2, 2) != Success ||
+            big->drawLine(thread, gc, 0, 0, 2, 2) != Success)
+            testFail("Drawing on an oversized drawable failed");
+        for (U32 i = 0; i < small->getDataSize(); ++i) {
+            if (small->getData()[i] != 0x5a) testFail("Copy from an oversized drawable changed the target");
+        }
+        // Shrinking must give it pixels again, growing must drop them.
+        big->setSize(3, 3);
+        if (!big->getData() || big->getDataSize() != 36 || big->getBytesPerLine() != 12) testFail("Resized drawable has no pixels");
+        big->setSize(size[0], size[1]);
+        if (big->getData() || big->getBytesPerLine()) testFail("Oversized resize kept pixels");
+        server->removePixmap(big->id);
+    }
+    server->removeGC(gc->id);
+    server->removePixmap(small->id);
+}
+
+// Each of these stopped the emulator or read host memory out of bounds when a guest passed it.
+void testX11BadGuestValues() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto root = server->getRoot();
+    auto thread = testContext().thread;
+    auto memory = thread->memory;
+    CPU* cpu = testContext().cpu;
+    auto call = [&](U32 function, std::initializer_list<U32> args) {
+        U32 i = 1;
+        for (U32 arg : args) memory->writed(cpu->seg[SS].address + cpu->reg[4].u32 + i++ * 4, arg);
+        callX11(cpu, function);
+        return EAX;
+    };
+    // width * height * 4 wrapped to 0, so the guest got a tiny image that claims a huge size.
+    if (call(X11_CURSOR_IMAGE_CREATE, {0x8000, 0x8000}) || call(X11_CURSOR_IMAGE_CREATE, {0x10000, 0x10000}))
+        testFail("XcursorImageCreate accepted a size that overflows");
+    if (!call(X11_CURSOR_IMAGE_CREATE, {X_CURSOR_MAX_SIDE, 1})) testFail("XcursorImageCreate refused a legal size");
+    // colors[pixel] had no bound (FreeColors and StoreColor check theirs).
+    U32 colors = TEST_HEAP_ADDRESS;
+    memory->writed(colors, MAX_COLORMAP_SIZE);
+    if (call(X11_QUERY_COLORS, {0, root->colorMap->id, colors, 1}) != BadValue) testFail("XQueryColors accepted a pixel past the map");
+    memory->writed(colors, MAX_COLORMAP_SIZE - 1);
+    if (call(X11_QUERY_COLORS, {0, root->colorMap->id, colors, 1}) != Success) testFail("XQueryColors refused the last pixel");
+    // A null Visual or display reached createNewWindow, a null attributes pointer reached setAttributes.
+    U32 display = server->openDisplay(thread);
+    U32 badVisual = TEST_HEAP_ADDRESS + 256;
+    auto visual = std::make_shared<Visual>();
+    visual->visualid = 0xfffffff0;
+    visual->write(memory, badVisual);
+    if (call(X11_CREATE_WINDOW, {display, root->id, 0, 0, 2, 2, 0, 32, InputOutput, badVisual, 0, 0})) testFail("XCreateWindow accepted an unknown visual");
+    U32 notDisplay = TEST_HEAP_ADDRESS + 1024;
+    for (U32 i = 0; i < sizeof(Display); i += 4) memory->writed(notDisplay + i, 0xfffffff0);
+    if (call(X11_CREATE_WINDOW, {notDisplay, root->id, 0, 0, 2, 2, 0, 32, InputOutput, CopyFromParent, 0, 0})) testFail("XCreateWindow accepted a bad display");
+    if (call(X11_CHANGE_WINDOW_ATTRIBUTES, {display, root->id, CWEventMask, 0}) != BadValue) testFail("XChangeWindowAttributes accepted null attributes");
+    // None on the root left it no cursor, and every window's getCursor ends there.
+    if (call(X11_DEFINE_CURSOR, {display, root->id, None}) != Success || !root->cursor) testFail("XDefineCursor(root, None) dropped the root cursor");
+}
+
+// Bug: IntlRo, IntlYen, Convert, NonConvert, KanaMode, Lang1 and Lang2 had no row here, so the keys were lost.
+// The SDL numbers are the ones in the page's key table (knativeinputSDL.cpp).
+void testX11JisKeys() {
+    x11_init();
+    const struct { U32 sdl, keysym, keysymShift; } keys[] = {
+        {135, XK_backslash, XK_underscore}, {137, XK_backslash, XK_bar}, {136, XK_Hiragana_Katakana, XK_Hiragana_Katakana},
+        {138, XK_Henkan_Mode, XK_Henkan_Mode}, {139, XK_Muhenkan, XK_Muhenkan},
+        {144, XK_Hiragana_Katakana, XK_Hiragana_Katakana}, {145, XK_Eisu_toggle, XK_Eisu_toggle}
+    };
+    for (const auto& key : keys) {
+        U32 keycode = XKeyboard::sdl2x11(key.sdl);
+        if (!keycode) testFail("JIS key %u has no keycode", key.sdl);
+        if (XKeyboard::keycodeToKeysym(keycode, 0) != key.keysym || XKeyboard::keycodeToKeysym(keycode, 1) != key.keysymShift)
+            testFail("JIS key %u has the wrong keysyms", key.sdl);
+    }
+    // Shift+\ on a US keyboard must stay |: the JIS keys must not take over the keysym lookups.
+    const U32 usKeys[][2] = {{XK_backslash, 0x33}, {XK_bar, 0x33}, {XK_underscore, 0x14}};
+    for (const auto& key : usKeys) {
+        if (XKeyboard::keysymToKeycode(key[0]) != key[1]) testFail("A JIS key took over keysym %x", key[0]);
+    }
+}
+
 void testX11GetImageBounds() {
     testNewInstruction(0);
     auto visual = std::make_shared<Visual>();
@@ -556,6 +659,261 @@ void testX11PatternFills() {
         if (pixel(target, 1, 2)) testFail("Empty pattern clip should suppress painting");
         server->removeGC(gc->id); server->removePixmap(target->id);
     }
+}
+
+// Bug: XPutImage and XCopyArea clipped only the right and bottom edges, so a negative corner wrote into the
+// previous row (or before the host buffer), a huge height never ended, and a PBuffer (no pixels) was written at address 0.
+void testX11CopyBounds() {
+    testNewInstruction(0);
+    auto thread = testContext().thread;
+    auto memory = thread->memory;
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 32;
+    for (U32 i = 0; i < 16; ++i) memory->writed(TEST_HEAP_ADDRESS + i * 4, 100 + i); // 4 x 4 image, pitch 16
+    auto fresh = [&]() {
+        auto d = std::make_shared<XDrawable>(4, 3, 32, visual, false);
+        for (U32 i = 0; i < 12; ++i) ((U32*)d->getData())[i] = 1;
+        return d;
+    };
+    auto put = [&](const std::shared_ptr<XDrawable>& d, S32 sx, S32 sy, S32 dx, S32 dy, U32 w, U32 h, U32 pitch = 16) {
+        if (d->copyImageData(thread, nullptr, TEST_HEAP_ADDRESS, pitch, 32, sx, sy, dx, dy, w, h) != Success) testFail("X11 image copy failed");
+    };
+    auto expect = [&](const std::shared_ptr<XDrawable>& d, const U32 (&pixels)[12], const char* what) {
+        if (memcmp(d->getData(), pixels, sizeof(pixels))) testFail("X11 copy wrote the wrong pixels: %s", what);
+    };
+    auto image = fresh();
+    put(image, 0, 0, -1, 1, 2, 1);
+    { const U32 want[12] = {1,1,1,1, 101,1,1,1, 1,1,1,1}; expect(image, want, "image left edge wrapped into the row above"); }
+    image = fresh();
+    put(image, 0, 0, 1, -1, 2, 2);
+    { const U32 want[12] = {1,104,105,1, 1,1,1,1, 1,1,1,1}; expect(image, want, "image top edge"); }
+    image = fresh();
+    put(image, 0, 0, 3, 2, 4, 4);
+    { const U32 want[12] = {1,1,1,1, 1,1,1,1, 1,1,1,100}; expect(image, want, "image right and bottom edges"); }
+    image = fresh();
+    put(image, 0, 0, 4, 0, 1, 1); put(image, 0, 0, 0, 3, 1, 1); put(image, 0, 0, -1, 0, 1, 1); put(image, 0, 0, 0, -3, 4, 3);
+    { const U32 want[12] = {1,1,1,1, 1,1,1,1, 1,1,1,1}; expect(image, want, "image fully outside"); }
+    image = fresh();
+    put(image, 0, 0, 0, 0, 1, 0x80000000u, 0); // negative as S32, and the source never moves
+    { const U32 want[12] = {100,1,1,1, 100,1,1,1, 100,1,1,1}; expect(image, want, "image height 0x80000000"); }
+
+    auto source = std::make_shared<XDrawable>(4, 2, 32, visual, false);
+    for (U32 i = 0; i < 8; ++i) ((U32*)source->getData())[i] = 200 + i;
+    auto area = [&](const std::shared_ptr<XDrawable>& d, S32 sx, S32 sy, U32 w, U32 h, S32 dx, S32 dy) {
+        if (d->copy(thread, nullptr, source, sx, sy, w, h, dx, dy) != Success) testFail("X11 area copy failed");
+    };
+    auto dest = fresh();
+    area(dest, -1, 1, 2, 1, 0, 0);
+    { const U32 want[12] = {1,204,1,1, 1,1,1,1, 1,1,1,1}; expect(dest, want, "area source left edge"); }
+    dest = fresh();
+    area(dest, 3, 1, 4, 4, 0, 0);
+    { const U32 want[12] = {207,1,1,1, 1,1,1,1, 1,1,1,1}; expect(dest, want, "area source right and bottom edges"); }
+    dest = fresh();
+    area(dest, 0, 0, 2, 1, -1, 1);
+    { const U32 want[12] = {1,1,1,1, 201,1,1,1, 1,1,1,1}; expect(dest, want, "area destination left edge"); }
+    dest = fresh();
+    area(dest, 0, -1, 1, 2, 2, 2);
+    { const U32 want[12] = {1,1,1,1, 1,1,1,1, 1,1,1,1}; expect(dest, want, "area source and destination cut to nothing"); }
+    area(dest, 4, 0, 1, 1, 0, 0); area(dest, 0, 2, 1, 1, 0, 0);
+    { const U32 want[12] = {1,1,1,1, 1,1,1,1, 1,1,1,1}; expect(dest, want, "area source fully outside"); }
+
+    // No pixels at all, either side
+    auto pbuffer = std::make_shared<XPBuffer>(4, 3, 32, visual, 0, false, 0);
+    auto empty = std::make_shared<XDrawable>(0, 0, 32, visual, false);
+    put(pbuffer, 0, 0, 0, 0, 4, 3);
+    put(empty, 0, 0, 0, 0, 4, 3);
+    area(pbuffer, 0, 0, 4, 2, 0, 0);
+    area(empty, 0, 0, 4, 2, 0, 0);
+    dest = fresh();
+    if (dest->copy(thread, nullptr, pbuffer, 0, 0, 4, 3, 0, 0) != Success) testFail("X11 area copy from a PBuffer failed");
+    { const U32 want[12] = {1,1,1,1, 1,1,1,1, 1,1,1,1}; expect(dest, want, "area from a PBuffer"); }
+
+    // Bitmaps take the same clip: a negative source corner cuts the rectangle, it doesn't drop the copy.
+    auto bitVisual = std::make_shared<Visual>();
+    bitVisual->bits_per_rgb = 1;
+    auto bits = std::make_shared<XDrawable>(8, 1, 1, bitVisual, false);
+    auto bitSource = std::make_shared<XDrawable>(8, 1, 1, bitVisual, false);
+    bitSource->getData()[0] = 0x01;
+    auto gc = std::make_shared<XGC>(bits);
+    if (bits->copy(thread, gc, bitSource, -1, 0, 2, 1, 0, 0) != Success || bits->getData()[0] != 0x02) testFail("X11 1-bit copy with a negative source corner");
+}
+
+// Bug: rows were copied top to bottom, so a scroll down within one drawable smeared its first row.
+void testX11CopyWithinDrawable() {
+    testNewInstruction(0);
+    auto thread = testContext().thread;
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 32;
+    auto d = std::make_shared<XDrawable>(3, 4, 32, visual, false);
+    U32* p = (U32*)d->getData();
+    auto reset = [&]() { for (U32 i = 0; i < 12; ++i) p[i] = i; };
+    auto check = [&](const U32 (&want)[12], const char* what) {
+        if (memcmp(p, want, sizeof(want))) testFail("X11 self copy wrong: %s", what);
+    };
+    reset();
+    d->copy(thread, nullptr, d, 0, 0, 3, 3, 0, 1);
+    { const U32 want[12] = {0,1,2, 0,1,2, 3,4,5, 6,7,8}; check(want, "down one row"); }
+    reset();
+    d->copy(thread, nullptr, d, 0, 1, 3, 3, 0, 0);
+    { const U32 want[12] = {3,4,5, 6,7,8, 9,10,11, 9,10,11}; check(want, "up one row"); }
+    reset();
+    d->copy(thread, nullptr, d, 0, 1, 2, 2, 1, 1);
+    { const U32 want[12] = {0,1,2, 3,3,4, 6,6,7, 9,10,11}; check(want, "right within a row"); }
+    reset();
+    d->copy(thread, nullptr, d, 1, 0, 2, 3, 0, 1);
+    { const U32 want[12] = {0,1,2, 1,2,5, 4,5,8, 7,8,11}; check(want, "down and left"); }
+}
+
+// Bug: once Caps Lock really stays on, LockMask shifted every key, so Caps + 1 typed '!'.
+void testX11CapsLockKeys() {
+    x11_init();
+    auto check = [](U32 keysym, U32 state, const char* want) {
+        char buffer[16] = {};
+        U32 len = XKeyboard::translate(keysym, state, buffer, sizeof(buffer));
+        if (len != strlen(want) || memcmp(buffer, want, len)) testFail("X11 key %x state %x gave '%s', expected '%s'", keysym, state, buffer, want);
+    };
+    check(XK_a, 0, "a");
+    check(XK_a, LockMask, "A");
+    check(XK_A, ShiftMask, "A");
+    check(XK_A, ShiftMask | LockMask, "a");
+    check(XK_1, 0, "1");
+    check(XK_1, LockMask, "1");
+    check(XK_exclam, ShiftMask, "!");
+    check(XK_exclam, ShiftMask | LockMask, "!");
+    check(XK_KP_1, NumMask, "1");
+}
+
+// Bug: a bigger 8 or 16 bit window composited its old, smaller converted copy at the new pitch until the guest drew.
+void testX11ResizeMarksDirty() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 16;
+    auto window = server->createNewWindow(0, server->getRoot(), 2, 2, 16, 0, 0, InputOutput, 0, visual);
+    window->isDirty = false;
+    window->moveResize(5, 5, 2, 2);
+    if (window->isDirty) testFail("X11 move alone marked the pixels dirty");
+    window->moveResize(5, 5, 4, 4);
+    if (!window->isDirty) testFail("X11 moveResize to a new size did not mark the window dirty");
+    window->isDirty = false;
+    XWindowChanges changes = {};
+    changes.width = 6;
+    window->configure(CWWidth, &changes);
+    if (!window->isDirty) testFail("X11 configure to a new size did not mark the window dirty");
+    server->destroyWindow(window->id);
+}
+
+static std::vector<U32> destroyNotifies(const DisplayDataPtr& data) {
+    std::vector<U32> result;
+    U32 count = data->lockEvents();
+    for (U32 i = 0; i < count; ++i) {
+        XEvent* e = data->getEvent(i);
+        if (e->type == DestroyNotify) result.push_back(e->xdestroywindow.window);
+    }
+    data->unlockEvents();
+    return result;
+}
+
+// Bug: only the named window was destroyed: its children stayed in the server, held their parent, and so
+// leaked both pixel buffers, and no client heard of them.
+void testX11DestroyWindowTree() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto thread = testContext().thread;
+    auto server = XServer::getServer();
+    DisplayDataPtr data = server->getDisplayDataByAddressOfDisplay(thread->memory, server->openDisplay(thread));
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 32;
+    auto parent = server->createNewWindow(data->displayId, server->getRoot(), 4, 4, 32, 0, 0, InputOutput, 0, visual);
+    auto child = server->createNewWindow(data->displayId, parent, 2, 2, 32, 0, 0, InputOutput, 0, visual);
+    auto grandchild = server->createNewWindow(data->displayId, child, 1, 1, 32, 0, 0, InputOutput, 0, visual);
+    const U32 parentId = parent->id, childId = child->id, grandchildId = grandchild->id;
+    for (U32 id : {parentId, childId, grandchildId}) data->setEventMask(id, StructureNotifyMask);
+    std::weak_ptr<XWindow> parentAlive = parent, childAlive = child, grandchildAlive = grandchild;
+    parent = child = grandchild = nullptr;
+    server->destroyWindow(parentId);
+    if (server->getWindow(childId) || server->getWindow(grandchildId)) testFail("X11 subwindows outlived their parent");
+    if (!parentAlive.expired() || !childAlive.expired() || !grandchildAlive.expired()) testFail("X11 destroyed windows are still held");
+    if (destroyNotifies(data) != std::vector<U32>{grandchildId, childId, parentId}) testFail("X11 DestroyNotify must come for every window, inferiors first");
+    server->closeDisplay(thread, data);
+}
+
+// Bug: a client going away left its windows mapped: drawn in every composite, in the way of clicks, holding memory.
+void testX11ClientWindowsGoWithIt() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto thread = testContext().thread;
+    auto server = XServer::getServer();
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 32;
+    auto newWindow = [&](U32 display) { return server->createNewWindow(display, server->getRoot(), 2, 2, 32, 0, 0, InputOutput, 0, visual)->id; };
+    auto open = [&]() { return server->getDisplayDataByAddressOfDisplay(thread->memory, server->openDisplay(thread)); };
+    DisplayDataPtr closing = open();
+    DisplayDataPtr exiting = open();
+    const U32 other = newWindow(exiting->displayId + 1000); // another client's: must survive both
+    const U32 ofClosing = newWindow(closing->displayId);
+    const U32 ofExiting = newWindow(exiting->displayId);
+    server->closeDisplay(thread, closing);
+    if (server->getWindow(ofClosing)) testFail("X11 XCloseDisplay left the display's window");
+    if (!server->getWindow(ofExiting) || !server->getWindow(other)) testFail("X11 XCloseDisplay took another display's window");
+    server->processExit(thread->process->id);
+    if (server->getWindow(ofExiting)) testFail("X11 process exit left the process's window");
+    if (!server->getWindow(other)) testFail("X11 process exit took a window of another client");
+    server->destroyWindow(other);
+}
+
+// Bug: on tab blur the owner window and its display were used unchecked, and a destroyed owner stayed the owner.
+void testX11ClipboardOwnerGone() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto input = KNativeSystem::getCurrentInput();
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 32;
+    auto window = server->createNewWindow(0x7ffffff0, server->getRoot(), 2, 2, 32, 0, 0, InputOutput, 0, visual);
+    server->selectionOwner = window->id;
+    for (auto& blur : input->onFocusLost) blur(); // its display doesn't exist
+    if (server->selectionOwner) testFail("X11 clipboard owner with no display stayed the owner");
+    server->selectionOwner = window->id;
+    server->destroyWindow(window->id);
+    if (server->selectionOwner) testFail("X11 destroyed clipboard owner stayed the owner");
+    server->selectionOwner = 0x7ffffff1; // no such window
+    for (auto& blur : input->onFocusLost) blur();
+    if (server->selectionOwner) testFail("X11 unknown clipboard owner stayed the owner");
+}
+
+// Bug: XFreeCursor did nothing, so every cursor made stayed for the whole session. X lets a client free a
+// cursor a window still uses: the id goes at once, the cursor when the last user does.
+void testX11FreeCursor() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 32;
+    auto cursor = std::make_shared<XCursor>(68);
+    const U32 id = cursor->id;
+    server->addCursor(cursor);
+    auto window = server->createNewWindow(0, server->getRoot(), 2, 2, 32, 0, 0, InputOutput, 0, visual);
+    window->cursor = cursor;
+    std::weak_ptr<XCursor> alive = cursor;
+    cursor = nullptr;
+    server->removeCursor(id);
+    if (server->getCursor(id)) testFail("X11 freed cursor id still resolves");
+    if (window->getCursor() != alive.lock()) testFail("X11 cursor in use by a window was freed");
+    window->cursor = nullptr;
+    if (!alive.expired()) testFail("X11 freed cursor outlived its last user");
+    server->destroyWindow(window->id);
 }
 
 void testX11PaletteInvalidation() {

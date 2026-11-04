@@ -36,6 +36,7 @@ U32 XServer::drawFps = 60;
 U64 XServer::nextDrawUs;
 bool XServer::composited;
 bool XServer::hidden;
+bool XServer::canvasLost;
 
 // The fps= gate, in place of upstream's 16 ms one: fps=0 draws every dirty frame. Flushes (drawNow) are
 // capped too, or fps=30 would not mean 30 for GDI games: a frame they flush early stays dirty and is drawn
@@ -527,6 +528,11 @@ void XServer::initClipboard() {
 			if (owner && server->selectionOwner != server->selectionWindow->id) {
 				XEvent event;
 				DisplayDataPtr data = server->getDisplayDataById(owner->displayId);
+				if (!data) {
+					// the owner's process is gone: nobody to tell
+					server->selectionOwner = server->selectionWindow->id;
+					return;
+				}
 				event.type = SelectionClear;
 				event.xselectionclear.display = data->displayAddress;
 				event.xselectionclear.selection = CLIPBOARD;
@@ -543,8 +549,13 @@ void XServer::initClipboard() {
 	KNativeSystem::getCurrentInput()->onFocusLost.push_back([] {
 		if (server->selectionOwner && server->selectionOwner != server->selectionWindow->id) {
 			XWindowPtr owner = server->getWindow(server->selectionOwner);
+			DisplayDataPtr data = owner ? server->getDisplayDataById(owner->displayId) : nullptr;
+			if (!data) {
+				// the owner's window or process is gone: nobody to ask
+				server->selectionOwner = 0;
+				return;
+			}
 			XEvent event;
-			DisplayDataPtr data = server->getDisplayDataById(owner->displayId);
 			event.type = SelectionRequest;
 			event.xselectionrequest.display = data->displayAddress;
 			event.xselectionrequest.owner = server->selectionOwner;
@@ -702,6 +713,17 @@ int XServer::destroyWindow(U32 window) {
 	// DestroyWindow unmaps first, including focus reversion for descendants.
 	// Do not hold windowsMutex across native window updates during unmap.
 	w->unmapWindow();
+	// X destroys every subwindow too, each with its own DestroyNotify, inferiors first.
+	std::vector<U32> childIds;
+	{
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(w->childrenMutex);
+		for (auto& child : w->children) {
+			childIds.push_back(child.key);
+		}
+	}
+	for (U32 child : childIds) {
+		destroyWindow(child);
+	}
 	if (pointerWindow) {
 		XWindowPtr current = pointerWindow;
 		while (current) {
@@ -717,6 +739,12 @@ int XServer::destroyWindow(U32 window) {
 		ungrabPointer(0);
 	}
 	clearFakeFullScreenWindow(w);
+	if (selectionOwner == window) {
+		selectionOwner = 0;
+	}
+	if (KNativeScreenPtr screen = KNativeSystem::getScreen()) {
+		screen->clearTextureCache(window);
+	}
 	return Success;
 }
 
@@ -785,9 +813,17 @@ XCursorPtr XServer::getCursor(U32 id) {
 	return cursors.get(id);
 }
 
+void XServer::removeCursor(U32 id) {
+	XCursorPtr cursor; // a window or the page may still use it; if not, it is freed after the lock is released
+	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);
+	cursor = cursors.get(id);
+	cursors.remove(id);
+}
+
 void XServer::updateCursor(const XWindowPtr& wnd) {
-	if (pointerWindow == wnd) {
-		KNativeSystem::getScreen()->setCursor(wnd->getCursor());
+	// A child with no cursor of its own shows its parent's, so the change shows there too.
+	if (focusAncestor(wnd, pointerWindow)) {
+		KNativeSystem::getScreen()->setCursor(pointerWindow->getCursor());
 	}
 }
 
@@ -923,16 +959,19 @@ int XServer::closeDisplay(KThread* thread, const DisplayDataPtr& data) {
 		// updates. The UI thread must be able to read that state while it runs.
 		ungrabPointer(0);
 	}
-	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(displayMutex);
-	
-	KMemory* memory = thread->memory;
-	U32 vendor = X11_READD(Display, data->displayAddress, vendor);
-	thread->process->free(vendor);
+	{
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(displayMutex);
 
-	U32 screen = X11_READD(Display, data->displayAddress, screens);
-	thread->process->free(screen);
-	thread->process->free(data->displayAddress);
-	displays.remove(data->displayId);	
+		KMemory* memory = thread->memory;
+		U32 vendor = X11_READD(Display, data->displayAddress, vendor);
+		thread->process->free(vendor);
+
+		U32 screen = X11_READD(Display, data->displayAddress, screens);
+		thread->process->free(screen);
+		thread->process->free(data->displayAddress);
+		displays.remove(data->displayId);
+	}
+	destroyWindowsOfDisplays({ data });
 	return Success;
 }
 
@@ -998,16 +1037,40 @@ void XServer::changeScreen(U32 width, U32 height) {
 }
 
 void XServer::processExit(U32 pid) {
-	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(displayMutex);
 	std::vector<DisplayDataPtr> processDisplays;
-
-	for (auto& display : displays) {
-		if (display.value->processId == pid) {
-			processDisplays.push_back(display.value);
+	{
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(displayMutex);
+		for (auto& display : displays) {
+			if (display.value->processId == pid) {
+				processDisplays.push_back(display.value);
+			}
+		}
+		for (auto& display : processDisplays) {
+			displays.remove(display->displayId);
 		}
 	}
-	for (auto& display : processDisplays) {
-		displays.remove(display->displayId);
+	destroyWindowsOfDisplays(processDisplays);
+}
+
+// As an X server does when a client goes away: its windows go too.
+void XServer::destroyWindowsOfDisplays(const std::vector<DisplayDataPtr>& gone) {
+	if (!KNativeSystem::getScreen()) {
+		return; // shutting down: nothing is shown any more
+	}
+	std::vector<U32> ids;
+	{
+		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(windowsMutex);
+		for (auto& window : windows) {
+			for (auto& display : gone) {
+				if (window.value->displayId == display->displayId) {
+					ids.push_back(window.key);
+					break;
+				}
+			}
+		}
+	}
+	for (U32 id : ids) {
+		destroyWindow(id); // BadWindow if it already went with its parent
 	}
 }
 

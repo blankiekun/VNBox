@@ -46,14 +46,16 @@ struct XcursorImage {
 
 static_assert(sizeof(XcursorImage) == 32, "emulation expects sizeof(XcursorImage) to be 32");
 
+// Per side. Guest sizes multiply into byte counts, so anything larger is refused before that.
+#define X_CURSOR_MAX_SIDE 4096
+
 class XCursor {
 public:
-	XCursor(const XPixmapPtr& pixmap, const XPixmapPtr& mask, const XColor& fg, const XColor& bg, U32 x, U32 y);
+	XCursor(const XColor& fg, const XColor& bg, U32 x, U32 y);
 	XCursor(U32 shape);
+	~XCursor();
 
 	const U32 id;
-	XPixmapPtr pixmap;
-	XPixmapPtr mask;
 	XColor fg = { 0 };
 	XColor bg = { 0 };
 	U32 x = 0;

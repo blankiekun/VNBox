@@ -18,6 +18,8 @@
 #include "../../emulation/cpu/wasm/wasmModuleMerger.h"
 #include "../../emulation/cpu/normal/normalCPU.h"
 #include <climits>
+#include <string>
+#include <vector>
 #include <emscripten.h>
 void clearJitBlock(const std::vector<void*>& jitOps);
 #ifdef BOXEDWINE_MULTI_THREADED
@@ -200,6 +202,25 @@ void testWasmJitHotGroups() {
     }
     if (wasmJitTestRuntimeGroupCount() != 0) {
         testFail("the hot group must be released with its last block");
+    }
+    // Catches: code invalidation (what an unmap or a write does) freeing a slot and keeping its queue entry. The freed
+    // op can come back at another address with the same slot, and the flush would then compile it under the old eip.
+    DecodedOp* requeued = cpu->getOp(TEST_CODE_ADDRESS, 0);
+    startNewJIT(cpu, TEST_CODE_ADDRESS, requeued);
+    requeued->runCount = JIT_RUN_COUNT + 1;
+    wasmJitTestClearHotCounts();
+    for (U32 i = 0; i < hotEntries; ++i) {
+        cpu->eip.u32 = 0;
+        cpu->nextOp = requeued;
+        cpu->yield = false;
+        cpu->blockInstructionCount = 0;
+        cpu->run();
+    }
+    const U32 queued = wasmJitTestHotQueueSize();
+    cpu->nextOp = nullptr;
+    context.memory->removeCodeBlock(TEST_CODE_ADDRESS, requeued, false);
+    if (!queued || wasmJitTestHotQueueSize() != queued - 1) {
+        testFail("invalidated code must drop its hot queue entry (%u queued, %u after)", queued, wasmJitTestHotQueueSize());
     }
     wasmJitTestResetRuntimeBatching();
 }
@@ -484,7 +505,675 @@ void testWasmJitInlineCall() {
     context.process->sigActions[K_SIGSEGV] = savedAction;
     memcpy(cpu->seg, savedSegs, sizeof(savedSegs));
 
+    // Catches: inline dependencies piling up on a callee page nothing ever writes to, when the caller (a plugin DLL)
+    // is unloaded and loaded again, at the same address or another one. Callers on their own page: removing one
+    // never scans the callee's page.
+    constexpr U32 deadCallerA = K_PAGE_SIZE;
+    constexpr U32 deadCallerB = K_PAGE_SIZE + 0x40;
+    code(0x400, {0x83, 0xc2, 0x01, 0xc3}); // add edx,1; ret
+    call(deadCallerA, 0x400); code(deadCallerA + 5, {0xcd, 0x97});
+    call(deadCallerB, 0x400); code(deadCallerB + 5, {0xcd, 0x97});
+    auto compileDeadCaller = [&](U32 offset) {
+        cpu->getOp(TEST_CODE_ADDRESS + 0x400, 0);
+        return compile(offset);
+    };
+    before = wasmJitTestInlinedCalls();
+    compileDeadCaller(deadCallerA);
+    if (wasmJitTestInlinedCalls() - before != 1) testFail("a caller on another page must inline its callee");
+    const U32 depsOfOneCaller = wasmJitTestInlineDepCount();
+    for (U32 i = 0; i < 4; ++i) {
+        context.memory->removeCode(context.thread, TEST_CODE_ADDRESS + deadCallerA, 0x10, false);
+        compileDeadCaller(deadCallerA);
+        if (wasmJitTestInlineDepCount() != depsOfOneCaller) {
+            testFail("a caller loaded again at its address must not add inline deps (%u, expected %u)", wasmJitTestInlineDepCount(), depsOfOneCaller);
+        }
+    }
+    context.memory->removeCode(context.thread, TEST_CODE_ADDRESS + deadCallerA, 0x10, false);
+    DecodedOp* liveCaller = compileDeadCaller(deadCallerB);
+    if (wasmJitTestInlineDepCount() != depsOfOneCaller) {
+        testFail("a caller loaded at another address must drop the old inline deps (%u, expected %u)", wasmJitTestInlineDepCount(), depsOfOneCaller);
+    }
+    // A live caller's dep survives that pruning: a write to the callee still reaches it.
+    compileDeadCaller(deadCallerA);
+    context.memory->writeb(TEST_CODE_ADDRESS + 0x402, 2);
+    if (context.memory->getDecodedOp(TEST_CODE_ADDRESS + deadCallerB) == liveCaller && liveCaller->pfnJitCode) {
+        testFail("a write to an inlined callee must still invalidate a caller whose page's deps were pruned");
+    }
+
     cpu->nextOp = nullptr;
+}
+
+// Guest code laid out at fixed offsets from TEST_CODE_ADDRESS, compiled and run a block at a time.
+namespace {
+struct JitShape {
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    U32 stackTop = 0;
+    JitShape() {
+        testNewInstruction(0);
+        cpu = context.cpu;
+        cpu->big = 1;
+        stackTop = cpu->reg[4].u32;
+    }
+    void code(U32 offset, std::initializer_list<U8> bytes) {
+        context.codeIp = TEST_CODE_ADDRESS + offset;
+        for (U8 b : bytes) testPushCode8(b);
+    }
+    void rel32(U32 offset, std::initializer_list<U8> opcode, U32 target) { // call, jmp and long jcc forms
+        code(offset, opcode);
+        U32 rel = target - (offset + (U32)opcode.size() + 4);
+        testPushCode32(rel);
+    }
+    DecodedOp* compile(U32 offset) {
+        DecodedOp* op = cpu->getOp(TEST_CODE_ADDRESS + offset, 0);
+        startNewJIT(cpu, TEST_CODE_ADDRESS + offset, op);
+        if (!op->pfnJitCode || op->pfn != context.process->startJITOp) {
+            testFail("test block at %x did not compile", offset);
+        }
+        op->runCount = JIT_RUN_COUNT + 1;
+        return op;
+    }
+    // Compile, and catch a register the block loads from the CPU struct a second time: only a boundary that forgot it
+    // makes it do that.
+    DecodedOp* compileNoReload(U32 offset, const char* what) {
+        wasmJitTestResetRegLoads();
+        DecodedOp* op = compile(offset);
+        if (wasmJitTestMaxRegLoads() > 1) {
+            testFail("%s: the path that stays reloads a register (%u loads)", what, wasmJitTestMaxRegLoads());
+        }
+        return op;
+    }
+    void run(DecodedOp* op, U32 offset) {
+        cpu->eip.u32 = offset;
+        cpu->nextOp = op;
+        cpu->yield = false;
+        for (U32 i = 0; i < 64 && (!cpu->nextOp || cpu->nextOp->inst != TestEnd); ++i) {
+            cpu->blockInstructionCount = 0;
+            cpu->run();
+        }
+        if (!cpu->nextOp || cpu->nextOp->inst != TestEnd) testFail("test block at %x did not reach its end", offset);
+    }
+    void regs(U32 eax, U32 ecx, U32 edx, U32 ebx, U32 ebp, U32 esi, U32 edi) {
+        cpu->reg[0].u32 = eax; cpu->reg[1].u32 = ecx; cpu->reg[2].u32 = edx; cpu->reg[3].u32 = ebx;
+        cpu->reg[4].u32 = stackTop; cpu->reg[5].u32 = ebp; cpu->reg[6].u32 = esi; cpu->reg[7].u32 = edi;
+    }
+    void xmmFloats(U32 index, float value) {
+        float lanes[4] = {value, value, value, value};
+        memcpy(&cpu->xmm[index], lanes, sizeof(lanes));
+    }
+    float xmmLane(U32 index, U32 lane) {
+        float lanes[4];
+        memcpy(lanes, &cpu->xmm[index], sizeof(lanes));
+        return lanes[lane];
+    }
+};
+}
+
+// Catches: the cold arm of a jcc side exit, a CMOV select or the SSE divide guard changing what the path that stays
+// sees: a dirty register lost or read stale, an arm's state leaking into the fall-through, the divide run twice.
+void testWasmJitColdArmsKeepRegisters() {
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    contextTimeRemaining = 0x7fffffff;
+    JitShape t;
+    CPU* cpu = t.cpu;
+    enum { rEax, rEcx, rEdx, rEbx, rEsp, rEbp, rEsi, rEdi };
+
+    // jz side exit with dirty registers. Taken: the target block reads eax from the CPU struct.
+    t.code(0x000, {0x89, 0xd8, 0x89, 0xf1, 0x85, 0xff}); // mov eax,ebx; mov ecx,esi; test edi,edi
+    t.rel32(0x006, {0x0f, 0x84}, 0x200); // jz 0x200
+    t.code(0x00c, {0x01, 0xc8, 0x01, 0xf0, 0x89, 0xc2, 0xcd, 0x97}); // add eax,ecx; add eax,esi; mov edx,eax; int 97
+    t.code(0x200, {0x89, 0xc5, 0x89, 0xcf, 0xcd, 0x97}); // mov ebp,eax; mov edi,ecx; int 97
+    DecodedOp* op = t.compileNoReload(0x000, "jz side exit");
+    t.regs(0, 0, 0, 10, 0, 3, 0);
+    t.run(op, 0);
+    if (cpu->reg[rEbp].u32 != 10 || cpu->reg[rEdi].u32 != 3 || cpu->reg[rEdx].u32 != 0) {
+        testFail("side exit taken: ebp=%u edi=%u edx=%u", cpu->reg[rEbp].u32, cpu->reg[rEdi].u32, cpu->reg[rEdx].u32);
+    }
+    t.regs(0, 0, 0, 10, 0, 3, 1);
+    t.run(op, 0);
+    if (cpu->reg[rEdx].u32 != 16 || cpu->reg[rEbp].u32 != 0) {
+        testFail("side exit not taken: edx=%u ebp=%u", cpu->reg[rEdx].u32, cpu->reg[rEbp].u32);
+    }
+
+    // The same with flags from an earlier block: the condition goes through the lazy flag helper.
+    t.code(0x300, {0x85, 0xff}); // test edi,edi
+    t.rel32(0x302, {0xe9}, 0x310); // jmp 0x310
+    t.code(0x310, {0x89, 0xd8}); // mov eax,ebx
+    t.rel32(0x312, {0x0f, 0x84}, 0x200); // jz 0x200
+    t.code(0x318, {0x01, 0xd8, 0x89, 0xc2, 0xcd, 0x97}); // add eax,ebx; mov edx,eax; int 97
+    t.compileNoReload(0x310, "side exit on earlier flags");
+    op = t.compile(0x300);
+    t.regs(0, 0, 0, 10, 0, 0, 0);
+    t.run(op, 0x300);
+    if (cpu->reg[rEbp].u32 != 10) testFail("side exit on earlier flags, taken: ebp=%u", cpu->reg[rEbp].u32);
+    t.regs(0, 0, 0, 10, 0, 0, 1);
+    t.run(op, 0x300);
+    if (cpu->reg[rEdx].u32 != 20) testFail("side exit on earlier flags, not taken: edx=%u", cpu->reg[rEdx].u32);
+
+    // x87 values held in locals across the side exit: the arm writes them back, the path that stays keeps them.
+    const U32 m1 = TEST_HEAP_ADDRESS + 0x100, m2 = TEST_HEAP_ADDRESS + 0x104;
+    const U32 d1 = m1 - cpu->seg[DS].address, d2 = m2 - cpu->seg[DS].address;
+    t.code(0x400, {0xd9, 0xe8, 0x85, 0xff}); // fld1; test edi,edi
+    t.rel32(0x404, {0x0f, 0x84}, 0x480); // jz 0x480
+    t.code(0x40a, {0xd9, 0xe8, 0xde, 0xc1, 0xdb, 0x1d, (U8)d1, (U8)(d1 >> 8), (U8)(d1 >> 16), (U8)(d1 >> 24), 0xcd, 0x97}); // fld1; faddp; fistp [m1]; int 97
+    t.code(0x480, {0xdb, 0x1d, (U8)d2, (U8)(d2 >> 8), (U8)(d2 >> 16), (U8)(d2 >> 24), 0xcd, 0x97}); // fistp [m2]; int 97
+    op = t.compile(0x400);
+    t.context.memory->writed(m1, 0); t.context.memory->writed(m2, 0);
+    t.regs(0, 0, 0, 0, 0, 0, 0);
+    t.run(op, 0x400);
+    if (t.context.memory->readd(m2) != 1 || t.context.memory->readd(m1) != 0) testFail("x87 side exit taken: [m2]=%u", t.context.memory->readd(m2));
+    t.regs(0, 0, 0, 0, 0, 0, 1);
+    t.run(op, 0x400);
+    if (t.context.memory->readd(m1) != 2) testFail("x87 side exit not taken: [m1]=%u", t.context.memory->readd(m1));
+
+    // cmovz eax,esi fused with its cmp. Both outcomes, and registers stay mapped after it.
+    t.code(0x500, {0x89, 0xd8, 0x39, 0xd1, 0x0f, 0x44, 0xc6, 0x01, 0xf0, 0x01, 0xd1, 0x89, 0xcf, 0xcd, 0x97}); // mov eax,ebx; cmp ecx,edx; cmovz eax,esi; add eax,esi; add ecx,edx; mov edi,ecx; int 97
+    op = t.compileNoReload(0x500, "cmov");
+    t.regs(0, 7, 7, 1, 0, 100, 0);
+    t.run(op, 0x500);
+    if (cpu->reg[rEax].u32 != 200 || cpu->reg[rEdi].u32 != 14) testFail("cmov taken: eax=%u edi=%u", cpu->reg[rEax].u32, cpu->reg[rEdi].u32);
+    t.regs(0, 7, 8, 1, 0, 100, 0);
+    t.run(op, 0x500);
+    if (cpu->reg[rEax].u32 != 101 || cpu->reg[rEdi].u32 != 15) testFail("cmov not taken: eax=%u edi=%u", cpu->reg[rEax].u32, cpu->reg[rEdi].u32);
+
+    // cmovz ax,si keeps eax's upper half on both outcomes.
+    t.code(0x540, {0x39, 0xd1, 0x66, 0x0f, 0x44, 0xc6, 0xcd, 0x97}); // cmp ecx,edx; cmovz ax,si; int 97
+    op = t.compile(0x540);
+    t.regs(0x11112222, 7, 7, 0, 0, 0x33334444, 0);
+    t.run(op, 0x540);
+    if (cpu->reg[rEax].u32 != 0x11114444) testFail("cmov16 taken: eax=%x", cpu->reg[rEax].u32);
+    t.regs(0x11112222, 7, 8, 0, 0, 0x33334444, 0);
+    t.run(op, 0x540);
+    if (cpu->reg[rEax].u32 != 0x11112222) testFail("cmov16 not taken: eax=%x", cpu->reg[rEax].u32);
+
+    // cmov alone in a block: not fused, flags from the block before, dst dirty first.
+    t.code(0x580, {0x85, 0xff}); // test edi,edi
+    t.rel32(0x582, {0xe9}, 0x590); // jmp 0x590
+    t.code(0x590, {0x89, 0xd8, 0x0f, 0x44, 0xc6, 0x89, 0xc2, 0xcd, 0x97}); // mov eax,ebx; cmovz eax,esi; mov edx,eax; int 97
+    t.compile(0x590);
+    op = t.compile(0x580);
+    t.regs(0, 0, 0, 5, 0, 9, 0);
+    t.run(op, 0x580);
+    if (cpu->reg[rEdx].u32 != 9) testFail("cmov on earlier flags, taken: edx=%u", cpu->reg[rEdx].u32);
+    t.regs(0, 0, 0, 5, 0, 9, 1);
+    t.run(op, 0x580);
+    if (cpu->reg[rEdx].u32 != 5) testFail("cmov on earlier flags, not taken: edx=%u", cpu->reg[rEdx].u32);
+
+    // SSE divide guard, packed and in a scalar region. Unmasked, the op runs in the arm and the block leaves: once only.
+    t.code(0x600, {0x0f, 0x58, 0xc1, 0x0f, 0x5e, 0xc1, 0x0f, 0x58, 0xc1, 0x0f, 0x28, 0xd0, 0xcd, 0x97}); // addps xmm0,xmm1; divps xmm0,xmm1; addps xmm0,xmm1; movaps xmm2,xmm0; int 97
+    t.code(0x640, {0xf3, 0x0f, 0x58, 0xc1, 0xf3, 0x0f, 0x5e, 0xc1, 0xf3, 0x0f, 0x58, 0xc1, 0xcd, 0x97}); // addss xmm0,xmm1; divss xmm0,xmm1; addss xmm0,xmm1; int 97
+    DecodedOp* packed = t.compileNoReload(0x600, "divps guard");
+    DecodedOp* scalar = t.compileNoReload(0x640, "divss guard");
+    for (U32 unmasked = 0; unmasked < 2; ++unmasked) {
+        const U32 saved = cpu->sseDivExceptionsUnmasked;
+        cpu->sseDivExceptionsUnmasked = unmasked;
+        t.xmmFloats(0, 1.0f); t.xmmFloats(1, 2.0f); t.xmmFloats(2, 0.0f);
+        t.run(packed, 0x600);
+        if (t.xmmLane(0, 3) != 3.5f || t.xmmLane(2, 0) != 3.5f) testFail("divps unmasked=%u: xmm0=%f xmm2=%f", unmasked, t.xmmLane(0, 3), t.xmmLane(2, 0));
+        t.xmmFloats(0, 1.0f); t.xmmFloats(1, 2.0f);
+        t.run(scalar, 0x640);
+        if (t.xmmLane(0, 0) != 3.5f || t.xmmLane(0, 1) != 1.0f) testFail("divss unmasked=%u: xmm0=%f,%f", unmasked, t.xmmLane(0, 0), t.xmmLane(0, 1));
+        cpu->sseDivExceptionsUnmasked = saved;
+    }
+    contextTimeRemaining = savedBudget;
+    cpu->nextOp = nullptr;
+}
+
+// Catches: a dropped lazy type store leaving the type of an older op in the CPU struct, and a result forwarded across
+// several ops reading the wrong value (a register overwritten since, a high-byte result).
+void testWasmJitLazyFlagStores() {
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    contextTimeRemaining = 0x7fffffff;
+    JitShape t;
+    CPU* cpu = t.cpu;
+    enum { rEax, rEcx, rEdx, rEbx, rEsp, rEbp, rEsi, rEdi };
+    auto zf = [&]() { cpu->fillFlags(); return (cpu->flags & ZF) != 0; };
+
+    // Two adds with live flags: the second has the type already.
+    t.code(0x00, {0x01, 0xd8, 0x0f, 0x94, 0xc2, 0x01, 0xd9, 0x0f, 0x94, 0xc6, 0xcd, 0x97}); // add eax,ebx; setz dl; add ecx,ebx; setz dh; int 97
+    U32 before = wasmJitTestLazyTypeStores();
+    DecodedOp* op = t.compile(0x00);
+    if (wasmJitTestLazyTypeStores() - before != 1) testFail("a repeated lazy type stores %u times", wasmJitTestLazyTypeStores() - before);
+    t.regs(1, 5, 0, (U32)-1, 0, 0, 0);
+    t.run(op, 0x00);
+    if ((cpu->reg[rEdx].u32 & 0xffff) != 0x0001 || zf()) testFail("add setz add setz (1): edx=%x", cpu->reg[rEdx].u32);
+    t.regs(1, (U32)-1, 0, 1, 0, 0, 0);
+    t.run(op, 0x00);
+    if ((cpu->reg[rEdx].u32 & 0xffff) != 0x0100 || !zf()) testFail("add setz add setz (2): edx=%x", cpu->reg[rEdx].u32);
+
+    // Different types: each store stays, and the last op's type is what the CPU struct has.
+    t.code(0x40, {0x01, 0xd8, 0x0f, 0x94, 0xc2, 0x29, 0xd9, 0x0f, 0x94, 0xc6, 0x01, 0xdf, 0xcd, 0x97}); // add eax,ebx; setz dl; sub ecx,ebx; setz dh; add edi,ebx; int 97
+    op = t.compile(0x40);
+    t.regs(1, 7, 0, 7, 0, 0, 1); // the sub is zero, the last add isn't: a stale SUB type over its dst/src would say zero differently
+    t.run(op, 0x40);
+    if ((cpu->reg[rEdx].u32 & 0xffff) != 0x0100 || cpu->reg[rEdi].u32 != 8 || zf() || cpu->lazyFlagType == FLAGS_SUB32) {
+        testFail("add sub add: edx=%x edi=%u type=%u", cpu->reg[rEdx].u32, cpu->reg[rEdi].u32, (U32)cpu->lazyFlagType);
+    }
+
+    // A result used across other ops: the producer's register is overwritten before the setcc and the cmov read it.
+    t.code(0x80, {0x01, 0xd8, 0x89, 0xc8, 0x89, 0xd5, 0x0f, 0x94, 0xc2, 0x0f, 0x44, 0xf7, 0xcd, 0x97}); // add eax,ebx; mov eax,ecx; mov ebp,edx; setz dl; cmovz esi,edi; int 97
+    op = t.compile(0x80);
+    t.regs(1, 50, 0, (U32)-1, 0, 2, 3);
+    t.run(op, 0x80);
+    if ((cpu->reg[rEdx].u32 & 0xff) != 1 || cpu->reg[rEsi].u32 != 3 || cpu->reg[rEax].u32 != 50) {
+        testFail("forwarded zero result: edx=%x esi=%u eax=%u", cpu->reg[rEdx].u32, cpu->reg[rEsi].u32, cpu->reg[rEax].u32);
+    }
+    t.regs(1, 50, 0, 1, 0, 2, 3);
+    t.run(op, 0x80);
+    if ((cpu->reg[rEdx].u32 & 0xff) != 0 || cpu->reg[rEsi].u32 != 2) {
+        testFail("forwarded non-zero result: edx=%x esi=%u", cpu->reg[rEdx].u32, cpu->reg[rEsi].u32);
+    }
+
+    // The same from a high-byte register, with other bits set above it.
+    t.code(0xc0, {0x00, 0xdc, 0x89, 0xd5, 0x0f, 0x94, 0xc2, 0xcd, 0x97}); // add ah,bl; mov ebp,edx; setz dl; int 97
+    op = t.compile(0xc0);
+    t.regs(0x12340100, 0, 0, 0xff, 0, 0, 0);
+    t.run(op, 0xc0);
+    if ((cpu->reg[rEdx].u32 & 0xff) != 1 || cpu->reg[rEax].u32 != 0x12340000) {
+        testFail("forwarded high-byte zero: edx=%x eax=%x", cpu->reg[rEdx].u32, cpu->reg[rEax].u32);
+    }
+    t.regs(0x12340100, 0, 0, 0x01, 0, 0, 0);
+    t.run(op, 0xc0);
+    if ((cpu->reg[rEdx].u32 & 0xff) != 0) testFail("forwarded high-byte non-zero: edx=%x", cpu->reg[rEdx].u32);
+    contextTimeRemaining = savedBudget;
+    cpu->nextOp = nullptr;
+}
+
+// Catches: a lazy type store dropped, or a result forwarded, where a later reader needs another value. Random runs of
+// register ops in one block against the same ops one block each: there nothing is dropped or forwarded and each setcc,
+// cmov and jcc reads the type and values in the CPU struct.
+void testWasmJitFlagsMatchOneBlockPerOp() {
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    contextTimeRemaining = 0x7fffffff;
+    struct Unit { std::vector<U8> b; S32 relAt = -1; }; // relAt: a jcc's rel32 to the stub
+    U32 seed = 0x9e3779b9;
+    auto rnd = [&]() { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; };
+    auto value = [&]() {
+        static const U32 edges[] = {0, 1, 2, 0x7f, 0x80, 0xff, 0x100, 0x7fff, 0x8000, 0xffff, 0x10000, 0x7fffffff, 0x80000000, 0xffffffff};
+        return (rnd() & 3) ? edges[rnd() % 14] : rnd();
+    };
+    auto r32 = [&]() { static const U8 gp[] = {0, 1, 2, 3, 5, 6}; return gp[rnd() % 6]; }; // edi marks the stub, esp stays
+    auto pushImm = [](std::vector<U8>& b, U32 imm, U32 bytes) { for (U32 i = 0; i < bytes; ++i) b.push_back((U8)(imm >> (8 * i))); };
+    auto cc = [&]() { static const U8 common[] = {4, 5, 8, 9, 10, 11}; return (U8)((rnd() & 3) ? common[rnd() % 6] : rnd() % 16); }; // z, s, p are the forwarded ones
+    auto makeOp = [&]() {
+        std::vector<U8> b;
+        const U32 kind = rnd() % 100, width = rnd() % 3; // width: 0 32 bits, 1 16 bits, 2 8 bits
+        const U8 d = width == 2 ? (U8)(rnd() % 8) : r32(), s = width == 2 ? (U8)(rnd() % 8) : r32();
+        const U8 rr = (U8)(0xc0 | (s << 3) | d);
+        const U32 immBytes = width == 0 ? 4 : width == 1 ? 2 : 1;
+        if (width == 1 && kind < 65) b.push_back(0x66);
+        if (kind < 30) { // add sub cmp test and or xor adc sbb, register form
+            static const U8 alu[] = {0x01, 0x29, 0x39, 0x85, 0x21, 0x09, 0x31, 0x11, 0x19};
+            b.push_back((U8)(alu[rnd() % (kind < 27 ? 7 : 9)] - (width == 2 ? 1 : 0)));
+            b.push_back(rr);
+        } else if (kind < 45) { // the same with an immediate
+            static const U8 ext[] = {0, 1, 4, 5, 6, 7};
+            b.push_back(width == 2 ? 0x80 : 0x81);
+            b.push_back((U8)(0xc0 | (ext[rnd() % 6] << 3) | d));
+            pushImm(b, value(), immBytes);
+        } else if (kind < 55) { // mov
+            b.push_back(width == 2 ? 0x88 : 0x89);
+            b.push_back(rr);
+        } else if (kind < 60) {
+            b.push_back((U8)((width == 2 ? 0xb0 : 0xb8) + d));
+            pushImm(b, value(), immBytes);
+        } else if (kind < 65) { // lea d,[base+index+disp8]
+            if (width == 2) b.push_back(0x66);
+            b.push_back(0x8d); b.push_back((U8)(0x44 | (r32() << 3))); b.push_back((U8)((r32() << 3) | r32())); b.push_back((U8)rnd());
+        } else if (kind < 78) { // setcc r8
+            b.push_back(0x0f); b.push_back((U8)(0x90 + cc())); b.push_back((U8)(0xc0 | (rnd() % 8)));
+        } else if (kind < 88) { // cmovcc r32
+            b.push_back(0x0f); b.push_back((U8)(0x40 + cc())); b.push_back((U8)(0xc0 | (r32() << 3) | r32()));
+        } else { // ops that drop the type or keep CF: inc dec neg shl shr sar
+            const U8 r = r32();
+            switch (rnd() % 6) {
+            case 0: b.push_back((U8)(0x40 + r)); break;
+            case 1: b.push_back((U8)(0x48 + r)); break;
+            case 2: b.push_back(0xf7); b.push_back((U8)(0xd8 + r)); break;
+            case 3: b.push_back(0xc1); b.push_back((U8)(0xe0 + r)); b.push_back((U8)(rnd() % 32)); break;
+            case 4: b.push_back(0xc1); b.push_back((U8)(0xe8 + r)); b.push_back((U8)(rnd() % 32)); break;
+            default: b.push_back(0xc1); b.push_back((U8)(0xf8 + r)); b.push_back((U8)(rnd() % 32)); break;
+            }
+        }
+        return b;
+    };
+    const U32 trials = 1500, flagMask = CF | PF | AF | ZF | SF | OF, stub = 0x800, perOp = 0x200, stride = 0x20;
+    for (U32 trial = 0; trial < trials; ++trial) {
+        JitShape t; // new memory and decoded ops
+        CPU* cpu = t.cpu;
+        std::vector<Unit> units(2 + rnd() % 14);
+        for (auto& u : units) {
+            const U32 what = rnd() % 100;
+            if (what < 6) { // a side exit
+                u.b = {0x0f, (U8)(0x80 + cc()), 0, 0, 0, 0};
+                u.relAt = 2;
+            } else {
+                u.b = makeOp();
+                if (what < 12) { // a jcc over the op: a label in the block
+                    u.b.insert(u.b.begin(), {(U8)(0x70 + cc()), (U8)u.b.size()});
+                }
+            }
+        }
+        auto place = [&](U32 offset, const Unit& u) {
+            t.context.codeIp = TEST_CODE_ADDRESS + offset;
+            for (size_t i = 0; i < u.b.size(); ++i) {
+                if (u.relAt >= 0 && (S32)i >= u.relAt && (S32)i < u.relAt + 4) {
+                    testPushCode8((stub - (offset + (U32)u.relAt + 4)) >> (8 * (i - u.relAt)));
+                } else {
+                    testPushCode8(u.b[i]);
+                }
+            }
+            return offset + (U32)u.b.size();
+        };
+        U32 end = 0;
+        for (const auto& u : units) end = place(end, u);
+        t.code(end, {0xcd, 0x97});
+        for (U32 i = 0; i < units.size(); ++i) t.code(place(perOp + i * stride, units[i]), {0xcd, 0x97});
+        t.code(stub, {0xbf, 1, 0, 0, 0, 0xcd, 0x97}); // mov edi,1; int 97
+
+        const U32 start[6] = {value(), value(), value(), value(), value(), value()}, startFlags = rnd() & flagMask;
+        auto reset = [&]() {
+            t.regs(start[0], start[1], start[2], start[3], start[4], start[5], 0);
+            cpu->lazyFlagType = FLAGS_NONE;
+            cpu->setFlags(startFlags, FMASK_ALL);
+        };
+        reset();
+        t.run(t.compile(0), 0);
+        U32 oneBlock[8];
+        for (U32 i = 0; i < 8; ++i) oneBlock[i] = cpu->reg[i].u32;
+        cpu->fillFlags();
+        const U32 oneBlockFlags = cpu->flags & flagMask;
+
+        reset();
+        for (U32 i = 0; i < units.size() && !cpu->reg[7].u32; ++i) {
+            const U32 offset = perOp + i * stride;
+            t.run(t.compile(offset), offset);
+        }
+        cpu->fillFlags();
+        bool same = (cpu->flags & flagMask) == oneBlockFlags;
+        for (U32 i = 0; i < 8; ++i) same = same && cpu->reg[i].u32 == oneBlock[i];
+        if (!same) {
+            std::string hex;
+            char text[8];
+            for (const auto& u : units) {
+                for (U8 x : u.b) { snprintf(text, sizeof(text), "%02x", x); hex += text; }
+                hex += " ";
+            }
+            testFail("trial %u: one block flags=%x eax=%x ecx=%x edx=%x ebx=%x ebp=%x esi=%x edi=%x, per op flags=%x eax=%x ecx=%x edx=%x ebx=%x ebp=%x esi=%x edi=%x; start %x %x %x %x %x %x flags %x; code %s",
+                trial, oneBlockFlags, oneBlock[0], oneBlock[1], oneBlock[2], oneBlock[3], oneBlock[5], oneBlock[6], oneBlock[7],
+                cpu->flags & flagMask, cpu->reg[0].u32, cpu->reg[1].u32, cpu->reg[2].u32, cpu->reg[3].u32, cpu->reg[5].u32, cpu->reg[6].u32, cpu->reg[7].u32,
+                start[0], start[1], start[2], start[3], start[4], start[5], startFlags, hex.c_str());
+            break;
+        }
+        cpu->nextOp = nullptr;
+    }
+    contextTimeRemaining = savedBudget;
+    testContext().cpu->nextOp = nullptr;
+}
+
+// Catches: the release-only stop before a block start (the exit in compileOps, the trim fix-up, a return site that is
+// also the stop in emitInlinedCall) skipping or repeating the code at the stop, or leaving registers unpublished.
+void testWasmJitStopBlockBefore() {
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    contextTimeRemaining = 0x7fffffff;
+    JitShape t;
+    CPU* cpu = t.cpu;
+    enum { rEax, rEcx, rEdx, rEbx, rEsp, rEbp, rEsi, rEdi };
+    struct StopBlocks {
+        StopBlocks() { wasmJitTestSetStopBlocks(true); }
+        ~StopBlocks() { wasmJitTestSetStopBlocks(false); }
+    } stopBlocks;
+
+    // An inlined call whose return site is already a block start. The block there reads eax from the CPU struct.
+    t.rel32(0x00, {0xe8}, 0x100); // call 0x100
+    t.code(0x05, {0x43, 0x89, 0xc2, 0xcd, 0x97}); // inc ebx; mov edx,eax; int 97
+    t.code(0x100, {0xb8, 0x07, 0x00, 0x00, 0x00, 0x41, 0xc3}); // mov eax,7; inc ecx; ret
+    cpu->getOp(TEST_CODE_ADDRESS + 0x100, 0); // inlining only copies code that was decoded
+    DecodedOp* returnSite = t.compile(0x05);
+    U64 inlinedBefore = wasmJitTestInlinedCalls();
+    DecodedOp* caller = t.compile(0x00);
+    if (wasmJitTestInlinedCalls() - inlinedBefore != 1) testFail("stop at a return site: the call must be inlined");
+    if (caller->blockOpCount != 1) testFail("stop at a return site: block has %u ops", (U32)caller->blockOpCount);
+    t.regs(0, 0, 0, 0, 0, 0, 0);
+    t.run(caller, 0x00);
+    if (cpu->reg[rEbx].u32 != 1 || cpu->reg[rEdx].u32 != 7 || cpu->reg[rEcx].u32 != 1 || cpu->reg[rEsp].u32 != t.stackTop) {
+        testFail("stop at a return site: ebx=%u edx=%u ecx=%u esp=%x", cpu->reg[rEbx].u32, cpu->reg[rEdx].u32, cpu->reg[rEcx].u32, cpu->reg[rEsp].u32);
+    }
+    if (!returnSite->pfnJitCode) testFail("stop at a return site: the block there must stay");
+
+    // A call that isn't inlined ends the block at its return site, compiled or not.
+    t.rel32(0x20, {0xe8}, 0x140); // call 0x140
+    t.code(0x25, {0x43, 0x89, 0xc2, 0xcd, 0x97}); // inc ebx; mov edx,eax; int 97
+    t.code(0x140, {0xb8, 0x09, 0x00, 0x00, 0x00, 0x41, 0xc3}); // mov eax,9; inc ecx; ret
+    setenv("BOXEDWINE_WASM_JIT_INLINE", "0", 1);
+    caller = t.compile(0x20);
+    unsetenv("BOXEDWINE_WASM_JIT_INLINE");
+    if (caller->blockOpCount != 1) testFail("stop after a call: block has %u ops", (U32)caller->blockOpCount);
+    t.regs(0, 0, 0, 0, 0, 0, 0);
+    t.run(caller, 0x20);
+    if (cpu->reg[rEbx].u32 != 1 || cpu->reg[rEdx].u32 != 9 || cpu->reg[rEcx].u32 != 1) {
+        testFail("stop after a call: ebx=%u edx=%u ecx=%u", cpu->reg[rEbx].u32, cpu->reg[rEdx].u32, cpu->reg[rEcx].u32);
+    }
+
+    // A plain block running into a block start, with a jcc that jumps past that start: the trim must end on the op
+    // before the stop, whichever path it took.
+    // 240 test eax,eax; 242 jz 24a; 244 mov edi,5; 249 inc ebx (a block start); 24a inc esi; 24b mov ebp,edi; 24d int 97
+    t.code(0x240, {0x85, 0xc0, 0x74, 0x06, 0xbf, 0x05, 0x00, 0x00, 0x00, 0x43, 0x46, 0x89, 0xfd, 0xcd, 0x97});
+    DecodedOp* start = t.compile(0x249);
+    caller = t.compile(0x240);
+    if (caller->blockOpCount != 3) testFail("stop before a block start: block has %u ops", (U32)caller->blockOpCount);
+    t.regs(1, 0, 0, 0, 0, 0, 0);
+    t.run(caller, 0x240);
+    if (cpu->reg[rEbx].u32 != 1 || cpu->reg[rEsi].u32 != 1 || cpu->reg[rEbp].u32 != 5) {
+        testFail("stop before a block start, jcc not taken: ebx=%u esi=%u ebp=%u", cpu->reg[rEbx].u32, cpu->reg[rEsi].u32, cpu->reg[rEbp].u32);
+    }
+    t.regs(0, 0, 0, 0, 0, 0, 0);
+    t.run(caller, 0x240);
+    if (cpu->reg[rEbx].u32 != 0 || cpu->reg[rEsi].u32 != 1 || cpu->reg[rEbp].u32 != 0) {
+        testFail("stop before a block start, jcc taken: ebx=%u esi=%u ebp=%u", cpu->reg[rEbx].u32, cpu->reg[rEsi].u32, cpu->reg[rEbp].u32);
+    }
+    if (!start->pfnJitCode) testFail("stop before a block start: the block there must stay");
+    contextTimeRemaining = savedBudget;
+    cpu->nextOp = nullptr;
+}
+
+// Catches: a change to fusing that breaks inlined code only when the callee sits below its caller (tryDirect stops at
+// the caller's last op, so a callee above it never fuses); ret imm16's stack adjust; a jcc side exit past the inlined ret.
+void testWasmJitInlineCalleeShapes() {
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    contextTimeRemaining = 0x7fffffff;
+    JitShape t;
+    CPU* cpu = t.cpu;
+    enum { rEax, rEcx, rEdx, rEbx, rEsp, rEbp, rEsi, rEdi };
+    auto decode = [&](std::initializer_list<U32> offsets) {
+        for (U32 offset : offsets) cpu->getOp(TEST_CODE_ADDRESS + offset, 0);
+    };
+
+    // Callee below the caller, so cmp+sete fuses (the skipToOp branch), with a label on the consumer: test eax,eax; jz L; cmp ecx,edx; L: sete al; add esp,0; ret 4
+    t.code(0x100, {0x85, 0xc0, 0x74, 0x02, 0x39, 0xd1, 0x0f, 0x94, 0xc0, 0x83, 0xc4, 0x00, 0xc2, 0x04, 0x00});
+    t.code(0x300, {0x6a, 0x11}); // push 0x11
+    t.rel32(0x302, {0xe8}, 0x100); // call 0x100
+    t.code(0x307, {0xcd, 0x97});
+    decode({0x100, 0x104, 0x106});
+    U64 before = wasmJitTestInlinedCalls();
+    DecodedOp* caller = t.compile(0x300);
+    if (wasmJitTestInlinedCalls() - before != 1) testFail("inline shapes: the label callee must be inlined");
+    struct Case { U32 eax, ecx, edx, expected; };
+    for (const Case& c : {Case{0, 5, 6, 1}, Case{0x1200, 5, 5, 0x1201}, Case{0x1200, 5, 6, 0x1200}}) {
+        t.regs(c.eax, c.ecx, c.edx, 0, 0, 0, 0);
+        t.run(caller, 0x300);
+        if (cpu->reg[rEax].u32 != c.expected || cpu->reg[rEsp].u32 != t.stackTop) {
+            testFail("inline shapes, label: eax %x -> %x, expected %x, esp=%x", c.eax, cpu->reg[rEax].u32, c.expected, cpu->reg[rEsp].u32);
+        }
+    }
+
+    // Callee below the caller, a cmp+jcc to a label of its own: inc ecx; cmp ecx,100; ja +3; add edx,2; ret
+    t.code(0x140, {0x41, 0x83, 0xf9, 0x64, 0x77, 0x03, 0x83, 0xc2, 0x02, 0xc3});
+    t.rel32(0x320, {0xe8}, 0x140); // call 0x140
+    t.code(0x325, {0x43, 0xcd, 0x97}); // inc ebx; int 97
+    decode({0x140, 0x146, 0x149});
+    before = wasmJitTestInlinedCalls();
+    caller = t.compile(0x320);
+    if (wasmJitTestInlinedCalls() - before != 1) testFail("inline shapes: the jcc callee must be inlined");
+    t.regs(0, 99, 0, 0, 0, 0, 0);
+    t.run(caller, 0x320);
+    if (cpu->reg[rEdx].u32 != 2 || cpu->reg[rEbx].u32 != 1 || cpu->reg[rEsp].u32 != t.stackTop) {
+        testFail("inline shapes, jcc not taken: edx=%u ebx=%u", cpu->reg[rEdx].u32, cpu->reg[rEbx].u32);
+    }
+    t.regs(0, 100, 0, 0, 0, 0, 0);
+    t.run(caller, 0x320);
+    if (cpu->reg[rEdx].u32 != 0 || cpu->reg[rEbx].u32 != 1 || cpu->reg[rEsp].u32 != t.stackTop) {
+        testFail("inline shapes, jcc taken: edx=%u ebx=%u", cpu->reg[rEdx].u32, cpu->reg[rEbx].u32);
+    }
+
+    // A jcc side exit past the inlined ret, with the return address still on the stack and a dirty caller register.
+    t.code(0x180, {0x41, 0x39, 0xd1}); // inc ecx; cmp ecx,edx
+    t.rel32(0x183, {0x0f, 0x87}, 0x1c0); // ja 0x1c0
+    t.code(0x189, {0xc3}); // ret
+    t.code(0x1c0, {0x46, 0x89, 0xdd, 0xcd, 0x97}); // inc esi; mov ebp,ebx; int 97
+    t.code(0x340, {0xbb, 0x05, 0x00, 0x00, 0x00}); // mov ebx,5
+    t.rel32(0x345, {0xe8}, 0x180); // call 0x180
+    t.code(0x34a, {0x47, 0xcd, 0x97}); // inc edi; int 97
+    decode({0x180, 0x189, 0x1c0});
+    before = wasmJitTestInlinedCalls();
+    caller = t.compile(0x340);
+    if (wasmJitTestInlinedCalls() - before != 1) testFail("inline shapes: the side exit callee must be inlined");
+    t.regs(0, 9, 0, 0, 0, 0, 0);
+    t.run(caller, 0x340);
+    if (cpu->reg[rEsi].u32 != 1 || cpu->reg[rEbp].u32 != 5 || cpu->reg[rEdi].u32 != 0 || cpu->reg[rEcx].u32 != 10 || cpu->reg[rEsp].u32 != t.stackTop - 4) {
+        testFail("inline shapes, side exit: esi=%u ebp=%u edi=%u ecx=%u esp=%x", cpu->reg[rEsi].u32, cpu->reg[rEbp].u32, cpu->reg[rEdi].u32, cpu->reg[rEcx].u32, cpu->reg[rEsp].u32);
+    }
+    t.regs(0, 0, 9, 0, 0, 0, 0);
+    t.run(caller, 0x340);
+    if (cpu->reg[rEsi].u32 != 0 || cpu->reg[rEdi].u32 != 1 || cpu->reg[rEsp].u32 != t.stackTop) {
+        testFail("inline shapes, past the jcc: esi=%u edi=%u esp=%x", cpu->reg[rEsi].u32, cpu->reg[rEdi].u32, cpu->reg[rEsp].u32);
+    }
+    contextTimeRemaining = savedBudget;
+    cpu->nextOp = nullptr;
+}
+
+// Catches: one rejected function (or a module over a browser's size limit, which is refused the same way) sending a
+// whole group to the interpreter for good, and a failed hot group losing the code its blocks already have.
+void testWasmJitFailedGroupSplits() {
+    testNewInstruction(0);
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    constexpr U32 blockCount = 8;
+    constexpr U32 blockBytes = 8;
+    constexpr U32 hotEntries = 4;
+    wasmJitTestResetRuntimeBatching();
+    struct Reset {
+        ~Reset() {
+            wasmJitTestFailBatchAfterSlots(-1);
+            wasmJitTestResetRuntimeBatching();
+        }
+    } reset;
+    wasmJitTestSetHotGroups(hotEntries, 1e12); // entries per period; the period never ends here: flush below
+    for (U32 i = 0; i < blockCount; ++i) {
+        testPushCode8(0x43); // inc ebx
+        testPushCode8(0xb8); testPushCode32((i + 1) * blockBytes); // mov eax,next
+        testPushCode8(0xff); testPushCode8(0xe0); // jmp eax: separate blocks
+    }
+    testPushCode8(0xcd); testPushCode8(0x97);
+    std::vector<DecodedOp*> blocks;
+    std::vector<void*> tier1;
+    for (U32 i = 0; i < blockCount; ++i) {
+        U32 address = TEST_CODE_ADDRESS + i * blockBytes;
+        DecodedOp* op = cpu->getOp(address, 0);
+        startNewJIT(cpu, address, op);
+        op->runCount = JIT_RUN_COUNT + 1;
+        blocks.push_back(op);
+        tier1.push_back(op->pfnJitCode);
+    }
+    auto runOnce = [&]() {
+        cpu->eip.u32 = 0;
+        cpu->reg[3].u32 = 0;
+        cpu->nextOp = blocks[0];
+        cpu->yield = false;
+        for (U32 i = 0; i < 4 * blockCount && cpu->nextOp->inst != TestEnd; ++i) {
+            cpu->blockInstructionCount = 0;
+            cpu->run();
+        }
+        return cpu->reg[3].u32 == blockCount && cpu->nextOp->inst == TestEnd;
+    };
+    auto queueAll = [&]() {
+        for (U32 i = 0; i < hotEntries; ++i) {
+            if (!runOnce()) testFail("failed group: blocks must run the chain");
+        }
+        wasmJitTestClearHotCounts();
+        if (wasmJitTestHotQueueSize() != blockCount) testFail("failed group: every block must queue");
+    };
+
+    // Every attempt fails: each block keeps the code it has, none goes to the interpreter.
+    queueAll();
+    wasmJitTestFailBatchAfterSlots(0);
+    wasmJitTestHotFlush(cpu);
+    wasmJitTestFailBatchAfterSlots(-1);
+    for (U32 i = 0; i < blockCount; ++i) {
+        DecodedOp* op = blocks[i];
+        if (op->pfnJitCode != tier1[i] || !(op->flags & OP_FLAG_JIT) || op->pfn != context.process->startJITOp || (op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
+            testFail("failed hot group: block %u must keep its old code", i);
+        }
+    }
+    if (!runOnce() || wasmJitCompilationPaused() || wasmJitTestPendingCount() != 0) testFail("failed hot group: the guest must keep running");
+
+    // Too big as one (more than 5 slots fail here, as a module over a size limit does): the halves install.
+    queueAll();
+    wasmJitTestFailBatchAfterSlots(5);
+    wasmJitTestHotFlush(cpu);
+    wasmJitTestFailBatchAfterSlots(-1);
+    if (!runOnce()) testFail("split hot group: the guest must keep running");
+    for (U32 i = 0; i < blockCount; ++i) {
+        if (!blocks[i]->pfnJitCode || blocks[i]->pfnJitCode == tier1[i]) {
+            testFail("split hot group: block %u must be published at a new slot", i);
+        }
+    }
+    if (wasmJitTestPendingCount() != 0) testFail("split hot group: nothing stays pending");
+    cpu->nextOp = nullptr;
+    for (U32 i = 0; i < blockCount; ++i) {
+        context.memory->removeCodeBlock(TEST_CODE_ADDRESS + i * blockBytes, blocks[i], false);
+    }
+    wasmJitTestResetRuntimeBatching();
+
+    // A file batch with one block the browser rejects: only that block is given up on.
+    WasmJitBatchLimits limits;
+    limits.maxBlocks = 4;
+    limits.maxBatchBytes = 1024 * 1024;
+    limits.urgentPendingHits = 1000;
+    limits.maxProcessOpenBytes = 4 * 1024 * 1024;
+    wasmJitTestSetBatchLimits(limits);
+    wasmJitTestSetMappedFileKeyOverride(79);
+    wasmJitTestEnableRuntimeBatching(true);
+    context.codeIp = TEST_CODE_ADDRESS + 0x100;
+    DecodedOp* ops[4];
+    U32 addresses[4];
+    for (U32 i = 0; i < 4; ++i) {
+        addresses[i] = context.codeIp;
+        testPushCode8(0x40 + i); // inc eax, ecx, edx, ebx
+        testPushCode8(0xcd); testPushCode8(0x97);
+    }
+    WasmJitRuntimeStatsSnapshot before = wasmJitTestGetRuntimeStats();
+    for (U32 i = 0; i < 4; ++i) {
+        ops[i] = cpu->getOp(addresses[i], 0);
+        startNewJIT(cpu, addresses[i], ops[i]);
+        if (i == 1) wasmJitTestCorruptPendingBlock(ops[i]);
+    }
+    WasmJitRuntimeStatsSnapshot after = wasmJitTestGetRuntimeStats();
+    if (after.permanentFailures - before.permanentFailures != 1) {
+        testFail("split file batch: %llu blocks given up on, expected 1", (unsigned long long)(after.permanentFailures - before.permanentFailures));
+    }
+    if (wasmJitTestPendingCount() != 0) testFail("split file batch: nothing stays pending");
+    for (U32 i = 0; i < 4; ++i) {
+        if ((ops[i]->pfnJitCode != nullptr) != (i != 1)) testFail("split file batch: block %u has the wrong outcome", i);
+    }
+    for (U32 i = 0; i < 4; ++i) {
+        if (ops[i]->pfnJitCode) context.memory->removeCodeBlock(addresses[i], ops[i], false);
+    }
 }
 #endif
 
@@ -1750,19 +2439,19 @@ void testWasmJitMtPendingLifecycle() {
     if (wasmJitTestMtTranslationCount() != translations || wasmJitTestMtPendingCount() != 1) {
         testFail("MT WASM pending lifecycle does not translate or enqueue a pending block twice");
     }
-    urgent->runCount = 0xff;
+    urgent->runCount = JIT_RUN_COUNT_MAX; // catches: a pending hit wrapping the counter past its top
     for (U32 i = 0; i < 63; ++i) {
         runPending(testContext().cpu, addresses[0], urgent);
     }
     if (!(urgent->flags2 & OP_FLAG2_WASM_JIT_PENDING) || urgent->pfnJitCode ||
-            urgent->runCount != 0xff || wasmJitTestMtTranslationCount() != translations ||
+            urgent->runCount != JIT_RUN_COUNT_MAX || wasmJitTestMtTranslationCount() != translations ||
             wasmJitTestMtPendingCount() != 1) {
         testFail("MT WASM pending lifecycle saturates runCount without retranslating before hit 64");
     }
     runPending(testContext().cpu, addresses[0], urgent);
     stats = wasmJitTestGetMtRuntimeStats();
     if (!urgent->pfnJitCode || (urgent->flags2 & OP_FLAG2_WASM_JIT_PENDING) ||
-            urgent->runCount != 0xff || wasmJitTestMtTranslationCount() != translations ||
+            urgent->runCount != JIT_RUN_COUNT_MAX || wasmJitTestMtTranslationCount() != translations ||
             wasmJitTestMtPendingCount() != 0 || stats.urgentFlushes != 1 ||
             stats.groupedModules != 1 || stats.groupedFunctions != 1) {
         testFail("MT WASM pending lifecycle flushes one group on the 64th pending hit: jit=%d pendingFlag=%d runCount=%u translations=%u/%u pending=%u urgent=%llu groups=%llu functions=%llu",

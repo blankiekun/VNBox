@@ -110,6 +110,7 @@ public:
     bool internalScreenShot(const BString& filepath, SDL_Rect* r, U8* buffer, U32 bufferlen);
 
     void setCursor(const std::shared_ptr<XCursor>& cursor) override;
+    void freeCursor(U32 id) override;
     void buildCursor(KThread* thread, const std::shared_ptr<XCursor>& cursor, U32 pixelsAddress, U32 width, U32 height, S32 xHot, S32 yHot, U32 frame = 0, U32 delayMs = 0) override;
 
     KNativeInputSDLPtr input;
@@ -136,7 +137,11 @@ private:
     U8* emscriptenSoftwareBuffer = nullptr;
     U32 emscriptenSoftwareBufferSize = 0;
     bool emscriptenSoftwareDirty = false;
-    U8* emscriptenShownFrame = nullptr; // a copy of the frame on the canvas
+    U8* emscriptenRgbaBuffer = nullptr; // the frame in the canvas's byte order
+    U32 emscriptenRgbaBufferSize = 0;
+    bool emscriptenDesktopFillPending = false; // clear() was called and the desktop colour is not in the buffer yet
+    void fillEmscriptenDesktop();
+    U8* emscriptenShownFrame = nullptr; // the frame on the canvas
     U32 emscriptenShownFrameSize = 0, emscriptenShownWidth = 0, emscriptenShownHeight = 0;
     bool emscriptenShownValid = false;
     bool emscriptenSoftwareDisabled = false;
@@ -153,6 +158,7 @@ private:
 
     BOXEDWINE_MUTEX cursorsMutex;
     BHashTable<U32, SDL_Cursor*> cursors;
+    std::shared_ptr<XCursor> shownCursor; // the one on the page is never freed
     BHashTable<U32, KNativeInputSDL::CursorFramesPtr> cursorFrames; // animated cursors: every frame, built once
 
 #ifdef BOXEDWINE_RECORDER
