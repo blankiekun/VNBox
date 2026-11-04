@@ -1539,10 +1539,12 @@
         }, false);
         dropzone.addEventListener("drop", async function(event){
             event.preventDefault();
+            // A running game shows nothing for a drop: the copy would use storage quota, unseen and for good.
+            if (isRunning) return;
             // the dropped items are only readable until the first await
             let entries = Array.from(event.dataTransfer.items, (item) => item.webkitGetAsEntry()).filter(Boolean);
             // with auto run off, list the dropped programs so one can be started
-            let showExecute = !Config.isAutoRunSet && !isRunning;
+            let showExecute = !Config.isAutoRunSet;
             let message = document.getElementById('message');
             if (showExecute) {
                 document.getElementById('modalLinkExe').click();

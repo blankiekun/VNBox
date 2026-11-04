@@ -316,6 +316,20 @@ test('a dropped folder is copied to d: before its programs are listed', async ()
     assert.deepEqual(listed, ['/game/GAME.EXE', '/game/run.bat']);
 });
 
+// The bug: #dropzone wraps the canvas, so a stray drop during play was copied to d: and saved there, with no sign.
+test('a drop on a running game stores nothing', async () => {
+    const tree = { d: {} };
+    const { context, byId } = dialogShell(tree);
+    vm.runInContext('Config.d_drive = "/d"; isRunning = true;', context);
+    let prevented = false;
+    await byId.get('dropzone').dispatch('drop', {
+        preventDefault() { prevented = true; }, // or the browser opens the file in place of the game
+        dataTransfer: { items: [{ webkitGetAsEntry: () => droppedFile('/stray.txt', 'stray') }] },
+    });
+    assert.deepEqual(tree.d, {});
+    assert.equal(prevented, true);
+});
+
 test('a dropped zip is unzipped into a d: folder named after it', async () => {
     const tree = { d: {} };
     const game = makeZip({
