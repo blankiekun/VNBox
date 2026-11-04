@@ -88,6 +88,14 @@ void testX11ImageIncludeInferiors();
 void testX11ImageScanlinePadding();
 void testX11GetImageBounds();
 void testX11ImageReadback();
+void testX11CopyBounds();
+void testX11CopyWithinDrawable();
+void testX11CapsLockKeys();
+void testX11ResizeMarksDirty();
+void testX11DestroyWindowTree();
+void testX11ClientWindowsGoWithIt();
+void testX11ClipboardOwnerGone();
+void testX11FreeCursor();
 void testX11PalettedDrawing();
 void testX11PatternFills();
 void testX11PaletteInvalidation();
@@ -1170,6 +1178,14 @@ const TestEntry TEST_ENTRIES[] = {
     {testX11ImageScanlinePadding, "Test X11 image scanline padding"},
     {testX11GetImageBounds, "Test X11 image capture bounds and padding"},
     {testX11ImageReadback, "Test X11 window readback and cursor save/restore"},
+    {testX11CopyBounds, "Test X11 image and area copies stay inside both drawables"},
+    {testX11CopyWithinDrawable, "Test X11 area copy within one drawable"},
+    {testX11CapsLockKeys, "Test X11 Caps Lock changes letters only"},
+    {testX11ResizeMarksDirty, "Test X11 resize marks the window dirty"},
+    {testX11DestroyWindowTree, "Test X11 destroying a window destroys its subwindows"},
+    {testX11ClientWindowsGoWithIt, "Test X11 a closed display or exited process takes its windows"},
+    {testX11ClipboardOwnerGone, "Test X11 clipboard owner gone"},
+    {testX11FreeCursor, "Test X11 XFreeCursor keeps a cursor in use"},
     {testX11PalettedDrawing, "Test X11 paletted drawing and clipping"},
     {testX11PatternFills, "Test X11 tiled and stippled rectangle fills"},
     {testX11PaletteInvalidation, "Test X11 shared palette invalidation"},

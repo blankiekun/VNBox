@@ -1073,6 +1073,7 @@ int XWindow::moveResize(S32 x, S32 y, U32 width, U32 height) {
 	this->top = y;
 	if (width != this->width() || height != this->height()) {
 		setSize(width, height);
+		setDirty(); // the old converted pixels of an 8 or 16 bit window no longer fit it
 	}
 
 	KNativeSystem::moveWindow(shared_from_this());
@@ -1124,6 +1125,7 @@ int XWindow::configure(U32 mask, XWindowChanges* changes) {
 	if (sizeChanged) {
 		if (width != this->width() || height != this->height()) {
 			setSize(width, height);
+			setDirty(); // the old converted pixels of an 8 or 16 bit window no longer fit it
 		}
 		KNativeSystem::moveWindow(shared_from_this());
 	}
