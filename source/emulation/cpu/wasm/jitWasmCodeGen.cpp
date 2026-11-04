@@ -12960,8 +12960,11 @@ bool JitWasmCodeGen::canKeepPublishedFlagType(DecodedOp* op) const {
     }
 }
 
+// shortcut: off (audit finding 76): no gain measured so far; turn on only if a paired timing shows one.
+static constexpr bool WASM_JIT_LAZY_TYPE_DSE_AND_SPAN_FORWARD = false;
+
 void JitWasmCodeGen::storeLazyFlagType(LazyFlagType flags) {
-    const bool certified = canKeepPublishedFlagType(currentOp) &&
+    const bool certified = WASM_JIT_LAZY_TYPE_DSE_AND_SPAN_FORWARD && canKeepPublishedFlagType(currentOp) &&
         flags != FLAGS_NULL && flags != FLAGS_CFOF;
     if (certified && m_publishedLazyFlagType == flags) return;
     WASM_JIT_TEST_COUNT(g_wasmJitTestLazyTypeStores);
@@ -12999,7 +13002,7 @@ U32 JitWasmCodeGen::findFlagResultForwardEnd(DecodedOp* producer) const {
 void JitWasmCodeGen::storeLazyFlagsResult(RegPtr reg) {
     writeCPU(reg->isHigh ? JitWidth::b8 : JitWidth::b32,
              (U32)offsetof(CPU, result.u32), reg);
-    U32 end = findFlagResultForwardEnd(currentOp);
+    U32 end = WASM_JIT_LAZY_TYPE_DSE_AND_SPAN_FORWARD ? findFlagResultForwardEnd(currentOp) : 0;
     if (end || canForwardFlagResult(currentOp)) {
         // Keep the architectural store for faults, exits, and later flag
         // consumers. The dedicated local cannot alias later instructions' scratch.
