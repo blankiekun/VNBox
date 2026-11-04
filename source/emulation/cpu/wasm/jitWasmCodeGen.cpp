@@ -1343,8 +1343,23 @@ static void wasmJitRecordHelperDetail(WasmJitHelperDetail detail) {
 // an access took the inline fast path.
 static std::atomic<U32> g_wasmJitTestMemHelperCalls{0};
 extern "C" U32 wasmJitTestMemHelperCalls() { return g_wasmJitTestMemHelperCalls.load(); }
+// Counts in the emitted code, so a test can tell a register reload or a lazy type store from none.
+static std::atomic<U32> g_wasmJitTestRegLoads[24]; // general registers, then 16 + xmm index
+static std::atomic<U32> g_wasmJitTestLazyTypeStores{0};
+void wasmJitTestResetRegLoads() { for (auto& count : g_wasmJitTestRegLoads) count = 0; }
+U32 wasmJitTestMaxRegLoads() {
+    U32 most = 0;
+    for (const auto& count : g_wasmJitTestRegLoads) most = std::max(most, count.load());
+    return most;
+}
+U32 wasmJitTestLazyTypeStores() { return g_wasmJitTestLazyTypeStores.load(); }
+#define WASM_JIT_TEST_COUNT(counter) counter++
+// shouldStopBlockBefore is off under __TEST unless a test turns it on (ST only).
+static bool g_wasmJitTestStopBlocks = false;
+void wasmJitTestSetStopBlocks(bool enabled) { g_wasmJitTestStopBlocks = enabled; }
 #define WASM_JIT_TEST_MEM_STAT(STAT) do { if (!strncmp(#STAT, "ReadMem", 7) || !strncmp(#STAT, "WriteMem", 8)) g_wasmJitTestMemHelperCalls++; } while (0)
 #else
+#define WASM_JIT_TEST_COUNT(counter) do {} while (0)
 #define WASM_JIT_TEST_MEM_STAT(STAT) do {} while (0)
 #endif
 
@@ -5223,6 +5238,24 @@ static void failRuntimeBatch(const std::vector<WasmJitBatchEntryId>& liveIds, co
     }
 }
 
+static void flushRuntimeBatch(const WasmJitFlushRequest& request);
+
+// One function the browser rejects, or a module over a browser's size limit, must not cost the rest of the group its
+// compiled code: halve until the good blocks install and only a block that fails alone is given up on.
+static void failOrSplitRuntimeBatch(const std::vector<WasmJitBatchEntryId>& liveIds, size_t byteCount, const char* stage, const char* detail = nullptr) {
+    if (liveIds.size() < 2) {
+        failRuntimeBatch(liveIds, stage, detail);
+        return;
+    }
+    klog_fmt("[WASM JIT batch] %s failed for %u blocks, %u KB: trying each half", stage, (U32)liveIds.size(), (U32)(byteCount / 1024));
+    const size_t half = liveIds.size() / 2;
+    WasmJitFlushRequest first, second;
+    first.entries.assign(liveIds.begin(), liveIds.begin() + half);
+    second.entries.assign(liveIds.begin() + half, liveIds.end());
+    flushRuntimeBatch(first);
+    flushRuntimeBatch(second);
+}
+
 static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
     std::vector<WasmJitBatchEntryId> liveIds;
     std::vector<WasmJitMergeInput> inputs;
@@ -5242,7 +5275,7 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
     std::vector<U8> merged;
     BString error;
     if (!wasmJitMergeModules(inputs, merged, error)) {
-        failRuntimeBatch(liveIds, "merge", error.c_str());
+        failOrSplitRuntimeBatch(liveIds, merged.size(), "merge", error.c_str());
         return;
     }
 
@@ -5260,7 +5293,7 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
         return;
     }
     if (result == WASM_JIT_BATCH_ERROR) {
-        failRuntimeBatch(liveIds, "runtime install");
+        failOrSplitRuntimeBatch(liveIds, merged.size(), "runtime install");
         return;
     }
     if (result != WASM_JIT_BATCH_OK) {
@@ -5562,9 +5595,9 @@ static void wasmJitHotFlush(CPU* cpu) {
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopFlushHot = 0;
 #endif
-    // A group publishes whole or not at all. Only published code replaces the old slot: after "out of memory" or a
-    // failed module a block keeps the code it has (sealed, it would run nothing but the interpreter), and queues
-    // itself again in a later period.
+    // Only published code replaces the old slot: after "out of memory" or a failed module a block keeps the code it has
+    // (sealed, it would run nothing but the interpreter), and queues itself again in a later period. A group that
+    // failed may have published in parts (failOrSplitRuntimeBatch): this goes block by block.
     std::vector<void*> oldSlots;
     for (const OldBlock& old : oldBlocks) {
         cancelPendingWasmJitBlock(old.id, old.op); // no-op once published or failed
@@ -5744,6 +5777,15 @@ U64 wasmJitTestInlinedCalls() {
 
 U64 wasmJitTestHotBlocks() {
     return g_wasmJitHotBlocks;
+}
+
+// One function the browser's validator rejects: the last byte of the block's module is the end of its code.
+void wasmJitTestCorruptPendingBlock(DecodedOp* op) {
+    auto byOp = g_wasmJitPendingByOp.find(op);
+    if (byOp != g_wasmJitPendingByOp.end()) {
+        auto found = g_wasmJitPendingBlocks.find(byOp->second);
+        if (found != g_wasmJitPendingBlocks.end()) found->second->bytes.back() = 0xff;
+    }
 }
 
 U32 wasmJitTestPendingCount() {
@@ -7393,6 +7435,7 @@ static U32 cpuRegOffset32(U8 emulatedReg) {
 
 void JitWasmCodeGen::loadGPReg(U8 emulatedReg) {
     if (m_gpLoaded[emulatedReg]) return;
+    WASM_JIT_TEST_COUNT(g_wasmJitTestRegLoads[emulatedReg]);
     U32 local = wasmLocalForGPReg(emulatedReg);
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Load(cpuRegOffset32(emulatedReg));
@@ -9463,6 +9506,7 @@ SSERegPtr JitWasmCodeGen::loadCpuXMMReg(U8 index) {
     }
     U32 local = WASM_XMM_LOCAL_BASE + index;
     if (!m_xmmLoaded[index]) {
+        WASM_JIT_TEST_COUNT(g_wasmJitTestRegLoads[16 + index]);
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
         m_emitter.emitV128Load((U32)(offsetof(CPU, xmm) + index * sizeof(cpu->xmm[0])));
         m_emitter.emitLocalSet(local);
@@ -12917,10 +12961,10 @@ bool JitWasmCodeGen::canKeepPublishedFlagType(DecodedOp* op) const {
 }
 
 void JitWasmCodeGen::storeLazyFlagType(LazyFlagType flags) {
-    const bool enabled = std::getenv("BOXEDWINE_WASM_LAZY_TYPE_DSE") != nullptr;
-    const bool certified = enabled && canKeepPublishedFlagType(currentOp) &&
+    const bool certified = canKeepPublishedFlagType(currentOp) &&
         flags != FLAGS_NULL && flags != FLAGS_CFOF;
     if (certified && m_publishedLazyFlagType == flags) return;
+    WASM_JIT_TEST_COUNT(g_wasmJitTestLazyTypeStores);
     writeCPUValue(JitWidth::b8, (U32)offsetof(CPU, lazyFlagType), (DYN_PTR_SIZE)flags);
     m_publishedLazyFlagType = certified ? flags : FLAGS_NULL;
 }
@@ -12955,7 +12999,7 @@ U32 JitWasmCodeGen::findFlagResultForwardEnd(DecodedOp* producer) const {
 void JitWasmCodeGen::storeLazyFlagsResult(RegPtr reg) {
     writeCPU(reg->isHigh ? JitWidth::b8 : JitWidth::b32,
              (U32)offsetof(CPU, result.u32), reg);
-    U32 end = std::getenv("BOXEDWINE_WASM_FLAG_FORWARD") ? findFlagResultForwardEnd(currentOp) : 0;
+    U32 end = findFlagResultForwardEnd(currentOp);
     if (end || canForwardFlagResult(currentOp)) {
         // Keep the architectural store for faults, exits, and later flag
         // consumers. The dedicated local cannot alias later instructions' scratch.
@@ -13731,11 +13775,26 @@ void JitWasmCodeGen::IfCondition(JitConditional cond) {
     freeScratch(r->hardwareReg());
 }
 void JitWasmCodeGen::JumpIfCondition(JitConditional cond, U32 address) {
-    IfCondition(cond);
-    if (emitForwardBranch(address)) {
+    if (isForwardBranchTarget(address)) {
+        IfCondition(cond);
+        emitForwardBranch(address);
         EndIf();
         return;
     }
+    // This edge leaves through its own arm (or the loop header, which reloads), so only the arm publishes state:
+    // the path that stays keeps its register and x87 mappings. Same cold arm as guardCachedFpuFallback.
+    auto condition = getCondition(cond);
+    pushRegValue(condition);
+    freeScratch(condition->hardwareReg());
+    condition = nullptr;
+    finishIf();
+    auto savedGpDirty = m_gpDirty;
+    auto savedXmmDirty = m_xmmDirty;
+    auto savedXmmLoaded = m_xmmLoaded;
+    auto savedGpLoaded = m_gpLoaded;
+    auto savedSegLoaded = m_segLoaded;
+    auto savedFpu = fpuStackCache;
+    LazyFlagType savedLazyFlags = currentLazyFlags;
     // Other intra-block edges still use the dispatcher unless selected as
     // the bounded loop's backedge. Targets are linear addresses, whereas
     // cpu->eip.u32 is relative to CS.
@@ -13799,7 +13858,14 @@ void JitWasmCodeGen::JumpIfCondition(JitConditional cond, U32 address) {
         m_emitter.emitReturn();
         freeScratch(targetLocal);
     }
-    EndIf();
+    m_emitter.emitEnd();
+    m_gpDirty = savedGpDirty;
+    m_xmmDirty = savedXmmDirty;
+    m_xmmLoaded = savedXmmLoaded;
+    m_gpLoaded = savedGpLoaded;
+    m_segLoaded = savedSegLoaded;
+    fpuStackCache = savedFpu;
+    currentLazyFlags = savedLazyFlags;
 }
 void JitWasmCodeGen::IfDF() {
     branchBoundary();
@@ -14802,10 +14868,18 @@ void JitWasmCodeGen::direct_jump(JitConditional cond, U32 address) {
     emitBranchBailoutCheck();
     JumpIfCondition(cond, address);
 }
+void JitWasmCodeGen::dynamic_cmov_R(JitWidth width, DecodedOp* op, JitConditional condition) {
+    direct_cmov(width, condition, getReg(op->reg), getReadOnlyReg(op->rm));
+}
 void JitWasmCodeGen::direct_cmov(JitWidth w, JitConditional cond, RegPtr dst, RegPtr src) {
-    IfCondition(cond);
-    mov(w, dst, src);
-    EndIf();
+    // No host branch and no join: dst = cond ? src : dst. A 16-bit popToReg keeps dst's upper half either way.
+    auto condition = getCondition(cond);
+    pushRegValue(src);
+    pushRegValue(dst);
+    pushRegValue(condition);
+    freeScratch(condition->hardwareReg());
+    m_emitter.emitOp(WASM_SELECT);
+    popToReg(w, dst);
 }
 void JitWasmCodeGen::direct_setcc(JitConditional cond, RegPtr dst) {
     loadGPReg(dst->emulatedReg);
@@ -15075,6 +15149,17 @@ void JitWasmCodeGen::findForwardTargets() {
         [](const auto& a, const auto& b) { return a.eip > b.eip; });
     m_forwardTargets.erase(std::unique(m_forwardTargets.begin(), m_forwardTargets.end(),
         [](const auto& a, const auto& b) { return a.eip == b.eip; }), m_forwardTargets.end());
+}
+
+bool JitWasmCodeGen::isForwardBranchTarget(U32 address) const {
+    auto open = [&](const auto& targets) {
+        for (const auto& target : targets) {
+            if (target.eip == address && target.token && address > currentEip) return true;
+        }
+        return false;
+    };
+    if (m_inlineDepth) return open(m_inlineTargets); // inside an inlined callee only its own labels are in reach
+    return (m_directLoopOpen && open(m_directLoop->forwardTargets)) || open(m_forwardTargets);
 }
 
 bool JitWasmCodeGen::emitForwardBranch(U32 address) {
@@ -15644,6 +15729,19 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
 #endif
 }
 
+void JitWasmCodeGen::guardSseDiv() {
+    if (reuseSseDivGuard()) return;
+    // Taken only when a game unmasks divide exceptions, and the arm always leaves: the common path spills nothing.
+    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+    m_emitter.emitI32Load((U32)offsetof(CPU, sseDivExceptionsUnmasked));
+    m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
+    m_emitter.emitIf();
+    emitSseDivSlowPath();
+    m_emitter.emitEnd();
+    lastSseDivGuardEip = currentEip;
+    hasSseDivGuard = true;
+}
+
 void JitWasmCodeGen::emitSseDivSlowPath() {
     // The interpreter executes this DIVSS/DIVPS, including any exception.
     // Always leave afterwards; falling through would execute it twice. Keep
@@ -15792,7 +15890,11 @@ void JitWasmCodeGen::postCompile(DecodedOp* op) {
 }
 
 bool JitWasmCodeGen::shouldStopBlockBefore(U32 eip, DecodedOp* op) {
-#if !defined(BOXEDWINE_MULTI_THREADED) && !defined(__TEST)
+#if !defined(BOXEDWINE_MULTI_THREADED)
+#ifdef __TEST
+    // Off in testJit unless a test asks: its tests choose their block shapes.
+    if (!g_wasmJitTestStopBlocks) return false;
+#endif
     // Blocks overlap: every entry point (a return site, a jump from another
     // block) compiles its own block over the code that follows it, so the same
     // guest code was compiled ~5 times. End a block where another one starts or
@@ -15814,6 +15916,7 @@ bool JitWasmCodeGen::shouldStopBlockBefore(U32 eip, DecodedOp* op) {
     if (!wasmJitPersistenceActive() || !op || eip == this->startingEip) {
         return false;
     }
+#ifndef __TEST
     if (boxedwine_wasm_profile_split_before(
         this->startingEip - cpu->seg[CS].address,
         eip - cpu->seg[CS].address) != 0) {
@@ -15822,6 +15925,7 @@ bool JitWasmCodeGen::shouldStopBlockBefore(U32 eip, DecodedOp* op) {
         m_profileSplitTargetEip = eip;
         return true;
     }
+#endif
     return false;
 #else
     return false;

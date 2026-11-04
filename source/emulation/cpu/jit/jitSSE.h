@@ -112,7 +112,7 @@ public:
 	virtual void stmxcsr(MemPtr address) = 0;
 	virtual void ldmxcsr(MemPtr address) = 0;
 
-	void guardSseDiv();
+	virtual void guardSseDiv();
     virtual void emitSseDivSlowPath() { emulateSingleOp(); }
     bool reuseSseDivGuard();
     U32 lastSseDivGuardEip = 0;
