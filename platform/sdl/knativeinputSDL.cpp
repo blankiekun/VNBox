@@ -218,7 +218,8 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82,
         NumLock: 83, NumpadDivide: 84, NumpadMultiply: 85, NumpadSubtract: 86, NumpadAdd: 87, NumpadEnter: 88,
         Numpad1: 89, Numpad2: 90, Numpad3: 91, Numpad4: 92, Numpad5: 93, Numpad6: 94, Numpad7: 95, Numpad8: 96, Numpad9: 97,
-        Numpad0: 98, NumpadDecimal: 99
+        Numpad0: 98, NumpadDecimal: 99,
+        IntlRo: 135, KanaMode: 136, IntlYen: 137, Convert: 138, NonConvert: 139, Lang1: 144, Lang2: 145
     };
 
     function boxedwineKey(event) {

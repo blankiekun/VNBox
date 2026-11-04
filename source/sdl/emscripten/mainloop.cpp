@@ -367,6 +367,9 @@ bool doMainLoop() {
         };
         document.addEventListener("visibilitychange", visibility);
         visibility(); // a player opened in a background tab
+        // A GPU reset or a laptop's sleep can blank the 2D canvas, and an idle screen sends no frame by itself.
+        var softwareCanvas = document.getElementById("boxedwine-webgl-canvas-0");
+        if (softwareCanvas) softwareCanvas.addEventListener("contextrestored", function() { wasmExports["vnbox_canvas_lost"](); wake(); });
         "keydown keyup mousedown mouseup wheel touchstart touchend touchmove".split(" ").forEach(function(type) {
             window.addEventListener(type, wake, true);
         });
@@ -402,8 +405,15 @@ bool doMainLoop() {
 #ifdef BOXEDWINE_JSPI
 void cdromRunQueuedInsert();
 void hostFolderRunQueuedSync();
+extern "C" EMSCRIPTEN_KEEPALIVE void vnbox_canvas_lost() {
+    XServer::canvasLost = true;
+    XServer* server = XServer::getServer(true);
+    if (server) server->isDisplayDirty = true;
+}
 extern "C" EMSCRIPTEN_KEEPALIVE void vnbox_set_hidden(int hidden) {
+    bool shownAgain = XServer::hidden && !hidden; // not every browser signals a lost 2D canvas: one frame per tab return
     XServer::hidden = hidden != 0;
+    if (shownAgain) vnbox_canvas_lost();
 }
 extern "C" EMSCRIPTEN_KEEPALIVE int boxedwine_tick() {
     cdromRunQueuedInsert();

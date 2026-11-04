@@ -200,6 +200,16 @@ test('keys typed in a page input and browser shortcuts stay with the browser', (
     assert.deepEqual(b.keys, []);
 });
 
+// Bug: these codes weren't in the table, so they fell through to SDL, which has no X key for them.
+test('JIS keys reach the guest', () => {
+    const b = browser(false);
+    const codes = {IntlRo: 135, KanaMode: 136, IntlYen: 137, Convert: 138, NonConvert: 139, Lang1: 144, Lang2: 145};
+    for (const [code, scanCode] of Object.entries(codes)) {
+        assert.equal(b.key('keydown', code), true, code);
+        assert.deepEqual(b.keys.at(-1), [scanCode, 1]);
+    }
+});
+
 // Bug: same as the buttons above; a keyboard-only player also got no audio.
 // Bug: the page takes modifier keys before SDL, so the X state never held Shift, Ctrl, Alt, Caps or Num.
 test('each key and mouse event sets the modifiers; losing focus keeps only the locks', () => {

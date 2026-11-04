@@ -1048,7 +1048,7 @@ void XWindow::configureNotify() {
 // the game fills the screen without a title bar or desktop around it. Frameless windows
 // (a game's own full screen) are left where the game puts them.
 void XWindow::fitToScreen() {
-	if (!KSystem::fitWindow || !isMapped || parent != XServer::getServer()->getRoot() || attributes.override_redirect || isDialog()) {
+	if (!KSystem::fitWindow || !isMapped || !data || parent != XServer::getServer()->getRoot() || attributes.override_redirect || isDialog()) {
 		return;
 	}
 	XPropertyPtr hints = getProperty(_MOTIF_WM_HINTS);

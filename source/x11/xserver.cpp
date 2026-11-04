@@ -36,6 +36,7 @@ U32 XServer::drawFps = 60;
 U64 XServer::nextDrawUs;
 bool XServer::composited;
 bool XServer::hidden;
+bool XServer::canvasLost;
 
 // The fps= gate, in place of upstream's 16 ms one: fps=0 draws every dirty frame. Flushes (drawNow) are
 // capped too, or fps=30 would not mean 30 for GDI games: a frame they flush early stays dirty and is drawn

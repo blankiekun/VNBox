@@ -36,6 +36,16 @@ struct KeyInfo {
 
 static const KeyInfo usKeyBoard[] =
 {
+	// JIS keys, X keycodes as evdev gives them. First in the table: a keysym lookup keeps the last key with that
+	// keysym, so \ | _ still find the US keys below (Shift+\ must stay |). Wine maps ろ and ¥ to VK_OEM_5, and
+	// its ToUnicodeEx takes the first keycode with that vkey, the US \ key: both type \ and Shift+either types |, so Shift+ろ is not _ yet.
+	{ 0x61, 0x73, SDL_SCANCODE_INTERNATIONAL1, XK_backslash, XK_underscore, 0, "\\", "_", 0 }, // ろ
+	{ 0x84, 0x7d, SDL_SCANCODE_INTERNATIONAL3, XK_backslash, XK_bar, 0, "\\", "|", 0 }, // ¥
+	{ 0x65, 0x70, SDL_SCANCODE_INTERNATIONAL2, XK_Hiragana_Katakana, XK_Hiragana_Katakana, 0, 0, 0, 0 },
+	{ 0x64, 0x79, SDL_SCANCODE_INTERNATIONAL4, XK_Henkan_Mode, XK_Henkan_Mode, 0, 0, 0, 0 },
+	{ 0x66, 0x7b, SDL_SCANCODE_INTERNATIONAL5, XK_Muhenkan, XK_Muhenkan, 0, 0, 0, 0 },
+	{ 0x82, 0x72, SDL_SCANCODE_LANG1, XK_Hiragana_Katakana, XK_Hiragana_Katakana, 0, 0, 0, 0 }, // かな on a Mac JIS keyboard
+	{ 0x83, 0x71, SDL_SCANCODE_LANG2, XK_Eisu_toggle, XK_Eisu_toggle, 0, 0, 0, 0 }, // 英数 on a Mac JIS keyboard
 	{ 0x09, 0x01, SDL_SCANCODE_ESCAPE, XK_Escape, XK_Escape, 0, "\x1b", "\x1b", 0 },
 	{ 0x43, 0x3B, SDL_SCANCODE_F1, XK_F1, XK_F1, 0, 0, 0, 0 },
 	{ 0x44, 0x3C, SDL_SCANCODE_F2, XK_F2, XK_F2, 0, 0, 0, 0 },
@@ -147,6 +157,10 @@ struct KeyName {
 };
 
 static const KeyName keyNames[] = {
+	{ XK_Muhenkan, "Muhenkan" },
+	{ XK_Henkan_Mode, "Henkan_Mode" },
+	{ XK_Hiragana_Katakana, "Hiragana_Katakana" },
+	{ XK_Eisu_toggle, "Eisu_toggle" },
 	{ XK_Escape, "Escape" },
 	{ XK_F1, "F1" },
 	{ XK_F2, "F2" },

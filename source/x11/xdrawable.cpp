@@ -88,11 +88,16 @@ void XDrawable::readImage(U8* dst, U32 dstPitch, S32 x, S32 y, U32 width, U32 he
 	}
 }
 
-U32 XDrawable::calculateBytesPerLine(U32 bitsPerPixel, U32 width) {
-	U32 result = (width * bitsPerPixel + 7) / 8;
+U64 XDrawable::calculateBytesPerLine(U32 bitsPerPixel, U32 width) {
+	U64 result = ((U64)width * bitsPerPixel + 7) / 8;
 	result = (result + 3) / 4 * 4;
 	return result;
 }
+
+// The largest drawable that gets pixels (8192x8192 at 32 bpp). An X server keeps none for an unmapped window, here every
+// window has them: a game's huge hidden popup must not end the emulator. Larger ones keep their size for the guest and
+// have no pixels, drawing on them does nothing and the composite skips them (bytes_per_line 0, as putBitsOnWnd checks).
+static const U64 MAX_DRAWABLE_BYTES = 256 * 1024 * 1024;
 
 void XDrawable::lockData() {
 	BOXEDWINE_MUTEX_LOCK(mutex);
@@ -106,16 +111,22 @@ void XDrawable::setSize(U32 width, U32 height) {
 	BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mutex);
 	w = width;
 	h = height;
-	bytes_per_line = calculateBytesPerLine(visual?visual->bits_per_rgb:32, width);
-	size = isPBuffer ? 0 : height * bytes_per_line;
+	U64 pitch = calculateBytesPerLine(visual?visual->bits_per_rgb:32, width);
 	if (data) {
 		delete[] data;
 		data = nullptr;
 	}
-	if (size) {
-		data = new U8[size];
-		memset(data, 0, size);
+	size = 0;
+	bytes_per_line = (U32)pitch;
+	if (isPBuffer || !pitch || !height) {
+		return;
 	}
+	if (pitch > MAX_DRAWABLE_BYTES / height || !(data = new (std::nothrow) U8[pitch * height])) {
+		bytes_per_line = 0;
+		return;
+	}
+	size = (U32)(pitch * height);
+	memset(data, 0, size);
 }
 
 int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage* image, S32 src_x, S32 src_y, S32 dest_x, S32 dest_y, U32 width, U32 height) {
@@ -127,7 +138,7 @@ int XDrawable::putImage(KThread* thread, const std::shared_ptr<XGC>& gc, XImage*
 
 // n bytes equal? 64 at a time with wasm SIMD (emscripten's memcmp is a byte loop, and a U64 loop
 // made the compare of an 800x600 frame cost more than the copy it saves)
-static bool sameBytes(const U8* a, const U8* b, U32 n) {
+bool sameBytes(const U8* a, const U8* b, U32 n) {
 	U32 i = 0;
 #ifdef __wasm_simd128__
 	for (; i + 64 <= n; i += 64) {
@@ -171,6 +182,9 @@ static bool clipCopy(S64& x, S64& y, S64& otherX, S64& otherY, S64& width, S64& 
 }
 
 int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U32 data, U32 bytes_per_line, S32 bits_per_pixel, S32 src_x, S32 src_y, S32 dst_x, S32 dst_y, U32 width, U32 height) {
+	if (!this->data) { // no pixels: a PBuffer, or too large to have any (setSize)
+		return Success;
+	}
 	if (bits_per_pixel != this->visual->bits_per_rgb) {
 		return BadMatch;
 	}
@@ -228,6 +242,9 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 static U32 readPixel(const U8* row, U32 x, U32 bits);
 
 int XDrawable::copy(KThread* thread,const std::shared_ptr<XGC>& gc, const std::shared_ptr<XDrawable>& srcDrawable, S32 srcX, S32 srcY, U32 width, U32 height, S32 dstX, S32 dstY) {
+	if (!data || !srcDrawable->data) { // no pixels: a PBuffer, or too large to have any (setSize)
+		return Success;
+	}
 	if (srcDrawable->visual->bits_per_rgb != this->visual->bits_per_rgb) {
 		return BadMatch;
 	}
@@ -299,7 +316,7 @@ static void writePixel(U8* row, U32 x, U32 bits, U32 value) {
 }
 
 void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src) {
-	if (x < 0 || y < 0 || (U32)x >= w || (U32)y >= h) return;
+	if (!data || x < 0 || y < 0 || (U32)x >= w || (U32)y >= h) return;
 	S64 cx = (S64)x - gc.values.clip_x_origin, cy = (S64)y - gc.values.clip_y_origin;
 	if (gc.hasClipRects) {
 		bool visible = false;
@@ -313,7 +330,7 @@ void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src) {
 	}
 	if (gc.values.clip_mask) {
 		auto mask = XServer::getServer()->getPixmap(gc.values.clip_mask);
-		if (!mask || cx < 0 || cy < 0 || cx >= mask->width() || cy >= mask->height() ||
+		if (!mask || !mask->getData() || cx < 0 || cy < 0 || cx >= mask->width() || cy >= mask->height() ||
 			!(mask->getData()[cy * mask->getBytesPerLine() + cx / 8] & (1 << (cx & 7)))) return;
 	}
 	U8* row = data + y * bytes_per_line;

@@ -86,6 +86,9 @@ void testWaitPid();
 void testX11ConcurrentInitialization();
 void testX11ImageIncludeInferiors();
 void testX11ImageScanlinePadding();
+void testX11OversizedDrawable();
+void testX11BadGuestValues();
+void testX11JisKeys();
 void testX11GetImageBounds();
 void testX11ImageReadback();
 void testX11CopyBounds();
@@ -1176,6 +1179,9 @@ const TestEntry TEST_ENTRIES[] = {
     {testWaitPid, "Test waitpid child selection"},
     {testX11ImageIncludeInferiors, "Test X11 image IncludeInferiors and child coordinates"},
     {testX11ImageScanlinePadding, "Test X11 image scanline padding"},
+    {testX11OversizedDrawable, "Test X11 drawables too large to have pixels"},
+    {testX11BadGuestValues, "Test X11 calls with bad guest values"},
+    {testX11JisKeys, "Test X11 JIS keys"},
     {testX11GetImageBounds, "Test X11 image capture bounds and padding"},
     {testX11ImageReadback, "Test X11 window readback and cursor save/restore"},
     {testX11CopyBounds, "Test X11 image and area copies stay inside both drawables"},
