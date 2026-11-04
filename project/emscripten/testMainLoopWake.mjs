@@ -17,7 +17,7 @@ function browser({hidden = false} = {}) {
     const failed = [], reported = [], hiddenCalls = [];
     const flush = () => new Promise(resolve => setImmediate(resolve));
     const channel = {port1: {onmessage: null}, port2: {postMessage: () => messages.push(1)}};
-    const document = {hidden, addEventListener: (type, f) => listeners.set(type, f)};
+    const document = {hidden, addEventListener: (type, f) => listeners.set(type, f), getElementById: () => null};
     vm.runInContext(code, vm.createContext({
         document, performance: {now: () => now},
         window: {addEventListener: (type, f) => listeners.set(type, f)},
