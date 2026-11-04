@@ -8,6 +8,7 @@ import path from 'node:path';
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
   '.wasm': 'application/wasm', '.zip': 'application/zip', '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2' };
 const GAME_PREFIX = '/__e2e/game/', LISTING = '/__e2e/listing.json';
+const PRIME_STEP_MS = 300000;
 export const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function listFiles(dir, base = '') {
@@ -69,13 +70,18 @@ export class Tab {
 
   // Copies the game into OPFS (files already there at their size stay) and lists it as a recent game, as
   // opening its folder would: the folder picker is the one step of the site's that can't run unattended.
+  // Throws, naming the step, if a step takes over PRIME_STEP_MS: the copy of the biggest file is the longest there is.
   async prime() {
     await this.page.goto(this.origin + '/privacy.html');
-    return this.page.evaluate(async ({ game, listing, prefix }) => {
+    const copy = this.page.evaluate(async ({ game, listing, prefix }) => {
+      const step = s => { globalThis.e2eStep = s; };
+      step('opening OPFS');
       const vn = await (await navigator.storage.getDirectory()).getDirectoryHandle('vn', { create: true });
       const dirHandle = await vn.getDirectoryHandle(game.title, { create: true });
       let copied = 0, size = 0;
+      step('fetching the listing');
       for (const f of await (await fetch(listing)).json()) {
+        step('OPFS file ' + f.path);
         const parts = f.path.split('/');
         let dir = dirHandle;
         for (const p of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(p, { create: true });
@@ -86,10 +92,18 @@ export class Tab {
         await res.body.pipeTo(await fh.createWritable());
         copied += f.size;
       }
+      step('localStorage');
       localStorage.setItem('w95.vnbox.recent', JSON.stringify([{ title: game.title, at: Date.now(), size, exe: game.exe, hook: game.hook, hooked: true }]));
       localStorage.setItem('w95.vnbox.log', 'true');
       return copied;
     }, { game: this.game, listing: LISTING, prefix: GAME_PREFIX });
+    for (let last; ;) {
+      const done = await Promise.race([copy.then(copied => ({ copied })), sleep(PRIME_STEP_MS)]);
+      if (done) return done.copied;
+      const now = await Promise.race([this.page.evaluate(() => globalThis.e2eStep), sleep(10000).then(() => 'the page stopped answering')]);
+      if (now === last) throw new Error('stuck at: ' + now);
+      last = now;
+    }
   }
 
   // The site's two save databases for the game (js/apps/vnsaves.js saveAreas). In the store a file is { contents, mode, timestamp }.

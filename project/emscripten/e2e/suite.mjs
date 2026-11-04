@@ -261,17 +261,27 @@ try {
   else if (breakName) { console.log('unknown --break ' + breakName + ': ' + Object.keys(BREAKS).join(', ')); process.exit(2); }
 
   // The game's copy, and a store with no saves left from an earlier run.
-  try {
-    const ctx = await within('starting the browser', 300000, launch(browserName, profile, sink.name, process.env.E2E_PLAYWRIGHT));
-    const tab = new Tab(ctx.pages()[0] || await ctx.newPage(), server.origin, GAME);
-    const copied = await within('copying the game', 1800000, tab.prime());
-    await within('clearing the save store', 120000, tab.wipeStore());
-    if (copied) console.log(`     ${browserName} copied the game into OPFS, ${(copied / 2 ** 30).toFixed(1)} GB`);
-    await within('closing the browser', 120000, ctx.close());
-  } catch (e) {
-    console.log(`FAIL ${browserName} overall: the run couldn't start: ${String(e).split('\n')[0].slice(0, 200)}`);
-    server.close(); sink.unload();
-    process.exit(2);
+  // Tried twice, saying so: Firefox's setup has hung with no bad input (see the PR), before any check ran.
+  for (let attempt = 1; ; attempt++) {
+    let ctx;
+    try {
+      ctx = await within('starting the browser', 300000, launch(browserName, profile, sink.name, process.env.E2E_PLAYWRIGHT));
+      const tab = new Tab(ctx.pages()[0] || await ctx.newPage(), server.origin, GAME);
+      const copied = await tab.prime();
+      await within('clearing the save store', 120000, tab.wipeStore());
+      if (copied) console.log(`     ${browserName} copied the game into OPFS, ${(copied / 2 ** 30).toFixed(1)} GB`);
+      await within('closing the browser', 120000, ctx.close());
+      break;
+    } catch (e) {
+      const why = String(e).split('\n')[0].slice(0, 200);
+      if (attempt === 2) {
+        console.log(`FAIL ${browserName} overall: the run couldn't start: ${why}`);
+        server.close(); sink.unload();
+        process.exit(2);
+      }
+      console.log(`     ${browserName} setup failed, trying once more: ${why}`);
+      if (ctx) await within('closing the browser', 120000, ctx.close()).catch(() => {});
+    }
   }
 
   for (const [name, check] of Object.entries(CHECKS)) {
