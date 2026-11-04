@@ -163,6 +163,9 @@ export class Tab {
 
   frame() { return this.page.frames().find(f => f.url().includes('boxedwine.html')); }
 
+  // The game's frame gone with none of the site's close path before it.
+  removeFrame() { return this.frame().frameElement().then(e => e.evaluate(f => f.remove())); }
+
   // The game's canvas on the page, with its size in game pixels. Null until it has a real size.
   async canvas() {
     const f = this.frame();

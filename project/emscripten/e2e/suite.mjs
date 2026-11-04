@@ -27,10 +27,17 @@ const FLAKY = new Set([]);
 // One browser per origin and profile for good: a new port would be a new origin and a new multi-GB copy of the game (and a QuotaExceededError).
 const PORT = { firefox: 8460, chromium: 8461 }[browserName];
 
+const CHECK_MS = 900000;
 class Failure extends Error {}
 const fail = msg => { throw new Failure(msg); };
 
 const near = (a, b, tolerance) => a && a.length === b.length && a.reduce((sum, v, i) => sum + Math.abs(v - b[i]), 0) / a.length <= tolerance;
+
+// A browser call has no time limit of its own: a stuck one would otherwise print nothing until run.sh's timeout.
+const within = (what, ms, promise) => {
+  let timer;
+  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Failure(what + ' got stuck')), ms); })]).finally(() => clearTimeout(timer));
+};
 
 async function waitFor(what, timeoutMs, test, every = 500) {
   const end = Date.now() + timeoutMs;
@@ -141,11 +148,12 @@ const CHECKS = {
     await tab.click(...SLOT_1);
     // The moment the game shows the slot filled, a player thinks it's saved. The slot is a tenth of the screen, so by its cells, not the mean.
     await waitFor('the save slot never filled', 30000, async () => (await tab.grid(16, 12)).some((v, i) => Math.abs(v - empty[i]) > 20), 50);
-    await tab.closeGame();
+    if (breakName === 'close-at-once') await tab.removeFrame(); else await tab.closeGame();
     const stored = await tab.storedFiles();
     const file = Object.keys(stored).find(k => k.endsWith(SAVE_FILE));
     if (!file) fail(`${SAVE_FILE} is not in the store after closing: ${JSON.stringify(Object.keys(stored))}`);
     if (breakName === 'wipe-save') await tab.deleteStored(SAVE_FILE);
+    if (breakName === 'close-at-once') await tab.openSite(); // the site wasn't told, so it has no card to play from
     await tab.clickPlay();
     await toTitle(tab);
     // A click while the title is still coming up does nothing, as with New Game.
@@ -196,31 +204,36 @@ const CHECKS = {
 
 // Bad inputs, to see a check fail (--break NAME). Each changes the serve dir's copy; wipe-save is read by the saves check.
 const engine = (dir, name) => path.join(dir, 'vnbox/engine', name);
+// Both safe to run again: the browsers of one run share the serve dir.
+const remove = file => fs.rmSync(file, { force: true });
 const edit = (file, from, to) => {
   const s = fs.readFileSync(file, 'utf8');
+  if (s.includes(to)) return;
   if (!s.includes(from)) throw new Error(`${from} is not in ${file}`);
   fs.writeFileSync(file, s.replace(from, to));
 };
 const BREAKS = {
-  // normal-start: a zip damaged in the middle.
-  'corrupt-jp-zip': dir => { const z = engine(dir, 'jp.zip'), b = fs.readFileSync(z); b.fill(0x55, b.length >> 1, (b.length >> 1) + 65536); fs.writeFileSync(z, b); },
+  // normal-start: a zip with its directory damaged. Damage in the middle isn't enough: a start reads few of its files, and 64 KB there passed.
+  'corrupt-jp-zip': dir => { const z = engine(dir, 'jp.zip'), b = fs.readFileSync(z); b.fill(0x55, b.length - 65536); fs.writeFileSync(z, b); },
   // movie: the page's movie player gone.
-  'no-movie-player': dir => fs.rmSync(engine(dir, 'vnbox-movie.js')),
+  'no-movie-player': dir => remove(engine(dir, 'vnbox-movie.js')),
   // movie: a movie no click can stop, on the page's side: its stop and close do nothing.
   'unstoppable-movie': dir => edit(engine(dir, 'vnbox-movie.js'), 'var movie = vnboxMovies.get(id);', 'var movie = vnboxMovies.get(id); if (cmd === "stop" || cmd === "close" || cmd === "pause") return 0;'),
   // text-hook: the hook script is gone.
-  'no-hook': dir => fs.rmSync(path.join(dir, 'vnbox/hooks', GAME.hook)),
+  'no-hook': dir => remove(path.join(dir, 'vnbox/hooks', GAME.hook)),
   // text-hook: a hook that sends every line twice.
   'double-hook': dir => edit(engine(dir, 'frida-compat.js'), "if (typeof globalThis.boxedwineText === 'function') globalThis.boxedwineText(text, t);", "if (typeof globalThis.boxedwineText === 'function') { globalThis.boxedwineText(text, t); globalThis.boxedwineText(text, t); }"),
   // saves: the save deleted from the store between close and restart.
   'wipe-save': () => {},
+  // saves: the frame removed the moment the slot shows filled, with none of the site's close path before it.
+  'close-at-once': () => {},
   // audio: the site starts the game with no sound.
   'no-sound': dir => edit(path.join(dir, 'js/apps/vnbox.js'), "'audioFreq=44100'", "'audioFreq=44100', 'sound=false'"),
   // two-tabs: no lock between tabs.
   'no-tab-lock': dir => edit(engine(dir, 'lazyfs.js'), 'if (typeof navigator === "undefined" || !navigator.locks) {', 'if (true) {'),
 };
 
-const results = [];
+const results = [], started = Date.now();
 function report(status, name, detail) {
   const counted = !FLAKY.has(name) || status === 'INFO';
   results.push({ status, counted });
@@ -231,19 +244,22 @@ fs.mkdirSync(logDir, { recursive: true });
 const sink = loadSink('vnbox-e2e-' + browserName);
 const server = await serve(path.resolve(serveDir), path.resolve(gameDir), PORT);
 const profile = path.join(workDir, 'profile-' + browserName);
-let code = 0;
 try {
   if (BREAKS[breakName]) await BREAKS[breakName](serveDir);
   else if (breakName) { console.log('unknown --break ' + breakName + ': ' + Object.keys(BREAKS).join(', ')); process.exit(2); }
 
   // The game's copy, and a store with no saves left from an earlier run.
-  {
-    const ctx = await launch(browserName, profile, sink.name, process.env.E2E_PLAYWRIGHT);
+  try {
+    const ctx = await within('starting the browser', 300000, launch(browserName, profile, sink.name, process.env.E2E_PLAYWRIGHT));
     const tab = new Tab(ctx.pages()[0] || await ctx.newPage(), server.origin, GAME);
-    const copied = await tab.prime();
-    await tab.wipeStore();
+    const copied = await within('copying the game', 1800000, tab.prime());
+    await within('clearing the save store', 120000, tab.wipeStore());
     if (copied) console.log(`     ${browserName} copied the game into OPFS, ${(copied / 2 ** 30).toFixed(1)} GB`);
-    await ctx.close();
+    await within('closing the browser', 120000, ctx.close());
+  } catch (e) {
+    console.log(`FAIL ${browserName} overall: the run couldn't start: ${String(e).split('\n')[0].slice(0, 200)}`);
+    server.close(); sink.unload();
+    process.exit(2);
   }
 
   for (const [name, check] of Object.entries(CHECKS)) {
@@ -255,13 +271,13 @@ try {
     const ctx = await launch(browserName, profile, sink.name, process.env.E2E_PLAYWRIGHT);
     const tab = new Tab(ctx.pages()[0] || await ctx.newPage(), server.origin, GAME, t => log.write(t + '\n'));
     try {
-      const out = await check({ tab, ctx, server, sink, dir, breakName });
+      const out = await within('the check', CHECK_MS, check({ tab, ctx, server, sink, dir, breakName }));
       if (out && out.status) report(out.status, name, out.detail); else report('PASS', name, out);
     } catch (e) {
       report('FAIL', name, e instanceof Failure ? `${e.message} (${path.relative(process.cwd(), dir)})` : `the check itself stopped: ${String(e).split('\n')[0].slice(0, 200)} (${path.relative(process.cwd(), dir)})`);
       await tab.page.screenshot({ path: path.join(dir, 'failed.png') }).catch(() => {});
     }
-    await ctx.close().catch(() => {});
+    await within('closing the browser', 120000, ctx.close()).catch(() => {});
     log.end();
   }
 } finally {
@@ -270,5 +286,5 @@ try {
 }
 const counted = results.filter(r => r.counted);
 const failed = counted.filter(r => r.status === 'FAIL').length;
-console.log(`${failed ? 'FAIL' : 'PASS'} ${browserName} overall: ${counted.filter(r => r.status === 'PASS').length} passed, ${failed} failed, ${counted.filter(r => r.status === 'INFO').length} info, ${results.length - counted.length} flaky not counted`);
-process.exit(failed ? 1 : code);
+console.log(`${failed ? 'FAIL' : 'PASS'} ${browserName} overall: ${counted.filter(r => r.status === 'PASS').length} passed, ${failed} failed, ${counted.filter(r => r.status === 'INFO').length} info, ${results.length - counted.length} flaky not counted, ${Math.round((Date.now() - started) / 1000)} s`);
+process.exit(failed ? 1 : 0);
