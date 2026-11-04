@@ -37,8 +37,8 @@ struct KeyInfo {
 static const KeyInfo usKeyBoard[] =
 {
 	// JIS keys, X keycodes as evdev gives them. First in the table: a keysym lookup keeps the last key with that
-	// keysym, so \ | _ still find the US keys below (Shift+\ must stay |). The text comes out right either way:
-	// the key's level picks the keysym, ろ gives \ and _, ¥ gives \ and |, as Japanese Windows does for both.
+	// keysym, so \ | _ still find the US keys below (Shift+\ must stay |). Wine maps ろ and ¥ to VK_OEM_5, and
+	// its ToUnicodeEx takes the first keycode with that vkey, the US \ key: both type \ and Shift+either types |, so Shift+ろ is not _ yet.
 	{ 0x61, 0x73, SDL_SCANCODE_INTERNATIONAL1, XK_backslash, XK_underscore, 0, "\\", "_", 0 }, // ろ
 	{ 0x84, 0x7d, SDL_SCANCODE_INTERNATIONAL3, XK_backslash, XK_bar, 0, "\\", "|", 0 }, // ¥
 	{ 0x65, 0x70, SDL_SCANCODE_INTERNATIONAL2, XK_Hiragana_Katakana, XK_Hiragana_Katakana, 0, 0, 0, 0 },
