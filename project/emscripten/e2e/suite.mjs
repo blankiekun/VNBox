@@ -128,6 +128,7 @@ const CHECKS = {
 
   // A save made in the game survives the site's Close Game right after it, and a restart: the slot holds it and loading it comes back to the same line.
   // Catches: saves still only in memory when the frame goes (the store written too late), a store that isn't read back at the next start.
+  // It can see a lost save (--break close-on-write), but the slot shows filled after the store is written, so this path doesn't reach the race itself: see the README.
   saves: async ({ tab, breakName }) => {
     await tab.play();
     let l = await startText(tab);
@@ -145,15 +146,19 @@ const CHECKS = {
     await tab.hover(...SLOT_1);
     await sleep(1000);
     const empty = await tab.grid(16, 12);
+    if (breakName === 'close-on-write') await tab.removeFrameOnWrite(SAVE_FILE);
     await tab.click(...SLOT_1);
-    // The moment the game shows the slot filled, a player thinks it's saved. The slot is a tenth of the screen, so by its cells, not the mean.
-    await waitFor('the save slot never filled', 30000, async () => (await tab.grid(16, 12)).some((v, i) => Math.abs(v - empty[i]) > 20), 50);
-    if (breakName === 'close-at-once') await tab.removeFrame(); else await tab.closeGame();
+    if (breakName === 'close-on-write') await waitFor('the save was never written', 30000, () => !tab.frame(), 50);
+    else {
+      // The moment the game shows the slot filled, a player thinks it's saved. The slot is a tenth of the screen, so by its cells, not the mean.
+      await waitFor('the save slot never filled', 30000, async () => (await tab.grid(16, 12)).some((v, i) => Math.abs(v - empty[i]) > 20), 50);
+      await tab.closeGame();
+    }
     const stored = await tab.storedFiles();
     const file = Object.keys(stored).find(k => k.endsWith(SAVE_FILE));
-    if (!file) fail(`${SAVE_FILE} is not in the store after closing: ${JSON.stringify(Object.keys(stored))}`);
+    if (!file || !stored[file]) fail(`${SAVE_FILE} is not in the store after closing: ${JSON.stringify(Object.keys(stored))}`);
     if (breakName === 'wipe-save') await tab.deleteStored(SAVE_FILE);
-    if (breakName === 'close-at-once') await tab.openSite(); // the site wasn't told, so it has no card to play from
+    if (breakName === 'close-on-write') await tab.openSite(); // the site wasn't told, so it has no card to play from
     await tab.clickPlay();
     await toTitle(tab);
     // A click while the title is still coming up does nothing, as with New Game.
@@ -213,20 +218,27 @@ const edit = (file, from, to) => {
   fs.writeFileSync(file, s.replace(from, to));
 };
 const BREAKS = {
-  // normal-start: a zip with its directory damaged. Damage in the middle isn't enough: a start reads few of its files, and 64 KB there passed.
-  'corrupt-jp-zip': dir => { const z = engine(dir, 'jp.zip'), b = fs.readFileSync(z); b.fill(0x55, b.length - 65536); fs.writeFileSync(z, b); },
+  // normal-start: a damaged download. A profile keeps its copy of a zip under the sum in vnbox-zips.sha256 and never reads the served bytes
+  // again, so a new sum is what makes it download, and the damaged bytes then don't match it.
+  'corrupt-jp-zip': dir => {
+    const z = engine(dir, 'jp.zip'), b = fs.readFileSync(z);
+    b.fill(0x55, b.length >> 1, (b.length >> 1) + 65536);
+    fs.writeFileSync(z, b);
+    const sums = engine(dir, 'vnbox-zips.sha256');
+    fs.writeFileSync(sums, fs.readFileSync(sums, 'utf8').replace(/^[0-9a-f]{64}(?= [ *]jp\.zip$)/m, '0'.repeat(64)));
+  },
   // movie: the page's movie player gone.
   'no-movie-player': dir => remove(engine(dir, 'vnbox-movie.js')),
-  // movie: a movie no click can stop, on the page's side: its stop and close do nothing.
-  'unstoppable-movie': dir => edit(engine(dir, 'vnbox-movie.js'), 'var movie = vnboxMovies.get(id);', 'var movie = vnboxMovies.get(id); if (cmd === "stop" || cmd === "close" || cmd === "pause") return 0;'),
+  // movie: a movie no click can stop, on the page's side. The game's stop also seeks to the start, which pauses it, so that does nothing too.
+  'unstoppable-movie': dir => edit(engine(dir, 'vnbox-movie.js'), 'var movie = vnboxMovies.get(id);', 'var movie = vnboxMovies.get(id); if (cmd === "stop" || cmd === "close" || cmd === "pause" || cmd === "seek") return 0;'),
   // text-hook: the hook script is gone.
   'no-hook': dir => remove(path.join(dir, 'vnbox/hooks', GAME.hook)),
   // text-hook: a hook that sends every line twice.
   'double-hook': dir => edit(engine(dir, 'frida-compat.js'), "if (typeof globalThis.boxedwineText === 'function') globalThis.boxedwineText(text, t);", "if (typeof globalThis.boxedwineText === 'function') { globalThis.boxedwineText(text, t); globalThis.boxedwineText(text, t); }"),
   // saves: the save deleted from the store between close and restart.
   'wipe-save': () => {},
-  // saves: the frame removed the moment the slot shows filled, with none of the site's close path before it.
-  'close-at-once': () => {},
+  // saves: the frame removed in the same tick the game's write of the save finishes, before the store can be written.
+  'close-on-write': () => {},
   // audio: the site starts the game with no sound.
   'no-sound': dir => edit(path.join(dir, 'js/apps/vnbox.js'), "'audioFreq=44100'", "'audioFreq=44100', 'sound=false'"),
   // two-tabs: no lock between tabs.

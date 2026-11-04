@@ -163,8 +163,17 @@ export class Tab {
 
   frame() { return this.page.frames().find(f => f.url().includes('boxedwine.html')); }
 
-  // The game's frame gone with none of the site's close path before it.
-  removeFrame() { return this.frame().frameElement().then(e => e.evaluate(f => f.remove())); }
+  // From now on the frame removes itself in the same tick a write of the file ends: IDBFS asks for a persist then, and runs it on a later timer.
+  removeFrameOnWrite(file) {
+    return this.frame().evaluate(file => {
+      const written = node => FS.isDir(node.mode) ? Object.values(node.contents).some(written) : FS.getPath(node).endsWith('/' + file) && node.usedBytes > 0;
+      const queue = IDBFS.queuePersist;
+      IDBFS.queuePersist = mount => {
+        queue(mount);
+        if (written(mount.root)) window.frameElement.remove();
+      };
+    }, file);
+  }
 
   // The game's canvas on the page, with its size in game pixels. Null until it has a real size.
   async canvas() {

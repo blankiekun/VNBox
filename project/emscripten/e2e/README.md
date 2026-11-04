@@ -25,4 +25,8 @@ Each check prints one line, `PASS`, `FAIL` or `INFO`, then each browser prints a
 run.sh ... --browsers firefox --only movie --break no-movie-player
 ```
 
-The names and what each breaks are in `BREAKS` in `suite.mjs`.
+The names and what each breaks are in `BREAKS` in `suite.mjs`. A profile keeps its copy of a root or overlay zip under the sum in `vnbox-zips.sha256` and never reads the served bytes again, so damaging a served zip alone changes nothing; `corrupt-jp-zip` changes the sum too.
+
+## What the saves check doesn't cover
+
+It can see a lost save: with `--break close-on-write` the frame goes in the same tick the save's write ends, and the check fails with the save not in the store. Without that break it can't reach the race: by the time the game shows the slot filled, the store has been written, even if the frame is then removed at once. So a pass says the site's own close path keeps a save at normal speed. It says nothing about a persist that is slow or has failed and is waiting to retry; `lazyfs.check.mjs` is where the close race itself is tested.
