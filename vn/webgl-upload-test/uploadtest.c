@@ -2,14 +2,15 @@
 // says it must be. Catches: swapped channels, wrong alpha (X8's unused byte is garbage here and must read as 0xff),
 // wrong row stride on a partial upload, a wrong tail on odd widths, a partial upload touching pixels outside its
 // rectangle, and upload state (row length, alignment) leaking into the next upload.
-// Prints "[upl] <case> ok|FAIL ... <hash>" per case and "[upl] done <failures>": the lines must not depend on where
-// the conversion runs (nativeTextureUpload=0 vs on). Build: i686-w64-mingw32-gcc -O1 uploadtest.c -o uploadtest.exe -ld3d9
+// Prints "[upl] <case> ok|FAIL ... <hash>" per case and "[upl] done <failures>": in one browser, the lines must not depend
+// on where the conversion runs (nativeTextureUpload=0 vs on). The 16-bit controls' hashes can differ between browsers. Build: i686-w64-mingw32-gcc -O1 uploadtest.c -o uploadtest.exe -ld3d9
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
 
 static IDirect3DDevice9* dev;
 static int failures;
+static int tolerance; // per channel: how a GPU expands 16-bit formats to 8 bits differs by 1 between browsers (Firefox's G of 565)
 
 // Unique per position and case, with all four bytes varying, so a swap or a shifted row can't go unnoticed.
 static BYTE pat(int x, int y, int ch, int seed) {
@@ -67,6 +68,14 @@ static IDirect3DSurface9* readback(IDirect3DTexture9* tex, int level, int w, int
 
 typedef DWORD (*Expect)(int x, int y, void* ctx);
 
+static int same(DWORD a, DWORD b) {
+    for (int s = 0; s < 32; s += 8) {
+        int d = (int)(a >> s & 255) - (int)(b >> s & 255);
+        if (d > tolerance || d < -tolerance) return 0;
+    }
+    return 1;
+}
+
 static void check(const char* name, IDirect3DSurface9* mem, int w, int h, Expect expect, void* ctx) {
     D3DLOCKED_RECT lr;
     int bad = 0, firstX = -1, firstY = -1;
@@ -81,7 +90,7 @@ static void check(const char* name, IDirect3DSurface9* mem, int w, int h, Expect
         h32 = hash(row, w * 4, h32);
         for (int x = 0; x < w; x++) {
             DWORD want = expect(x, y, ctx);
-            if (row[x] != want) {
+            if (!same(row[x], want)) {
                 if (!bad++) { firstX = x; firstY = y; got0 = row[x]; want0 = want; }
             }
         }
@@ -220,7 +229,9 @@ static void upload16(const char* name, D3DFORMAT fmt, Expect expect, int w, int 
         for (int x = 0; x < w; x++) row[x] = (WORD)(pat(x, y, 0, seed) | pat(x, y, 1, seed) << 8);
     }
     IDirect3DTexture9_UnlockRect(t, 0);
+    tolerance = 1;
     check(name, readback(t, 0, w, h), w, h, expect, &c);
+    tolerance = 0;
     IDirect3DTexture9_Release(t);
 }
 
