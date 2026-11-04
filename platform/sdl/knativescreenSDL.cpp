@@ -681,6 +681,13 @@ bool KNativeScreenSDL::presentedSinceLastCheck() {
 }
 
 void KNativeScreenSDL::clearTextureCache(U32 id) {
+    {
+        // a window never drawn has no entry, so nothing needs the main thread
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(wndCacheMutex);
+        if (!wndCache.get(id)) {
+            return;
+        }
+    }
     // on the main thread: the entry can hold an SDL texture
     DISPATCH_MAIN_THREAD_BLOCK_THIS_BEGIN
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(wndCacheMutex);
