@@ -18,6 +18,7 @@ function browser(threaded) {
     const documentHandlers = new Map();
     const events = [];
     const keys = [];
+    const mods = [];
     const canvas = {
         width: 640, height: 480, focus() {}, addEventListener() {},
         getBoundingClientRect: () => ({left: 100, top: 50, right: 740, bottom: 530, width: 640, height: 480})
@@ -33,21 +34,22 @@ function browser(threaded) {
         }},
         _boxedwineEmscriptenMouseButton: (down, button, x, y) => events.push({down, button, x, y}),
         _boxedwineEmscriptenMouseMove() {}, _boxedwineEmscriptenPointerLock() {},
-        _boxedwineEmscriptenKey: (scanCode, key, down) => keys.push([scanCode, down])
+        _boxedwineEmscriptenKey: (scanCode, key, down) => keys.push([scanCode, down]),
+        _boxedwineEmscriptenModifiers: value => mods.push(value)
     });
     vm.runInContext(code, context);
     // Listeners on window run in the order they were added; only stopImmediatePropagation ends the list.
     const dispatch = (type, event) => {
         let consumed = false, immediate = false;
         for (const callback of windowHandlers.get(type) || []) {
-            callback({...event, preventDefault() {},
+            callback({getModifierState: name => !!event.locks?.includes(name), ...event, preventDefault() {},
                 stopPropagation() {consumed = true;},
                 stopImmediatePropagation() {consumed = immediate = true;}});
             if (immediate) break;
         }
         return consumed;
     };
-    return {events, keys, context,
+    return {events, keys, mods, context,
         send: (type, button = 0, clientX = 300, clientY = 250) => dispatch(type, {button, clientX, clientY}),
         key: (type, code, event = {}) => dispatch(type, {code, key: '', target: {tagName: 'CANVAS'}, ...event}),
         // A listener added after the page's, as the main loop's wake and audio's resume are.
@@ -199,6 +201,21 @@ test('keys typed in a page input and browser shortcuts stay with the browser', (
 });
 
 // Bug: same as the buttons above; a keyboard-only player also got no audio.
+// Bug: the page takes modifier keys before SDL, so the X state never held Shift, Ctrl, Alt, Caps or Num.
+test('each key and mouse event sets the modifiers; losing focus keeps only the locks', () => {
+    const SHIFT = 0x0001, CTRL = 0x0040, CAPS = 0x2000, NUM = 0x1000;
+    const b = browser(false);
+    b.key('keydown', 'KeyA', {shiftKey: true, locks: ['CapsLock', 'NumLock']});
+    assert.equal(b.mods.at(-1), SHIFT | CAPS | NUM);
+    b.key('mousedown', '', {button: 0, clientX: 300, clientY: 250, ctrlKey: true, locks: ['CapsLock']});
+    assert.equal(b.mods.at(-1), CTRL | CAPS);
+    const sent = b.mods.length;
+    b.key('mouseup', '', {button: 0, clientX: 300, clientY: 250, ctrlKey: true, locks: ['CapsLock']});
+    assert.equal(b.mods.length, sent, 'unchanged state is not sent again');
+    b.send('blur');
+    assert.equal(b.mods.at(-1), CAPS);
+});
+
 test('keys reach later window listeners', () => {
     const b = browser(false);
     const down = b.later('keydown'), up = b.later('keyup');
