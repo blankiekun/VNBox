@@ -20,9 +20,13 @@ addToLibrary({
         constructor(options) {
           super();
           const p = options.processorOptions;
-          this.control = new Int32Array(p.control);
-          this.pcm = new Float32Array(p.pcm);
           this.channels = p.channels;
+          // Without cross-origin isolation there is no SharedArrayBuffer: the page posts PCM
+          // and this processor posts its counters back every quantum (message mode).
+          this.messages = !p.control;
+          this.control = this.messages ? new Int32Array(10) : new Int32Array(p.control);
+          this.pcm = this.messages ? new Float32Array(p.capacity * p.channels) : new Float32Array(p.pcm);
+          if (this.messages) this.port.onmessage = (event) => this.receive(event.data);
           this.capacity = this.pcm.length / this.channels;
           this.ratio = p.rate / sampleRate;
           this.phase = 0;
@@ -51,6 +55,21 @@ addToLibrary({
           }
           this.started = false;
           this.starved = false;
+        }
+        receive(m) {
+          const control = this.control;
+          if (m.data) {
+            const mask = this.capacity - 1;
+            for (let i = 0, frames = m.data.length / this.channels; i < frames; ++i) {
+              for (let c = 0; c < this.channels; ++c) {
+                this.pcm[((m.start + i) & mask) * this.channels + c] = m.data[i * this.channels + c];
+              }
+            }
+            control[1] = m.start + m.data.length / this.channels;
+          }
+          // The page drained frames itself while this processor wasn't running.
+          if (m.skip !== undefined && ((m.skip - control[0]) | 0) > 0) control[0] = m.skip;
+          if (m.stop) control[2] = m.stop;
         }
         process(inputs, outputs) {
           const control = this.control;
@@ -144,6 +163,8 @@ addToLibrary({
           Atomics.add(control, 8, nonzero);
           const done = closing && available === 0 && this.tail === 0;
           if (done) Atomics.store(control, 9, 1);
+          // Date.now(): the page may read this late, so it counts played frames from when it was sent.
+          if (this.messages) this.port.postMessage({c: control.slice(), t: Date.now()});
           return !done;
         }
       }
@@ -153,7 +174,6 @@ addToLibrary({
     available: function() {
       return !BoxedwineAudio.failed && typeof window !== 'undefined' &&
         typeof AudioContext !== 'undefined' && typeof AudioWorkletNode !== 'undefined' &&
-        typeof SharedArrayBuffer !== 'undefined' && globalThis.crossOriginIsolated === true &&
         new URLSearchParams(window.location.search).get('audioBackend') !== 'sdl';
     },
 
@@ -190,10 +210,12 @@ addToLibrary({
         let capacity = 1;
         while (capacity < rate / 2) capacity *= 2;
         const id = audio.nextId++;
+        const shared = typeof SharedArrayBuffer !== 'undefined' && globalThis.crossOriginIsolated === true;
         const device = {
-          id: id, channels: channels, rate: rate, capacity: capacity, node: null,
-          control: new Int32Array(new SharedArrayBuffer(40)),
-          pcm: new Float32Array(new SharedArrayBuffer(capacity * channels * 4)),
+          id: id, channels: channels, rate: rate, capacity: capacity, node: null, messages: !shared,
+          sent: 0, reportRead: 0, reportAt: -1,
+          control: new Int32Array(shared ? new SharedArrayBuffer(40) : new ArrayBuffer(40)),
+          pcm: new Float32Array(shared ? new SharedArrayBuffer(capacity * channels * 4) : capacity * channels),
           closing: false, lastDrain: performance.now(), drainFraction: 0,
           queueFailures: 0, targetFrames: targetFrames
         };
@@ -203,9 +225,17 @@ addToLibrary({
           try {
             device.node = new AudioWorkletNode(audio.context, 'boxedwine-pcm', {
               numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [channels],
-              processorOptions: {control: device.control.buffer, pcm: device.pcm.buffer,
+              processorOptions: device.messages ?
+                {capacity: capacity, channels: channels, rate: rate, primeFrames: Math.ceil(rate * 0.02)} :
+                {control: device.control.buffer, pcm: device.pcm.buffer,
                 channels: channels, rate: rate, primeFrames: Math.ceil(rate * 0.02)}
             });
+            if (device.messages) {
+              device.node.port.onmessage = function(event) { audio.report(device, event.data.c, event.data.t); };
+              device.sent = Atomics.load(device.control, 0);
+              device.node.port.postMessage({skip: device.sent});
+              audio.send(device);
+            }
             device.node.onprocessorerror = function() {
               audio.failed = true;
               err('AudioWorklet processor failed; falling back to SDL audio');
@@ -225,9 +255,40 @@ addToLibrary({
     },
 
     queued: function(device) {
-      const read = Atomics.load(device.control, 0) >>> 0;
+      let read = Atomics.load(device.control, 0) >>> 0;
       const write = Atomics.load(device.control, 1) >>> 0;
+      if (device.messages && device.node && BoxedwineAudio.context.state === 'running' && device.reportAt >= 0) {
+        // Reports wait while the emulator holds this thread, so count the frames played since the last was sent.
+        // shortcut: at most 100 ms ahead of a report, so a stalled worklet can't be overwritten; real reads correct it.
+        const ms = Math.min(Math.max(Date.now() - device.reportAt, 0), 100);
+        const guess = (device.reportRead + Math.floor(ms * device.rate / 1000)) >>> 0;
+        if (((guess - read) | 0) > 0) read = ((write - guess) | 0) < 0 ? write : guess;
+      }
       return (write - read) >>> 0;
+    },
+
+    // Message mode: post the frames written since the last post.
+    send: function(device) {
+      if (!device.node) return;
+      const write = Atomics.load(device.control, 1);
+      const frames = (write - device.sent) >>> 0;
+      if (!frames) return;
+      const data = new Float32Array(frames * device.channels);
+      for (let i = 0; i < frames; ++i) {
+        const source = ((device.sent + i) & (device.capacity - 1)) * device.channels;
+        for (let c = 0; c < device.channels; ++c) data[i * device.channels + c] = device.pcm[source + c];
+      }
+      device.node.port.postMessage({start: device.sent, data: data}, [data.buffer]);
+      device.sent = write;
+    },
+
+    // Message mode: the worklet's counters. The read only moves forward (the page may drain ahead of it).
+    report: function(device, counters, sentAt) {
+      const c = device.control;
+      if (((counters[0] - c[0]) | 0) > 0) c[0] = counters[0];
+      for (const i of [3, 4, 5, 6, 8, 9]) c[i] = counters[i];
+      device.reportRead = counters[0] >>> 0;
+      device.reportAt = sentAt;
     },
 
     queue: function(id, pointer, frames) {
@@ -253,11 +314,13 @@ addToLibrary({
       }
       Atomics.store(device.control, 1, (write + frames) | 0);
       Atomics.store(device.control, 7, Math.max(Atomics.load(device.control, 7), queued + frames));
+      if (device.messages) BoxedwineAudio.send(device);
       return frames;
     },
 
     dispose: function(device) {
       Atomics.store(device.control, 2, 1);
+      if (device.node && device.messages) device.node.port.postMessage({stop: 1});
       if (device.node) device.node.disconnect();
       BoxedwineAudio.devices.delete(device.id);
     },
@@ -268,6 +331,7 @@ addToLibrary({
       if (drain && !BoxedwineAudio.failed && (device.node || BoxedwineAudio.queued(device))) {
         device.closing = true;
         Atomics.store(device.control, 2, 2);
+        if (device.node && device.messages) device.node.port.postMessage({stop: 2});
       }
       else BoxedwineAudio.dispose(device);
     },
@@ -286,6 +350,7 @@ addToLibrary({
           const count = Math.min(frames, audio.queued(device));
           // Never move the reader backwards if audio resumed concurrently.
           Atomics.compareExchange(device.control, 0, read, (read + count) | 0);
+          if (count && device.node && device.messages) device.node.port.postMessage({skip: Atomics.load(device.control, 0)});
         }
         device.lastDrain = now;
         if (device.closing && (Atomics.load(device.control, 9) ||

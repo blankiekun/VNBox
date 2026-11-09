@@ -193,9 +193,127 @@ test('unsupported or explicitly selected SDL bypasses worklet initialization', (
     f.context.window.location.search = '?audioBackend=sdl';
     assert.equal(f.audio.available(), false);
     f.context.window.location.search = '';
-    f.context.crossOriginIsolated = false;
+    f.context.AudioWorkletNode = undefined;
     assert.equal(f.audio.available(), false);
     assert.equal(f.audio.open(2), 0);
+});
+
+// A page that isn't cross-origin isolated (blankie.moe): no SharedArrayBuffer, PCM and counters go by message.
+async function messageFixture({channels = 1, rate = 48000} = {}) {
+    let library, Processor, now = 0;
+    const pending = [];
+    const port = () => ({onmessage: null, peer: null,
+        postMessage(data) { pending.push([this.peer, structuredClone(data)]); }});
+    const context = vm.createContext({
+        addToLibrary(value) { library = value; },
+        Int32Array, Float32Array, ArrayBuffer, Atomics, Map, Math, Array,
+        URL: Object.assign(class extends URL {}, {createObjectURL: () => 'blob:test', revokeObjectURL() {}}),
+        URLSearchParams, Blob, Module: {}, HEAPF32: new Float32Array(4096),
+        performance: {now: () => now}, Date: {now: () => now}, navigator: {}, crossOriginIsolated: false,
+        window: {location: {search: ''}, addEventListener() {}, removeEventListener() {}},
+        setInterval() { return 1; }, clearInterval() {}, err() {},
+        AudioContext: class {
+            sampleRate = 48000; state = 'running'; destination = {};
+            audioWorklet = {addModule: () => Promise.resolve()};
+            resume() { return Promise.resolve(); }
+        },
+        AudioWorkletNode: class {
+            constructor(ctx, name, options) {
+                this.port = port();
+                const inner = port();
+                this.port.peer = inner; inner.peer = this.port;
+                globalThis.__port = inner;
+                this.processor = new Processor(options);
+            }
+            connect() {} disconnect() {}
+        }
+    });
+    vm.runInContext(source, context);
+    const audio = context.BoxedwineAudio = library.$BoxedwineAudio;
+    vm.runInNewContext('(' + audio.processorSource.toString() + ')()', {
+        AudioWorkletProcessor: class { constructor() { this.port = globalThis.__port; } },
+        globalThis, Int32Array, Float32Array, Atomics, Math, sampleRate: 48000, Date: {now: () => now},
+        registerProcessor(name, value) { Processor = value; }
+    });
+    const id = audio.open(channels, rate, Math.floor(rate * 0.03));
+    assert(id);
+    await audio.loading;
+    await Promise.resolve();
+    const device = audio.devices.get(id);
+    assert.equal(device.messages, true);
+    assert(device.node, 'worklet node must exist without SharedArrayBuffer');
+    function pump() { while (pending.length) { const [to, data] = pending.shift(); to.onmessage({data}); } }
+    function render(frames = 128) {
+        pump();
+        const output = Array.from({length: channels}, () => new Float32Array(frames));
+        const running = device.node.processor.process([], [output]);
+        pump();
+        return {output, running};
+    }
+    function queue(values) {
+        context.HEAPF32.set(values);
+        return audio.queue(id, 0, values.length / channels);
+    }
+    return {audio, context, device, id, render, queue, pump, advance(ms) { now += ms; }};
+}
+
+test('without SharedArrayBuffer the worklet plays posted PCM in order and reports its reads', async () => {
+    const f = await messageFixture();
+    const input = Array.from({length: 2048}, (_, i) => (i % 97) / 97);
+    assert.equal(f.queue(input), 2048);
+    const output = [];
+    for (let i = 0; i < 16; ++i) output.push(...f.render().output[0]);
+    assert.deepEqual(output, Array.from(new Float32Array(input)));
+    assert.equal(f.audio.queued(f.device), 0);
+    assert.equal(f.audio.snapshot().devices[0].starvationEpisodes, 0);
+});
+
+test('message mode counts frames played since the last report, never past the write', async () => {
+    const f = await messageFixture();
+    f.queue(Array(1024).fill(0.5));
+    f.render();
+    assert.equal(f.audio.queued(f.device), 896);
+    f.advance(5); // 240 frames at 48 kHz while the emulator held the page thread
+    assert.equal(f.audio.queued(f.device), 656);
+    f.advance(1000); // capped at 100 ms = 4800 frames, clamped to the write
+    assert.equal(f.audio.queued(f.device), 0);
+    assert.equal(f.audio.queue(f.id, 0, 1), 1, 'a guess never makes the ring look overfull');
+});
+
+test('a report the page reads late still counts from when the worklet sent it', async () => {
+    const f = await messageFixture();
+    f.queue(Array(2048).fill(0.5));
+    f.pump();
+    f.device.node.processor.process([], [[new Float32Array(128)]]); // reads 128, report waits in the queue
+    f.advance(10);  // the emulator held the page thread for 10 ms (480 frames played)
+    f.pump();
+    assert.equal(f.audio.queued(f.device), 2048 - 128 - 480);
+});
+
+test('message mode drain while suspended skips the worklet ahead too', async () => {
+    const f = await messageFixture();
+    f.audio.context.state = 'suspended';
+    f.queue(Array(512).fill(0.25));
+    f.advance(5);
+    f.audio.tick();
+    f.pump();
+    assert.equal(f.audio.queued(f.device), 272);
+    assert.equal(f.device.node.processor.control[0], 240, 'the worklet skips what the page drained');
+    f.audio.context.state = 'running';
+    for (let i = 0; i < 8; ++i) f.render(); // past the 20 ms start cushion
+    assert.equal(f.device.node.processor.control[0], f.device.control[0]);
+    assert(f.audio.queued(f.device) < 272);
+});
+
+test('message mode draining close plays the tail and releases the device', async () => {
+    const f = await messageFixture({rate: 11025});
+    f.queue([1]);
+    f.audio.close(f.id, true);
+    const rendered = f.render();
+    assert(rendered.output[0].some(x => x !== 0));
+    assert.equal(rendered.running, false);
+    f.audio.tick();
+    assert.equal(f.audio.devices.size, 0);
 });
 
 test('processor failure releases backpressure so a blocked writer can select SDL', () => {

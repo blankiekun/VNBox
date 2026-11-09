@@ -182,11 +182,18 @@ const CHECKS = {
   audio: async ({ tab, sink, dir }) => {
     await tab.play();
     await toTitle(tab);
+    // Which output the page picked and how much it keeps queued (the SDL fallback holds several hundred ms),
+    // and the worklet's starvations during the capture only.
+    const snap = () => tab.frame().evaluate(() => globalThis.Module && Module.boxedwineAudio && Module.boxedwineAudio.snapshot()).catch(() => null);
+    const before = await snap();
     const rec = capture(sink.name, path.join(dir, 'capture.raw'));
     await sleep(AUDIO_SECONDS * 1000);
+    const s = await snap(), starved = d => (before && before.devices.find(b => b.id === d.id) || {starvationEpisodes: 0}).starvationEpisodes;
+    const out = s ? `${s.backend}, queued ${s.devices.map(d => d.queuedMs.toFixed(0) + '/' + d.maxQueuedMs.toFixed(0)).join(' ') || 'none'} ms now/max, ` +
+      `starved ${s.devices.map(d => d.starvationEpisodes - starved(d)).join(' ')} times in the capture` : 'SDL';
     const a = analyze(await rec.stop());
     fs.rmSync(path.join(dir, 'capture.raw'));
-    const numbers = `${a.soundSeconds} of ${a.seconds} s with sound, rms ${a.rmsDb} dB, peak ${a.peakDb} dB, ${a.gaps} gaps of ${GAP_MS}+ ms, ${a.gapMs} ms in all, longest ${a.longestGapMs} ms`;
+    const numbers = `${out}; ${a.soundSeconds} of ${a.seconds} s with sound, rms ${a.rmsDb} dB, peak ${a.peakDb} dB, ${a.gaps} gaps of ${GAP_MS}+ ms, ${a.gapMs} ms in all, longest ${a.longestGapMs} ms`;
     if (a.soundSeconds < AUDIO_SECONDS / 2) fail('hardly any sound: ' + numbers);
     return { status: 'INFO', detail: numbers };
   },
