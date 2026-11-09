@@ -66,10 +66,12 @@ alternatively make sure your web server returns COEP, COOP headers
 
 ## Browser audio
 
-All four targets use an AudioWorklet output backend when AudioWorklet and
-SharedArrayBuffer are available. Serve over HTTPS or localhost with the COOP
-and COEP headers above, including for single-threaded builds. Otherwise audio
-falls back to SDL. Append `&audioBackend=sdl` to a demo URL for an A/B comparison.
+All four targets use an AudioWorklet output backend when AudioWorklet is
+available. With the COOP and COEP headers above the PCM ring is shared memory;
+without them (single-threaded builds on a plain host) the page posts PCM to the
+worklet and the worklet posts its read counter back every render quantum, so
+the same ~30 ms queue holds. Only a browser without AudioWorklet falls back to SDL,
+whose queue is several hundred ms. Append `&audioBackend=sdl` to a demo URL for an A/B comparison.
 Worklet initialization failures also fall back to SDL on the next audio write.
 
 The worklet uses a separate shared PCM ring, so single-threaded Wasm memory
