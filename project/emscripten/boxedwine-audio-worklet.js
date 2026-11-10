@@ -22,7 +22,7 @@ addToLibrary({
           const p = options.processorOptions;
           this.channels = p.channels;
           // Without cross-origin isolation there is no SharedArrayBuffer: the page posts PCM
-          // and this processor posts its counters back every quantum (message mode).
+          // and this processor posts its counters back when playing starts or stops and every 20 ms (message mode).
           this.messages = !p.control;
           this.control = this.messages ? new Int32Array(10) : new Int32Array(p.control);
           this.pcm = this.messages ? new Float32Array(p.capacity * p.channels) : new Float32Array(p.pcm);
@@ -55,6 +55,8 @@ addToLibrary({
           }
           this.started = false;
           this.starved = false;
+          this.playing = false;
+          this.sinceReport = -1;
         }
         receive(m) {
           const control = this.control;
@@ -147,6 +149,7 @@ addToLibrary({
           // Publish only after the PCM copy; the producer may reuse these slots.
           Atomics.store(control, 0, read | 0);
           if (count) this.started = true;
+          const starvedBefore = this.starved;
           if (this.started && count < frames && !draining) {
             Atomics.add(control, 3, frames - count);
             if (!this.starved) Atomics.add(control, 4, 1);
@@ -164,7 +167,19 @@ addToLibrary({
           const done = closing && available === 0 && this.tail === 0;
           if (done) Atomics.store(control, 9, 1);
           // Date.now(): the page may read this late, so it counts played frames from when it was sent.
-          if (this.messages) this.port.postMessage({c: control.slice(), t: Date.now()});
+          if (this.messages) {
+            // The page counts played frames from the last report's time, so it must hear at once when
+            // playing starts or stops; in steady state a report every 20 ms is enough.
+            const playing = count > 0;
+            const changed = playing !== this.playing || starvedBefore !== this.starved || done ||
+              (playing && available === 0);
+            this.playing = playing;
+            this.sinceReport = this.sinceReport < 0 ? -1 : this.sinceReport + frames;
+            if (changed || this.sinceReport < 0 || this.sinceReport >= sampleRate * 0.02) {
+              this.sinceReport = 0;
+              this.port.postMessage({c: control.slice(), t: Date.now()});
+            }
+          }
           return !done;
         }
       }
@@ -235,6 +250,9 @@ addToLibrary({
               device.sent = Atomics.load(device.control, 0);
               device.node.port.postMessage({skip: device.sent});
               audio.send(device);
+              // A close that came before this node existed set the stop on the page only.
+              const stop = Atomics.load(device.control, 2);
+              if (stop) device.node.port.postMessage({stop: stop});
             }
             device.node.onprocessorerror = function() {
               audio.failed = true;

@@ -199,11 +199,11 @@ test('unsupported or explicitly selected SDL bypasses worklet initialization', (
 });
 
 // A page that isn't cross-origin isolated (blankie.moe): no SharedArrayBuffer, PCM and counters go by message.
-async function messageFixture({channels = 1, rate = 48000} = {}) {
-    let library, Processor, now = 0;
+async function messageFixture({channels = 1, rate = 48000, beforeNode = null} = {}) {
+    let library, Processor, now = 0, posts = 0;
     const pending = [];
     const port = () => ({onmessage: null, peer: null,
-        postMessage(data) { pending.push([this.peer, structuredClone(data)]); }});
+        postMessage(data) { if (data.c) ++posts; pending.push([this.peer, structuredClone(data)]); }});
     const context = vm.createContext({
         addToLibrary(value) { library = value; },
         Int32Array, Float32Array, ArrayBuffer, Atomics, Map, Math, Array,
@@ -237,6 +237,7 @@ async function messageFixture({channels = 1, rate = 48000} = {}) {
     });
     const id = audio.open(channels, rate, Math.floor(rate * 0.03));
     assert(id);
+    if (beforeNode) beforeNode({audio, id, context});
     await audio.loading;
     await Promise.resolve();
     const device = audio.devices.get(id);
@@ -254,7 +255,7 @@ async function messageFixture({channels = 1, rate = 48000} = {}) {
         context.HEAPF32.set(values);
         return audio.queue(id, 0, values.length / channels);
     }
-    return {audio, context, device, id, render, queue, pump, advance(ms) { now += ms; }};
+    return {audio, context, device, id, render, queue, pump, posted: () => posts, advance(ms) { now += ms; }};
 }
 
 test('without SharedArrayBuffer the worklet plays posted PCM in order and reports its reads', async () => {
@@ -312,6 +313,39 @@ test('message mode draining close plays the tail and releases the device', async
     const rendered = f.render();
     assert(rendered.output[0].some(x => x !== 0));
     assert.equal(rendered.running, false);
+    f.audio.tick();
+    assert.equal(f.audio.devices.size, 0);
+});
+
+test('message mode reports about every 20 ms in steady playback, not every quantum', async () => {
+    const f = await messageFixture();
+    const chunk = Array(4096).fill(0.5); // the fake heap holds 4096 floats
+    for (let i = 0; i < 375; ++i) {
+        if (i % 32 === 0) f.queue(chunk);
+        f.render();
+    }
+    assert(f.posted() <= 60, 'too many reports: ' + f.posted());
+    assert(f.posted() >= 40, 'too few reports: ' + f.posted());
+});
+
+test('message mode reports at once when playback starts and when the ring empties', async () => {
+    const f = await messageFixture();
+    f.queue(Array(256).fill(0.5));
+    for (let i = 0; i < 64 && f.device.node.processor.control[0] !== 256; ++i) f.render();
+    assert.equal(f.device.node.processor.control[0], 256);
+    assert.equal(f.audio.queued(f.device), 0);
+    assert.equal(f.device.control[0], 256);
+});
+
+test('a draining close before the node exists still reaches the worklet', async () => {
+    const f = await messageFixture({rate: 11025, beforeNode: ({audio, id, context}) => {
+        context.HEAPF32.set([1]);
+        assert.equal(audio.queue(id, 0, 1), 1);
+        audio.close(id, true);
+    }});
+    let running = true;
+    for (let i = 0; i < 64 && running; ++i) running = f.render().running;
+    assert.equal(running, false, 'the processor must stop after the tail');
     f.audio.tick();
     assert.equal(f.audio.devices.size, 0);
 });
