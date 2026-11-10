@@ -237,7 +237,7 @@ async function messageFixture({channels = 1, rate = 48000, beforeNode = null} = 
     });
     const id = audio.open(channels, rate, Math.floor(rate * 0.03));
     assert(id);
-    if (beforeNode) beforeNode({audio, id, context});
+    if (beforeNode) beforeNode({audio, id, context, advance(ms) { now += ms; }});
     await audio.loading;
     await Promise.resolve();
     const device = audio.devices.get(id);
@@ -348,6 +348,31 @@ test('a draining close before the node exists still reaches the worklet', async 
     assert.equal(running, false, 'the processor must stop after the tail');
     f.audio.tick();
     assert.equal(f.audio.devices.size, 0);
+});
+
+// Bug: the page drained everything while the worklet module loaded, the node got the read position only,
+// took write = 0 for about 4e9 queued frames and ran ahead of the writer for the rest of the session.
+test('a node created after the page drained everything starts level with the writer', async () => {
+    const f = await messageFixture({beforeNode: ({audio, id, context, advance}) => {
+        context.HEAPF32.set(Array(480).fill(0.25));
+        assert.equal(audio.queue(id, 0, 480), 480);
+        advance(20); // 960 frames of silent drain: more than is queued
+        audio.tick();
+    }});
+    f.pump();
+    const processor = f.device.node.processor;
+    assert.deepEqual([processor.control[0], processor.control[1]], [480, 480]);
+    for (let i = 0; i < 4; ++i) {
+        assert(f.render().output[0].every(x => x === 0));
+    }
+    assert.equal(processor.control[0], 480, 'nothing is queued: the read must not move');
+    assert.equal(f.queue(Array(256).fill(0.5)), 256);
+    const played = [];
+    for (let i = 0; i < 64 && processor.control[0] !== 736; ++i) played.push(...f.render().output[0]);
+    assert.equal(processor.control[0], 736);
+    assert.equal(played.filter(x => x !== 0).length, 256);
+    assert(played.every(x => x === 0 || x === 0.5));
+    assert.equal(f.audio.queued(f.device), 0);
 });
 
 test('processor failure releases backpressure so a blocked writer can select SDL', () => {

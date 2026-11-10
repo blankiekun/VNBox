@@ -69,6 +69,8 @@ addToLibrary({
             }
             control[1] = m.start + m.data.length / this.channels;
           }
+          // At creation only: the first data post moves the write on from here.
+          if (m.write !== undefined && !m.data) control[1] = m.write;
           // The page drained frames itself while this processor wasn't running.
           if (m.skip !== undefined && ((m.skip - control[0]) | 0) > 0) control[0] = m.skip;
           if (m.stop) control[2] = m.stop;
@@ -248,7 +250,8 @@ addToLibrary({
             if (device.messages) {
               device.node.port.onmessage = function(event) { audio.report(device, event.data.c, event.data.t); };
               device.sent = Atomics.load(device.control, 0);
-              device.node.port.postMessage({skip: device.sent});
+              // Nothing before "sent" is ever posted, so the worklet starts with read = write = sent.
+              device.node.port.postMessage({skip: device.sent, write: device.sent});
               audio.send(device);
               // A close that came before this node existed set the stop on the page only.
               const stop = Atomics.load(device.control, 2);
