@@ -1057,7 +1057,8 @@ void testWasmJitInlineCalleeShapes() {
 }
 
 // Catches: one rejected function (or a module over a browser's size limit, which is refused the same way) sending a
-// whole group to the interpreter for good, and a failed hot group losing the code its blocks already have.
+// whole group to the interpreter for good, a failed hot group losing the code its blocks already have, and a block the
+// browser rejects being compiled again every period.
 void testWasmJitFailedGroupSplits() {
     testNewInstruction(0);
     TestContext& context = testContext();
@@ -1120,6 +1121,14 @@ void testWasmJitFailedGroupSplits() {
         }
     }
     if (!runOnce() || wasmJitCompilationPaused() || wasmJitTestPendingCount() != 0) testFail("failed hot group: the guest must keep running");
+
+    // Rejected for good: the blocks get hot again but must not be compiled again.
+    for (U32 i = 0; i < hotEntries; ++i) {
+        if (!runOnce()) testFail("rejected hot group: blocks must run the chain");
+    }
+    wasmJitTestClearHotCounts();
+    if (wasmJitTestHotQueueSize() != 0) testFail("rejected hot group: %u blocks queued again", wasmJitTestHotQueueSize());
+    wasmJitTestForgetHotRejections(); // the next part reuses these blocks
 
     // Too big as one (more than 5 slots fail here, as a module over a size limit does): the halves install.
     queueAll();

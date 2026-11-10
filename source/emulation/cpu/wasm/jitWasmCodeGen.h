@@ -1379,6 +1379,7 @@ void wasmJitTestCorruptPendingBlock(DecodedOp* op);
 U32 wasmJitTestPendingCount();
 void wasmJitTestSetHotGroups(U32 entries, double waitMs);
 void wasmJitTestClearHotCounts();
+void wasmJitTestForgetHotRejections();
 U32 wasmJitTestHotQueueSize();
 void wasmJitTestHotFlush(CPU* cpu);
 void wasmJitTestOomTick(double nowMs); // one main loop tick of the OOM retry at this host time
