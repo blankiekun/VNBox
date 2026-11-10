@@ -515,6 +515,8 @@ struct WasmJitHotEntry {
     int slot = -1;
 };
 static std::vector<WasmJitHotEntry> g_wasmJitHotQueue;
+// Slots whose hot recompile the browser rejected for good (not out of memory): they keep their code and stay out of the queue.
+static std::unordered_set<int> g_wasmJitHotRejected;
 static U64 g_wasmJitHotSubmittedId = 0;
 static U64 g_wasmJitHotModules = 0;
 static U64 g_wasmJitHotBlocks = 0;
@@ -550,6 +552,7 @@ static U32 wasmJitHotThreshold() {
 }
 
 static void wasmJitHotForgetSlot(int slot) {
+    g_wasmJitHotRejected.erase(slot);
     if (g_wasmJitHotQueue.empty()) return;
     g_wasmJitHotQueue.erase(std::remove_if(g_wasmJitHotQueue.begin(), g_wasmJitHotQueue.end(), [slot](const WasmJitHotEntry& e) {
         return e.slot == slot;
@@ -4946,6 +4949,7 @@ static void wasmHelper_hotBlock(CPU* cpu, U32 eip) {
     if (!op || !op->pfnJitCode || op->pfn != cpu->thread->process->startJITOp || (op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
         return;
     }
+    if (g_wasmJitHotRejected.count((int)(uintptr_t)op->pfnJitCode)) return;
     for (const WasmJitHotEntry& e : g_wasmJitHotQueue) {
         if (e.op == op) return;
     }
@@ -5594,15 +5598,19 @@ static void wasmJitHotFlush(CPU* cpu) {
     g_hopFlushHot = 0;
 #endif
     // Only published code replaces the old slot: after "out of memory" or a failed module a block keeps the code it has
-    // (sealed, it would run nothing but the interpreter), and queues itself again in a later period. A group that
-    // failed may have published in parts (failOrSplitRuntimeBatch): this goes block by block.
+    // (sealed, it would run nothing but the interpreter). Only after "out of memory" does it queue itself again in a
+    // later period; a rejected module is not tried again. A group that failed may have published in parts
+    // (failOrSplitRuntimeBatch): this goes block by block.
     std::vector<void*> oldSlots;
     for (const OldBlock& old : oldBlocks) {
+        // Still pending here means the browser was out of memory: that block may try again later.
+        const bool outOfMemory = g_wasmJitPendingBlocks.find(old.id) != g_wasmJitPendingBlocks.end();
         cancelPendingWasmJitBlock(old.id, old.op); // no-op once published or failed
         if (old.op->pfnJitCode) {
             oldSlots.push_back(old.slot);
             continue;
         }
+        if (!outOfMemory) g_wasmJitHotRejected.insert((int)(uintptr_t)old.slot);
         claimJitBlockOps(old.op, old.blockOpCount, old.blockLen);
         old.op->pfnJitCode = old.slot;
         old.op->pfn = cpu->thread->process->startJITOp;
@@ -5728,6 +5736,7 @@ void wasmJitTestResetRuntimeBatching() {
     g_wasmJitRuntimeStats = {};
     boxedwine_wasm_test_reset_runtime_batching_js();
     g_wasmJitHotQueue.clear();
+    g_wasmJitHotRejected.clear();
     memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
     g_wasmJitHotModules = 0;
     g_wasmJitHotBlocks = 0;
@@ -5753,6 +5762,10 @@ void wasmJitTestOomTick(double nowMs) {
 
 void wasmJitTestClearHotCounts() {
     memset(g_wasmJitHotCounts, 0, sizeof(g_wasmJitHotCounts));
+}
+
+void wasmJitTestForgetHotRejections() {
+    g_wasmJitHotRejected.clear();
 }
 
 U32 wasmJitTestHotQueueSize() {
