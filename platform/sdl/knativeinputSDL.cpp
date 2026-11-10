@@ -242,6 +242,8 @@ static void boxedwineInstallEmscriptenInputHandlers() {
 
     // Keys down in the guest. SDL never sees them, so its blur handler can't release them.
     var heldKeys = new Set();
+    // Keys whose key-down went on to SDL (Ctrl or Cmd held, or typed in a page input): their key-up is SDL's too.
+    var sdlKeys = new Set();
 
     function releaseHeldKeys() {
         setMods(lastMods & (MOD_NUM | MOD_CAPS)); // focus loss lets go of what is held; locks stay on
@@ -249,6 +251,7 @@ static void boxedwineInstallEmscriptenInputHandlers() {
             _boxedwineEmscriptenKey(scanCode, 0, 0);
         });
         heldKeys.clear();
+        sdlKeys.clear();
     }
 
     window.addEventListener('blur', releaseHeldKeys, false);
@@ -264,6 +267,10 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         syncMods(event); // also for the Ctrl+letter keys left to SDL
         var key = boxedwineKey(event);
         if (!key) {
+            var passed = keyCodeToSDLScanCode[event.code];
+            if (passed) {
+                sdlKeys.add(passed);
+            }
             return;
         }
         heldKeys.add(key.scanCode);
@@ -279,6 +286,11 @@ static void boxedwineInstallEmscriptenInputHandlers() {
         // A key down in the guest is released whatever the event's target or modifiers are now.
         // One it doesn't hold gets no second key-up: focus loss already released it.
         var held = heldKeys.delete(scanCode);
+        // SDL saw this key go down and sends the key-up itself. The page's own hold on it (a repeat
+        // under Ctrl) ends with it, without a second key-up.
+        if (sdlKeys.delete(scanCode)) {
+            return;
+        }
         if (!held && !key) {
             return;
         }
