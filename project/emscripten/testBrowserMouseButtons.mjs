@@ -200,6 +200,35 @@ test('keys typed in a page input and browser shortcuts stay with the browser', (
     assert.deepEqual(b.keys, []);
 });
 
+// Bug: Ctrl+A, Ctrl released first: the page consumed A's key-up without sending it, SDL never saw it,
+// and A stayed down in the guest until focus was lost.
+test('a key SDL saw go down gets its key-up through SDL, whatever the modifiers are by then', () => {
+    const b = browser(false);
+    b.key('keydown', 'ControlLeft');
+    assert.equal(b.key('keydown', 'KeyA', {ctrlKey: true}), false);
+    b.key('keyup', 'ControlLeft');
+    assert.equal(b.key('keyup', 'KeyA'), false, 'the key-up must reach SDL');
+    assert.deepEqual(b.keys, [[ctrl, 1], [ctrl, 0]]);
+});
+
+test('a key the page holds that repeats under Ctrl is released once, through SDL', () => {
+    const b = browser(false);
+    b.key('keydown', 'KeyA');
+    b.key('keydown', 'KeyA', {ctrlKey: true}); // the repeat goes to SDL
+    assert.equal(b.key('keyup', 'KeyA'), false);
+    b.send('blur');
+    assert.deepEqual(b.keys, [[a, 1]], 'SDL sends the one key-up; focus loss must not add another');
+});
+
+test('focus loss forgets the keys left to SDL: SDL releases its own', () => {
+    const b = browser(false);
+    b.key('keydown', 'KeyA', {ctrlKey: true});
+    b.send('blur');
+    b.key('keydown', 'KeyA');
+    assert.equal(b.key('keyup', 'KeyA'), true);
+    assert.deepEqual(b.keys, [[a, 1], [a, 0]]);
+});
+
 // Bug: these codes weren't in the table, so they fell through to SDL, which has no X key for them.
 test('JIS keys reach the guest', () => {
     const b = browser(false);
