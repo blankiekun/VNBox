@@ -1,7 +1,7 @@
 // ftcompare <libfreetype.so> <font>...: hashes what win32u gets from FreeType (face fields, OS/2 table, size metrics,
 // glyph metrics, outlines, gray/mono FT_Outline_Get_Bitmap, LCD FT_Render_Glyph) per font, face, ppem and load flags,
 // for every glyph (STEP=n: every nth). Two FreeType builds that print the same lines give win32u the same bytes.
-// VERBOSE=1 prints a hash per glyph; GLYPH=g FL=f PPEM=p details one glyph. See README.md for the builds compared.
+// EMBOLDEN=1 emboldens each outline first (win32u's fake bold). VERBOSE=1 prints a hash per glyph; GLYPH=g FL=f PPEM=p details one glyph. See README.md for the builds compared.
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
@@ -14,7 +14,7 @@
 #define F(n) static __typeof__(n)* p##n;
 F(FT_Init_FreeType) F(FT_New_Memory_Face) F(FT_Done_Face) F(FT_Set_Pixel_Sizes) F(FT_Load_Glyph) F(FT_Outline_Get_Bitmap)
 F(FT_Render_Glyph) F(FT_Library_SetLcdFilter) F(FT_Outline_Translate) F(FT_Outline_Get_CBox) F(FT_Get_Sfnt_Table) F(FT_Library_Version)
-F(FT_Get_Char_Index)
+F(FT_Get_Char_Index) F(FT_Outline_Embolden) F(FT_MulDiv)
 static unsigned h;
 static void mix(const void* p, size_t n) { const unsigned char* c = p; while (n--) h = (h ^ *c++) * 16777619u; }
 static int dbg;
@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
 #endif
     L(FT_Init_FreeType) L(FT_New_Memory_Face) L(FT_Done_Face) L(FT_Set_Pixel_Sizes) L(FT_Load_Glyph) L(FT_Outline_Get_Bitmap)
     L(FT_Render_Glyph) L(FT_Library_SetLcdFilter) L(FT_Outline_Translate) L(FT_Outline_Get_CBox) L(FT_Get_Sfnt_Table) L(FT_Library_Version)
-    L(FT_Get_Char_Index)
+    L(FT_Get_Char_Index) L(FT_Outline_Embolden) L(FT_MulDiv)
     FT_Library library; pFT_Init_FreeType(&library);
     FT_Int ma, mi, pa; pFT_Library_Version(library, &ma, &mi, &pa);
     printf("version %d.%d.%d lcdfilter=%d\n", ma, mi, pa, pFT_Library_SetLcdFilter(library, FT_LCD_FILTER_DEFAULT));
@@ -75,6 +75,7 @@ int main(int argc, char** argv) {
                         FT_Outline* o = &gs->outline;
                         MIX(o->n_points); MIX(o->n_contours); MIX(o->flags);
                         mix(o->points, o->n_points * sizeof(FT_Vector)); mix(o->tags, o->n_points); mix(o->contours, o->n_contours * 2);
+                        if (getenv("EMBOLDEN")) { e = pFT_Outline_Embolden(o, pFT_MulDiv(ppems[s], 1 << 6, 24)); MIX(e); mix(o->points, o->n_points * sizeof(FT_Vector)); } // win32u's fake bold
                         FT_BBox bb; pFT_Outline_Get_CBox(o, &bb);
                         bb.xMin &= ~63; bb.yMin &= ~63; bb.xMax = (bb.xMax + 63) & ~63; bb.yMax = (bb.yMax + 63) & ~63;
                         int w = (bb.xMax - bb.xMin) >> 6, hh = (bb.yMax - bb.yMin) >> 6;
