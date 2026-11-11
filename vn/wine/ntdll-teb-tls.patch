@@ -1,0 +1,57 @@
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -82,7 +82,12 @@
+ WINE_DECLARE_DEBUG_CHANNEL(syscall);
+ WINE_DECLARE_DEBUG_CHANNEL(threadname);
+ 
+-pthread_key_t teb_key = 0;
++/* VNBox: the TEB of the current thread, NULL on a thread Wine did not start, as the pthread key it
++ * replaces. NtCurrentTeb is called on almost every unix-side Wine path (win32u alone has ~200 call
++ * sites); through pthread_getspecific it was two calls, a PLT jump and ~30 instructions, all emulated.
++ * Initial-exec: one %gs load, no __tls_get_addr. ntdll.so is dlopen()ed, so its 4 bytes come from
++ * glibc's static TLS surplus; if that ever ran out, dlopen fails at startup, never silently. */
++__thread TEB *current_teb __attribute__((tls_model("initial-exec")));
+ 
+ static LONG nb_threads = 1;
+ 
+@@ -1126,7 +1131,7 @@
+     thread_data->syscall_table = KeServiceDescriptorTable;
+     thread_data->syscall_trace = TRACE_ON(syscall);
+     thread_data->pthread_id = pthread_self();
+-    pthread_setspecific( teb_key, teb );
++    current_teb = teb;
+     server_init_thread( thread_data->start, &suspend );
+     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
+ }
+@@ -1633,7 +1638,7 @@
+  */
+ TEB * WINAPI NtCurrentTeb(void)
+ {
+-    return pthread_getspecific( teb_key );
++    return current_teb;
+ }
+ 
+ 
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -184,7 +184,7 @@
+ extern const char *user_name;
+ extern const char **dll_paths;
+ extern const char **system_dll_paths;
+-extern pthread_key_t teb_key;
++extern __thread TEB *current_teb __attribute__((tls_model("initial-exec")));  /* VNBox: thread.c */
+ extern PEB *peb;
+ extern USHORT *uctable;
+ extern USHORT *lctable;
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4059,8 +4059,7 @@
+     NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &data_size, MEM_COMMIT, PAGE_READWRITE );
+     peb = (PEB *)((char *)teb_block + 31 * block_size + (is_win64 ? 0 : page_size));
+     teb = init_teb( ptr, FALSE );
+-    pthread_key_create( &teb_key, NULL );
+-    pthread_setspecific( teb_key, teb );
++    current_teb = teb;
+     return teb;
+ }
+ 
