@@ -23,6 +23,7 @@
 
 U32 hostVorbisFnId(const char* name);
 bool hostVorbisRun(CPU* cpu, U32 fn);
+U32 hostVorbisFileLoop(KMemory* memory, U32 ovRead);
 
 #define cpu (testContext().cpu)
 #define memory (testContext().memory)
@@ -315,6 +316,109 @@ void testHostVorbisSeek() {
     if (samples < 10000) testFail("only %u samples of the second stream", samples);
     hostClear();
     clearCalls();
+}
+
+// Native libvorbisfile (hostvorbis.cpp): ov_read_filter's 16-bit pack loop, as 最果てのイマ's libvorbisfile.dll has it
+// (with ov_read and the two helpers it calls), run as guest code by the emulator and hooked on the host, must leave the
+// same samples and locals, in every x87 rounding mode, for decoded samples and for edge values (ties, clipping, NaN,
+// infinities, out of int32 range). ov_read is found by its bytes; any other bytes, or another constant, stay guest.
+void testHostVorbisPack16() {
+    static const U8 ovRead[] = {
+        0x55, 0x8b, 0xec, 0x6a, 0x00, 0x6a, 0x00, 0x8b, 0x45, 0x20, 0x50, 0x8b, 0x4d, 0x1c, 0x51, 0x8b, 0x55, 0x18, 0x52, 0x8b,
+        0x45, 0x14, 0x50, 0x8b, 0x4d, 0x10, 0x51, 0x8b, 0x55, 0x0c, 0x52, 0x8b, 0x45, 0x08, 0x50, 0xe8, 0xc8, 0xf9, 0xff, 0xff,
+        0x83, 0xc4, 0x24, 0x5d, 0xc3 };
+    static const U8 loop[] = { // RVA 0x4f16..0x4fd1; the fmul's address at +0x67 is 0x10015228 (32768.0) unrelocated
+        0x8d, 0x55, 0xe0, 0x52, 0xe8, 0xd1, 0x03, 0x00, 0x00, 0x83, 0xc4, 0x04, 0xc7, 0x45, 0xf8, 0x00, 0x00, 0x00, 0x00, 0xeb,
+        0x09, 0x8b, 0x45, 0xf8, 0x83, 0xc0, 0x01, 0x89, 0x45, 0xf8, 0x8b, 0x4d, 0xf8, 0x3b, 0x4d, 0xdc, 0x0f, 0x8d, 0x91, 0x00,
+        0x00, 0x00, 0x8b, 0x55, 0xf8, 0x8b, 0x45, 0xfc, 0x8b, 0x0c, 0x90, 0x89, 0x4d, 0xc8, 0x8b, 0x55, 0xf8, 0x8b, 0x45, 0x0c,
+        0x8d, 0x0c, 0x50, 0x89, 0x4d, 0xcc, 0xc7, 0x45, 0xec, 0x00, 0x00, 0x00, 0x00, 0xeb, 0x09, 0x8b, 0x55, 0xec, 0x83, 0xc2,
+        0x01, 0x89, 0x55, 0xec, 0x8b, 0x45, 0xec, 0x3b, 0x45, 0xf4, 0x7d, 0x5a, 0x8b, 0x4d, 0xec, 0x8b, 0x55, 0xc8, 0xd9, 0x04,
+        0x8a, 0xdc, 0x0d, 0x28, 0x52, 0x01, 0x10, 0x83, 0xec, 0x08, 0xdd, 0x1c, 0x24, 0xe8, 0x44, 0x03, 0x00, 0x00, 0x83, 0xc4,
+        0x08, 0x89, 0x45, 0xd8, 0x81, 0x7d, 0xd8, 0xff, 0x7f, 0x00, 0x00, 0x7e, 0x09, 0xc7, 0x45, 0xd8, 0xff, 0x7f, 0x00, 0x00,
+        0xeb, 0x10, 0x81, 0x7d, 0xd8, 0x00, 0x80, 0xff, 0xff, 0x7d, 0x07, 0xc7, 0x45, 0xd8, 0x00, 0x80, 0xff, 0xff, 0x8b, 0x45,
+        0xcc, 0x66, 0x8b, 0x4d, 0xd8, 0x66, 0x89, 0x08, 0x8b, 0x55, 0xdc, 0x8b, 0x45, 0xcc, 0x8d, 0x0c, 0x50, 0x89, 0x4d, 0xcc,
+        0xeb, 0x95, 0xe9, 0x5a, 0xff, 0xff, 0xff };
+    static const U8 ftoi[] = { 0x55, 0x8b, 0xec, 0x51, 0xdd, 0x45, 0x08, 0xdb, 0x5d, 0xfc, 0x8b, 0x45, 0xfc, 0x8b, 0xe5, 0x5d, 0xc3 };
+    static const U8 setround[] = { 0x55, 0x8b, 0xec, 0x5d, 0xc3 };
+    constexpr U32 LOOP = TEST_CODE_ADDRESS + 0x100, EXIT = LOOP + sizeof(loop), OVREAD = LOOP + 0x42a, SCALE = HEAP + 0x40;
+    constexpr U32 PCMS = HEAP + 0x80, SRC = HEAP + 0x1000, EBPV = TEST_STACK_ADDRESS - 0x800;
+    constexpr U32 MAXN = 6000, OUTB = SRC + 2 * MAXN * 4;
+    U32 pack = hostVorbisFnId("ov_read 16-bit pack loop");
+    if (!pack) testFail("no pack loop id");
+
+    std::vector<std::vector<U8>> store;
+    int blocksize1;
+    std::vector<float> decoded = reference(encode(store, blocksize1)); // interleaved stereo
+    float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+    const float edge[] = { 0.5f / 32768, 1.5f / 32768, 2.5f / 32768, -0.5f / 32768, -1.5f / 32768, -2.5f / 32768,
+        32766.5f / 32768, 32767.5f / 32768, -32767.5f / 32768, -32768.5f / 32768, 1.0f, -1.0f, 1.5f, -1.5f, 65535.99f,
+        65536.0f, 65537.0f, -65536.0f, -65537.0f, 1e10f, -1e10f, inf, -inf, nan, -nan, 1e-40f, -1e-40f, 0.0f, -0.0f };
+
+    // channels, samples, the guest's x87 rounding control: memory after the loop (output, then the frame's locals)
+    auto run = [&](S32 channels, S32 samples, U32 rc, bool host, double scale) -> std::vector<U8> {
+        testNewInstruction(0);
+        for (int seg : { CS, DS, ES, SS, FS, GS }) cpu->seg[seg].address = 0;
+        memory->memcpy(LOOP, loop, sizeof(loop));
+        memory->writed(LOOP + 0x67, SCALE);
+        memory->memcpy(LOOP + 0x3ba, ftoi, sizeof(ftoi));
+        memory->memcpy(LOOP + 0x3da, setround, sizeof(setround));
+        memory->memcpy(OVREAD, ovRead, sizeof(ovRead));
+        for (U32 page = LOOP >> K_PAGE_SHIFT; page <= (OVREAD + 0x40) >> K_PAGE_SHIFT; page++) memory->clearPageWriteCounts(page);
+        U64 bits;
+        ::memcpy(&bits, &scale, 8);
+        memory->writeq(SCALE, bits);
+        for (S32 ch = 0; ch < 2; ch++) {
+            memory->writed(PCMS + ch * 4, SRC + ch * MAXN * 4);
+            for (U32 j = 0; j < MAXN; j++) {
+                float f = j < sizeof(edge) / 4 ? (ch ? -edge[j] : edge[j]) : decoded[((j * 2) % decoded.size()) + ch];
+                U32 v;
+                ::memcpy(&v, &f, 4);
+                memory->writed(SRC + (ch * MAXN + j) * 4, v);
+            }
+        }
+        memory->memset(OUTB, 0xaa, 2 * MAXN * 2);
+        memory->memset(EBPV - 0x40, 0x55, 0x50);
+        memory->writed(EBPV - 4, PCMS);
+        memory->writed(EBPV - 0xc, (U32)samples);
+        memory->writed(EBPV - 0x24, (U32)channels);
+        memory->writed(EBPV + 0xc, OUTB);
+        cpu->fpu.SetCW((U16)(0x037f | (rc << 10)));
+        EBP = EBPV;
+        ESP = EBPV - 0x44;
+        cpu->eip.u32 = LOOP;
+        if (host) {
+            if (!hostVorbisRun(cpu, pack - 1)) return {};
+            if (cpu->eip.u32 != EXIT || ESP != EBPV - 0x44) testFail("pack loop didn't end at its exit");
+        } else {
+            testContext().codeIp = EXIT; // TestEnd at the loop's exit
+            testRunCPU();
+        }
+        std::vector<U8> got(2 * MAXN * 2 + 0x50);
+        memory->memcpy(got.data(), OUTB, 2 * MAXN * 2);
+        memory->memcpy(got.data() + 2 * MAXN * 2, EBPV - 0x40, 0x50);
+        return got;
+    };
+    struct Case { S32 channels, samples; };
+    for (Case c : { Case{ 2, (S32)MAXN }, Case{ 1, 777 }, Case{ 2, 0 }, Case{ 0, 50 }, Case{ 2, -3 } }) {
+        for (U32 rc = 0; rc < 4; rc++) {
+            std::vector<U8> guest = run(c.channels, c.samples, rc, false, 32768.0), host = run(c.channels, c.samples, rc, true, 32768.0);
+            if (host.empty()) testFail("pack loop (%d ch, %d samples) not done on the host", c.channels, c.samples);
+            if (guest != host) {
+                size_t k = 0;
+                while (guest[k] == host[k]) k++;
+                testFail("pack loop (%d ch, %d samples, rc %d) differs from the guest at byte %d", c.channels, c.samples, rc, (int)k);
+            }
+        }
+    }
+    if (!run(2, 100, 0, true, 32767.0).empty()) testFail("pack loop with another constant taken");
+    // found from ov_read by its bytes, and only then
+    run(2, 1, 0, true, 32768.0);
+    if (hostVorbisFileLoop(memory, OVREAD) != LOOP) testFail("known libvorbisfile not recognized");
+    memory->writeb(LOOP + 0x7f, 0xfe); // the clamp at 32767
+    if (hostVorbisFileLoop(memory, OVREAD)) testFail("changed pack loop recognized");
+    memory->writeb(LOOP + 0x7f, 0xff);
+    memory->writeb(OVREAD + 0x2c, 0xc2);
+    if (hostVorbisFileLoop(memory, OVREAD)) testFail("changed ov_read recognized");
 }
 
 #endif

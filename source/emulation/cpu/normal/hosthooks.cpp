@@ -233,10 +233,12 @@ void hostHookHit(CPU* cpu) {
 // read-only, copy-on-write, code, not loaded yet), DF set, debug watchpoints, non-flat segments, errno
 // cases (strtol overflow, bad base). Nothing is written before the checks pass. nativeLibc=0 turns it off.
 // shortcut: strtol/strtoul use C-locale ctype (ASCII), which every glibc locale matches except Turkish ones.
+// Wine's CRT DLLs (msvcrt, msvcr70-120, ucrtbase .dll.so) get the same head op for their memory/string exports (hostCrtFnId).
 enum : U32 {
     LIBC_NONE, LIBC_MEMCPY, LIBC_MEMMOVE, LIBC_MEMSET, LIBC_MEMCMP, LIBC_MEMCHR, LIBC_STRLEN, LIBC_STRNLEN,
     LIBC_STRCMP, LIBC_STRNCMP, LIBC_STRCHR, LIBC_STRRCHR, LIBC_STRCPY, LIBC_STRTOL, LIBC_STRTOUL,
-    LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_MUTEX_LOCK, LIBC_MUTEX_UNLOCK, LIBC_COUNT, // mutex ones: hostmutex.cpp
+    LIBC_STRTOL23, LIBC_STRTOUL23, LIBC_MUTEX_LOCK, LIBC_MUTEX_UNLOCK, // mutex ones: hostmutex.cpp
+    LIBC_STRSTR, LIBC_STRNICMP, LIBC_COUNT, // Wine CRT only (msvcrt's string.c), not looked up in glibc
     HOST_ACM = LIBC_COUNT, // vorbis.acm's DriverProc (hostacm.cpp), on the same head op
     HOST_CLOCK, // + CLOCK_* - 1: ntdll.dll.so's clock reads (hostclock.cpp)
     HOST_VORBIS = HOST_CLOCK + 3, // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
@@ -245,7 +247,7 @@ enum : U32 {
     HOST_GLYPHM = 0x1000, // + GM_*: win32u.so's text measuring (hostglyphm.cpp)
     HOST_DSOUND = 0x1100 // + DS_*: dsound.dll.so's mix loops (hostdsound.cpp)
 };
-static const char* const hostLibcNames[LIBC_COUNT] = {
+static const char* const hostLibcNames[LIBC_STRSTR] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
     "strchr", "strrchr", "strcpy", "strtol", "strtoul", "__isoc23_strtol", "__isoc23_strtoul",
     "pthread_mutex_lock", "pthread_mutex_unlock"
@@ -257,6 +259,7 @@ U32 hostDsoundFnId(const char* name); // hostdsound.cpp
 bool hostDsoundEnabled();
 bool hostDsoundRun(CPU* cpu, U32 fn);
 U32 hostLibcFnId(const char* name);
+U32 hostCrtFnId(const char* name);
 static bool hostLibcEnabled() {
 #ifdef __EMSCRIPTEN__
     if (vnboxUrlIs("nativeLibc", "0")) {
@@ -283,13 +286,36 @@ static HostElfLib hostElfLibs[] = {
     { "/libc.so.6", false, 0, hostLibcFnId, hostLibcEnabled, {}, {}, {} }, // LIBC_*
     { "/libfreetype.so.6", true, HOST_FREETYPE - 1, hostFreetypeFnId, hostFreetypeEnabled, {}, {}, {} },
     { "/dsound.dll.so", false, HOST_DSOUND - 1, hostDsoundFnId, hostDsoundEnabled, {}, {}, {} }, // jp.zip's patched one
+    // The Wine builtins built from dlls/msvcrt's sources (PARENTSRC), whose string.c hostCrtFnId follows: LIBC_*.
+    { "/msvcrt.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
+    { "/msvcr70.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
+    { "/msvcr71.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
+    { "/msvcr80.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
+    { "/msvcr90.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
+    { "/msvcr100.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
+    { "/msvcr110.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
+    { "/msvcr120.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
+    { "/ucrtbase.dll.so", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} },
 };
 static std::atomic<bool> hostElfAny; // some table is ready
 static U8 hostLibcPageOffsets[K_PAGE_SIZE / 8]; // bit per page offset of an entry: getOp's cheap filter
 
 U32 hostLibcFnId(const char* name) {
-    for (U32 i = 1; i < LIBC_COUNT; i++) {
+    for (U32 i = 1; i < LIBC_STRSTR; i++) {
         if (!strcmp(hostLibcNames[i], name)) return i;
+    }
+    return LIBC_NONE;
+}
+
+// Wine 11's dlls/msvcrt/string.c, the same in every CRT DLL above: memcpy is memmove there, memset and strlen are glibc's,
+// strstr and _strnicmp have their own cases in hostLibcRun.
+U32 hostCrtFnId(const char* name) {
+    static const struct { const char* name; U32 fn; } fns[] = {
+        { "memcpy", LIBC_MEMMOVE }, { "memmove", LIBC_MEMMOVE }, { "memset", LIBC_MEMSET }, { "strlen", LIBC_STRLEN },
+        { "strstr", LIBC_STRSTR }, { "_strnicmp", LIBC_STRNICMP },
+    };
+    for (const auto& f : fns) {
+        if (!strcmp(f.name, name)) return f.fn;
     }
     return LIBC_NONE;
 }
@@ -316,6 +342,48 @@ bool hostMutexWanted(U32 symValue, U32 index); // hostmutex.cpp
 void hostMutexCheck(KFile* file);
 bool hostMutexRun(CPU* cpu, U32 fn, U32 a0, U32& result);
 
+// A Wine builtin (.dll.so: the root fs's Wine is built --without-mingw) keeps its exports out of .dynsym, in the PE export
+// table winebuild writes after __wine_spec_nt_header (tools/winebuild/spec32.c, output_exports): its RVAs count from that
+// header, and its function addresses are plain pointers (R_386_RELATIVE, so the file holds the ELF address). Only addresses in
+// an executable section are taken, which leaves out forwarders (strings).
+static bool hostWineExports(KFile* file, HostElfLib& lib, const std::vector<U8>& sh, U32 shnum, U32 nt) {
+    auto fileOffset = [&](U32 address, U32 len, U32 flags, U64& offset) { // a section with SHF_ALLOC | flags holding all of it
+        for (U32 i = 0; i < shnum; i++) {
+            const U8* s = &sh[i * 40];
+            U32 at = hostElf32(s + 12), size = hostElf32(s + 20);
+            if (hostElf32(s + 4) == 8 || (hostElf32(s + 8) & (2 | flags)) != (2 | flags) || address < at || address - at >= size || size - (address - at) < len) continue; // SHT_NOBITS
+            offset = (U64)(address - at) + hostElf32(s + 16);
+            return true;
+        }
+        return false;
+    };
+    std::vector<U8> h, dir;
+    U64 offset;
+    if (!fileOffset(nt, 24 + 104, 0, offset) || !hostFileRead(file, offset, h, 24 + 104) || hostElf32(&h[0]) != 0x4550 || hostElf16(&h[24]) != 0x10b) return false; // "PE\0\0", PE32
+    U32 exportRva = hostElf32(&h[24 + 96]), exportSize = hostElf32(&h[24 + 100]);
+    if (exportSize < 40 || exportSize > 0x1000000 || !fileOffset(nt + exportRva, exportSize, 0, offset) || !hostFileRead(file, offset, dir, exportSize)) return false;
+    auto at = [&](U32 rva, U32 len) -> const U8* { // the export directory's bytes at this RVA, null outside it
+        return rva >= exportRva && rva - exportRva <= exportSize && exportSize - (rva - exportRva) >= len ? dir.data() + (rva - exportRva) : nullptr;
+    };
+    U32 functionCount = hostElf32(&dir[20]), count = hostElf32(&dir[24]);
+    if (functionCount > exportSize / 4 || count > exportSize / 4) return false;
+    const U8* functions = at(hostElf32(&dir[28]), functionCount * 4);
+    const U8* nameRvas = at(hostElf32(&dir[32]), count * 4);
+    const U8* ordinals = at(hostElf32(&dir[36]), count * 2);
+    if (!functions || !nameRvas || !ordinals) return false;
+    for (U32 i = 0; i < count; i++) {
+        U32 rva = hostElf32(nameRvas + i * 4), ordinal = hostElf16(ordinals + i * 2);
+        const U8* name = at(rva, 1);
+        if (!name || ordinal >= functionCount || !memchr(name, 0, exportSize - (rva - exportRva))) continue;
+        U32 fn = lib.fnId((const char*)name);
+        U64 code;
+        if (!fn || !fileOffset(hostElf32(functions + ordinal * 4), 1, 4, code)) continue; // SHF_EXECINSTR
+        lib.entries.push_back({ code, lib.base + fn });
+        hostLibcPageOffsets[(code & K_PAGE_MASK) >> 3] |= 1 << (code & 7);
+    }
+    return !lib.entries.empty();
+}
+
 // Reads the exports from the file's section headers and .dynsym (host-side reads, the guest isn't involved).
 static bool hostLibcParse(KFile* file, HostElfLib& lib) {
     std::vector<U8> eh, sh, syms, names;
@@ -331,7 +399,12 @@ static bool hostLibcParse(KFile* file, HostElfLib& lib) {
         for (U32 off = 0; off + 16 <= syms.size(); off += 16) {
             const U8* sym = &syms[off];
             U32 name = hostElf32(sym), value = hostElf32(sym + 4), shndx = hostElf16(sym + 14);
-            if ((sym[12] & 0xf) != 2 || !shndx || shndx >= shnum || name >= names.size()) continue; // STT_FUNC only (an IFUNC is a resolver)
+            if (!shndx || shndx >= shnum || name >= names.size()) continue;
+            if (lib.fnId == hostCrtFnId) { // a Wine builtin: the exports are in the PE table this symbol starts
+                if (names.size() - name >= 22 && !memcmp(&names[name], "__wine_spec_nt_header", 22)) return hostWineExports(file, lib, sh, shnum, value);
+                continue;
+            }
+            if ((sym[12] & 0xf) != 2) continue; // STT_FUNC only (an IFUNC is a resolver)
             if (!memchr(&names[name], 0, names.size() - name)) continue;
             U32 fn = lib.fnId((const char*)&names[name]);
             if (!fn || (lib.fnId == hostLibcFnId && fn >= LIBC_MUTEX_LOCK && fn < LIBC_COUNT && !hostMutexWanted(value, fn - LIBC_MUTEX_LOCK))) continue;
@@ -344,6 +417,15 @@ static bool hostLibcParse(KFile* file, HostElfLib& lib) {
     }
     return false;
 }
+
+#ifdef __TEST
+// testHostLibc.cpp: what hostLibcParse finds in a Wine CRT builtin, as (file offset, LIBC_*).
+std::vector<std::pair<U64, U32>> hostCrtParseTest(KFile* file) {
+    HostElfLib lib = { "", false, 0, hostCrtFnId, hostLibcEnabled, {}, {}, {} };
+    hostLibcParse(file, lib);
+    return lib.entries;
+}
+#endif
 
 bool hostAcmMapped(KFile* file, U32& driverProc); // hostacm.cpp
 bool hostAcmAt(const BString& path, U32 fileOffset);
@@ -691,8 +773,12 @@ bool hostLibcRun(CPU* cpu, U32 fn) {
         break;
     }
     case LIBC_STRCMP:
-    case LIBC_STRNCMP: { // byte difference at the first mismatch or terminator (string/strcmp.c, strncmp.c)
-        U32 max = fn == LIBC_STRNCMP ? a2 : 0xFFFFFFFF, i = 0;
+    case LIBC_STRNCMP: // byte difference at the first mismatch or terminator (string/strcmp.c, strncmp.c)
+    case LIBC_STRNICMP: { // msvcrt's _strnicmp_l, both locale branches: any byte from 0x80 up goes to the guest (locale tables,
+        // multibyte), and below it every locale lowers A-Z alone and both return the lowered bytes' difference.
+        if (fn == LIBC_STRNICMP && a2 && (!a0 || !a1 || a2 > 0x7FFFFFFF)) return false; // invalid parameter handler, errno
+        bool fold = fn == LIBC_STRNICMP;
+        U32 max = fn != LIBC_STRCMP ? a2 : 0xFFFFFFFF, i = 0;
         S32 r = 0;
         bool done = false;
         while (!done && i < max) {
@@ -702,8 +788,14 @@ bool hostLibcRun(CPU* cpu, U32 fn) {
             if (!p || !q) return false;
             U32 n = std::min({ max - i, K_PAGE_SIZE - (x & K_PAGE_MASK), K_PAGE_SIZE - (y & K_PAGE_MASK) });
             for (U32 j = 0; j < n; j++) {
-                if (p[j] != q[j] || !p[j]) {
-                    r = (S32)p[j] - (S32)q[j];
+                U8 c = p[j], d = q[j];
+                if (fold) {
+                    if ((c | d) & 0x80) return false;
+                    if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                    if (d >= 'A' && d <= 'Z') d += 'a' - 'A';
+                }
+                if (c != d || !c) {
+                    r = (S32)c - (S32)d;
                     i += j;
                     done = true;
                     break;
@@ -723,6 +815,32 @@ bool hostLibcRun(CPU* cpu, U32 fn) {
         libcCopy(memory, a0, a1, len, false);
         memory->checkDebugTrapOnMemoryWrite(a0, len);
         result = a0;
+        break;
+    }
+    case LIBC_STRSTR: { // msvcrt's: the first match (its KMP finds that one too), the haystack for an empty needle
+        U32 m;
+        if (!libcFindByte(memory, a1, 0xFFFFFFFF, 0, m)) return false;
+        if (!m) { result = a0; break; }
+        static thread_local std::vector<U8> needle;
+        static thread_local std::vector<U32> next; // KMP: the longest proper prefix of needle[0..i] that is also its suffix
+        needle.resize(m);
+        next.assign(m, 0);
+        memory->memcpy(needle.data(), a1, m);
+        for (U32 i = 1, k = 0; i < m; i++) {
+            while (k && needle[i] != needle[k]) k = next[k - 1];
+            if (needle[i] == needle[k]) k++;
+            next[i] = k;
+        }
+        U32 j = 0; // needle bytes matched so far, over page pieces
+        if (!libcScan(memory, a0, 0xFFFFFFFF, index, [m, &j](const U8* p, U32 n, U32) {
+            for (U32 i = 0; i < n; i++) {
+                if (!p[i]) return i;
+                while (j && p[i] != needle[j]) j = next[j - 1];
+                if (p[i] == needle[j] && ++j == m) return i;
+            }
+            return n;
+        })) return false;
+        result = j == m ? a0 + index - (m - 1) : 0;
         break;
     }
     case LIBC_STRTOL:

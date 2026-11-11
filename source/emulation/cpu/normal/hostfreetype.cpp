@@ -32,8 +32,9 @@
 // The guest reads a host face's public fields directly (face->glyph->outline, ->size->metrics, ->charmaps, the
 // sfnt tables...), so each host face has a mirror in guest memory (mmap'ed by the host, in the process): the public
 // structs with guest pointers, kept in step after every call that changes them. The guest may change the glyph's
-// outline points (FT_Outline_Transform/Translate/Embolden run as guest code on the mirror); FT_Render_Glyph takes
-// them back first. FT_Outline_Get_Bitmap is a pure function of its arguments and runs on the host for any caller.
+// outline points (FT_Outline_Transform/Translate run as guest code on the mirror); FT_Render_Glyph takes them back
+// first. FT_Outline_Get_Bitmap and FT_Outline_EmboldenXY (fake bold: Wine's FT_Outline_Embolden calls it) are pure
+// functions of their arguments and run on the host for any caller.
 // FT_Library_SetLcdFilter and FT_Property_Set run on the twin too, then as guest code.
 // nativeFreetype=0 (URL) turns it off.
 #include "../../softmmu/kmemory_soft.h"
@@ -53,14 +54,16 @@
 enum : U32 {
     FTH_NEW_MEMORY_FACE, FTH_DONE_FACE, FTH_SET_PIXEL_SIZES, FTH_SET_CHARMAP, FTH_GET_CHAR_INDEX, FTH_GET_FIRST_CHAR,
     FTH_GET_NEXT_CHAR, FTH_GET_SFNT_NAME_COUNT, FTH_GET_SFNT_NAME, FTH_GET_SFNT_TABLE, FTH_LOAD_SFNT_TABLE,
-    FTH_GET_WINFNT_HEADER, FTH_LOAD_GLYPH, FTH_RENDER_GLYPH, FTH_OUTLINE_GET_BITMAP, // host for host objects
+    FTH_GET_WINFNT_HEADER, FTH_LOAD_GLYPH, FTH_RENDER_GLYPH, // host for host objects
+    FTH_OUTLINE_GET_BITMAP, FTH_OUTLINE_EMBOLDEN_XY, // host for any caller
     FTH_LIBRARY_SET_LCD_FILTER, FTH_PROPERTY_SET, // mirrored on the twin library, then guest
     FTH_COUNT
 };
 static const char* const hostFreetypeNames[FTH_COUNT] = {
     "FT_New_Memory_Face", "FT_Done_Face", "FT_Set_Pixel_Sizes", "FT_Set_Charmap", "FT_Get_Char_Index", "FT_Get_First_Char",
     "FT_Get_Next_Char", "FT_Get_Sfnt_Name_Count", "FT_Get_Sfnt_Name", "FT_Get_Sfnt_Table", "FT_Load_Sfnt_Table",
-    "FT_Get_WinFNT_Header", "FT_Load_Glyph", "FT_Render_Glyph", "FT_Outline_Get_Bitmap",
+    "FT_Get_WinFNT_Header", "FT_Load_Glyph", "FT_Render_Glyph",
+    "FT_Outline_Get_Bitmap", "FT_Outline_EmboldenXY",
     "FT_Library_SetLcdFilter", "FT_Property_Set"
 };
 
@@ -401,6 +404,32 @@ static bool hostFtOutlineGetBitmap(CPU* cpu, U32 lib, U32 outline, U32 bitmap, S
     return true;
 }
 
+// FT_Outline_EmboldenXY(outline, xstrength, ystrength) on a host copy of the guest's points and contours: it reads
+// those two arrays only (not the tags) and moves the points in place. It trusts the contour ends, so an outline that
+// FT_Outline_Check rejects stays guest code.
+static bool hostFtOutlineEmboldenXY(CPU* cpu, U32 outline, S32 xstrength, S32 ystrength, S32& result) {
+    KMemory* memory = cpu->memory;
+    if (!outline || !memory->canRead(outline, sizeof(FT_Outline))) return false;
+    FT_Outline o;
+    memory->memcpy(&o, outline, sizeof(o));
+    U32 gp = (U32)(uintptr_t)o.points, gc = (U32)(uintptr_t)o.contours;
+    if (o.n_points < 0 || o.n_contours < 0 || (o.n_points && !gp) || (o.n_contours && !gc)) return false;
+    U32 points = (U32)o.n_points, contours = (U32)o.n_contours;
+    if ((points && !memory->canWrite(gp, points * sizeof(FT_Vector))) || (contours && !memory->canRead(gc, contours * sizeof(short)))) return false;
+    static thread_local std::vector<U8> arrays;
+    arrays.resize(points * sizeof(FT_Vector) + contours * sizeof(short) + 8);
+    U8* p = arrays.data();
+    if (points) memory->memcpy(p, gp, points * sizeof(FT_Vector));
+    if (contours) memory->memcpy(p + points * sizeof(FT_Vector), gc, contours * sizeof(short));
+    o.points = (FT_Vector*)p;
+    o.contours = (short*)(p + points * sizeof(FT_Vector));
+    o.tags = nullptr;
+    if (FT_Outline_Check(&o)) return false;
+    result = FT_Outline_EmboldenXY(&o, xstrength, ystrength);
+    if (points) memory->memcpy(gp, p, points * sizeof(FT_Vector));
+    return true;
+}
+
 // FT_Render_Glyph(slot, mode) on a host slot: the guest may have moved the outline's points (transform, translate,
 // embolden as guest code), so they come back first.
 static bool hostFtRenderGlyph(CPU* cpu, HostFtFace& f, U32 mode, S32& result) {
@@ -445,6 +474,9 @@ bool hostFreetypeRun(CPU* cpu, U32 fn) {
         break;
     case FTH_OUTLINE_GET_BITMAP:
         if (cpu->debugTrapActive || !hostFtOutlineGetBitmap(cpu, a0, a1, a2, result)) return false;
+        break;
+    case FTH_OUTLINE_EMBOLDEN_XY:
+        if (cpu->debugTrapActive || !hostFtOutlineEmboldenXY(cpu, a0, (S32)a1, (S32)a2, result)) return false;
         break;
     case FTH_LIBRARY_SET_LCD_FILTER:
         if (HostFtLibrary* l = hostFtLibrary(cpu->thread->process->id, a0)) FT_Library_SetLcdFilter(l->lib, (FT_LcdFilter)a1);

@@ -1086,7 +1086,13 @@ void KOpenGLSdl::glSwapBuffers(KThread* thread, const std::shared_ptr<XDrawable>
             if (pglFlush) {
                 pglFlush();
             }
+            // SDL's swap ends with emscripten_sleep(0): a setTimeout round trip inside every present, which the
+            // browser may run late (seen: 22 ms per present for 2 s, one of 117 ms) while the guest and its audio
+            // stand still. The frame shows when the tick returns, which the yield below makes happen anyway.
+            // Only around the swap: with the hint off SDL_Delay would spin.
+            SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "0");
             SDL_GL_SwapWindow(window->window);
+            SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "1");
         }
         if (!usePrivateThreadCanvas) {
             resizeWebGLCanvas(window->window, d->width(), d->height());

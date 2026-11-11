@@ -20,6 +20,8 @@ void testHostLibcMutex();
 void testHostHookPatchedExport();
 void testHostLibcHead();
 void testHostLibcDeclines();
+void testHostCrt();
+void testHostCrtExports();
 void testHostHookHeadSingleStep();
 
 #endif

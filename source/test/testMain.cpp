@@ -951,6 +951,8 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostHookPatchedExport, "Test a game's patch on a hooked export runs instead of the hook"},
     {testHostLibcHead, "Test a hooked export's head op does the call or goes on with the guest function"},
     {testHostLibcDeclines, "Test native libc leaves DF, segments, code, copy-on-write and unloaded pages to the guest"},
+    {testHostCrt, "Test native Wine CRT memcpy/memset/strlen/strstr/_strnicmp"},
+    {testHostCrtExports, "Test the Wine CRT exports are found in a builtin .dll.so"},
     {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
     {testHostDsoundSameBytes, "Test host dsound convert/mix leave the bytes the guest functions do"},
     {testHostDsoundDeclines, "Test host dsound convert/mix leave what they can't do to the guest"},
@@ -960,6 +962,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostAcmBadSource, "Test a bad source length can't make the host allocate gigabytes"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
     {testHostVorbisSeek, "Test native libvorbis restart, trackonly and a second stream on the same objects"},
+    {testHostVorbisPack16, "Test native libvorbisfile ov_read pack"},
 #endif
 #ifdef BOXEDWINE_HOST_FREETYPE
     {testHostFreetypeGlyphs, "Test host FreeType faces and glyphs as win32u uses them"},

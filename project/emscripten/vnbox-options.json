@@ -25,6 +25,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeVorbisfile",
+      "label": "Native libvorbisfile sample packing",
+      "description": "Packs decoded audio into 16-bit samples as browser code instead of emulated x86, for a known libvorbisfile.dll build.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "nativeFreetype",
       "label": "Native FreeType",
       "description": "Loads and draws Windows text glyphs (GDI fonts) as browser code instead of emulated x86.",
@@ -63,6 +70,13 @@
       "name": "nativeGlyphMetrics",
       "label": "Native text measuring",
       "description": "Answers Wine's cached text measuring (text extents, glyph metrics) as browser code instead of emulated x86.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
+      "name": "nativeTextureUpload",
+      "label": "Native texture upload",
+      "description": "Converts BGRA and BGRX texture uploads to the browser's RGBA as browser code instead of emulated x86.",
       "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
       "group": "Speed", "restart": true, "experimental": false
     },

@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include "vnboxparam.h"
 
 #ifdef BOXEDWINE_OPENGL
 #include GLH
@@ -898,6 +899,14 @@ void printOpenGLInfo() {
 }
 
 #ifdef __EMSCRIPTEN__
+// WebGL has no BGRA upload, so the WebGL wined3d.dll swizzled each row of a BGR[AX] texture in emulated x86, per pixel,
+// on every present. vn/webgl/wined3d-webgl-host-bgra-upload.patch asks for this instead: the query string says the
+// engine can do it (nativeTextureUpload=0: null, as an older engine answers, and the guest keeps converting), and these
+// two glTexSubImage2D formats mean guest BGRA rows, stride from UNPACK_ROW_LENGTH, no unpack buffer bound.
+#define VNBOX_GL_QUERY_HOST_BGRA_UPLOAD 0x56420000
+#define VNBOX_GL_BGRX_TO_RGBA 0x56420001 // alpha becomes 0xff
+#define VNBOX_GL_BGRA_TO_RGBA 0x56420002
+
 // What glGetString reports for these names instead of the browser's WebGL strings, else null.
 static const char* webglFixedString(U32 name) {
     switch (name) {
@@ -909,6 +918,10 @@ static const char* webglFixedString(U32 name) {
         return "3.0 BoxedWine WebGL";
     case 0x8B8C: /* GL_SHADING_LANGUAGE_VERSION */
         return "3.00 BoxedWine WebGL";
+    case VNBOX_GL_QUERY_HOST_BGRA_UPLOAD: {
+        static const bool on = !vnboxUrlIs("nativeTextureUpload", "0");
+        return on ? "1" : nullptr;
+    }
     }
     return nullptr;
 }
@@ -1215,6 +1228,32 @@ static void texSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffs
 #endif
 }
 
+#ifdef __EMSCRIPTEN__
+static void texSubImage2DFromGuestBgra(CPU* cpu, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, U32 address) {
+    thread_local static std::vector<U32> rgba;
+    GLint rowLength = 0;
+    GL_FUNC(pglGetIntegerv)(GL_UNPACK_ROW_LENGTH, &rowLength);
+    const U32 stride = (U32)(rowLength ? rowLength : width) * 4;
+    const U32 alpha = format == VNBOX_GL_BGRX_TO_RGBA ? 0xff000000 : 0;
+    rgba.resize((size_t)width * height);
+    U32* out = rgba.data();
+    for (GLsizei y = 0; y < height; y++, address += stride, out += width) {
+        cpu->memory->memcpy(out, address, (U32)width * 4);
+        for (GLsizei x = 0; x < width; x++) {
+            const U32 v = out[x];
+            out[x] = (v & 0xff00ff00) | ((v & 0xff) << 16) | ((v >> 16) & 0xff) | alpha;
+        }
+    }
+    if (rowLength) {
+        GL_FUNC(pglPixelStorei)(GL_UNPACK_ROW_LENGTH, 0);
+    }
+    GL_FUNC(pglTexSubImage2D)(target, level, xoffset, yoffset, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    if (rowLength) {
+        GL_FUNC(pglPixelStorei)(GL_UNPACK_ROW_LENGTH, rowLength);
+    }
+}
+#endif
+
 void glcommon_glTexSubImage2D(CPU* cpu) {
     GLenum target = ARG1;
     GLint level = ARG2;
@@ -1224,6 +1263,12 @@ void glcommon_glTexSubImage2D(CPU* cpu) {
     GLsizei height = ARG6;
     GLenum format = ARG7;
     GLenum type = ARG8;
+#ifdef __EMSCRIPTEN__
+    if (format == VNBOX_GL_BGRX_TO_RGBA || format == VNBOX_GL_BGRA_TO_RGBA) {
+        texSubImage2DFromGuestBgra(cpu, target, level, xoffset, yoffset, width, height, format, ARG9);
+        return;
+    }
+#endif
     const GLvoid* pixels = PIXEL_UNPACK_BUFFER() ? (GLvoid*)pARG9 : marshalPixels(cpu, target == GL_TEXTURE_3D ? 3 : 2, width, height, 1, format, type, ARG9, xoffset, yoffset, level);
 
     GL_LOG("glTexSubImage2D GLenum target=%x, GLint level=%d, GLint xoffset=%d, GLint yoffset=%d, GLsizei width=%d, GLsizei height=%d, GLenum format=%x, GLenum type=%x, const GLvoid* pixels=%x", ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, ARG7, ARG8, ARG9);

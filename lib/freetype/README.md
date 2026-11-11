@@ -22,7 +22,9 @@ Checked (2026-11): the root fs `libfreetype.so.6` (run natively, 32-bit, with th
 native `gcc -m32 -mno-sse -mno-sse2` build of these sources and flags, and the wasm objects of this build (under node)
 print identical lines for jp.zip's IPA fonts (ipag, ipagp, ipam, ipamp: all 12728 glyphs each) and the root fs's
 Liberation and Wine fonts (.ttf and .fon). Without `FT_CONFIG_OPTION_SUBPIXEL_RENDERING` LCD glyphs differ; with SSE2
-some gray pixels differ by one.
+some gray pixels differ by one. With `EMBOLDEN=1` (win32u's fake bold, `FT_Outline_Embolden` first; checked 2026-11, every
+2nd glyph of ipag, ipamp, Liberation Sans/Serif Bold/Mono, Tahoma, Tahoma Bold, Marlett, Symbol) the root fs library,
+the native `-m32` build and a wasm build of these sources and flags print identical lines too.
 
     gcc -m32 -Ifreetype-2.11.1/include ftcompare.c -o ftcompare -ldl
     LD_LIBRARY_PATH=<dir with the root fs libfreetype.so.6, libz.so.1, libpng16.so.16> ./ftcompare <that dir>/libfreetype.so.6 fonts... > a.txt

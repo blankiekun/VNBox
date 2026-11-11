@@ -111,11 +111,11 @@ test('showing the page wakes an idle wait', async () => {
 });
 
 // The bug: Firefox gives a display:none iframe no frames with document.hidden false: without the limit the guest stops for good.
-test('a frame that never comes ends the wait at 100 ms, and no tick waits again until a frame comes', async () => {
+test('a frame that never comes ends the wait at 24 ms, and no tick waits again until a frame comes', async () => {
     const b = browser();
     await b.advance(20);
     await b.finish(-1);
-    await b.advance(99);
+    await b.advance(23);
     assert.equal(b.ticks.length, 1);
     await b.advance(1);
     assert.equal(b.ticks.length, 2);

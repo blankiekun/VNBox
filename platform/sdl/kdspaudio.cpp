@@ -40,6 +40,7 @@ extern "C" {
     int bw_audio_open(int channels, int rate, int targetFrames);
     int bw_audio_status(int id);
     U32 bw_audio_queued(int id);
+    U32 bw_audio_starved(int id);
     int bw_audio_queue(int id, const void* pcm, int frames);
     void bw_audio_close(int id, int drain);
     void bw_audio_shutdown();
@@ -198,6 +199,13 @@ public:
 			// One main-thread round trip returns queued frames or a failure.
 			S32 queued = bw_audio_status(this->webDevice);
 			this->webFailed = queued < 0;
+			if (vnboxStats.on && queued >= 0 && this->want.freq) { // the worklet path's share of [stats] audio
+				double ms = 1000.0 * queued / this->want.freq;
+				if (vnboxStats.audioQueuedMinMs < 0 || ms < vnboxStats.audioQueuedMinMs) vnboxStats.audioQueuedMinMs = ms;
+				U32 starved = bw_audio_starved(this->webDevice);
+				if (this->webStarvedSeen != 0xffffffff) vnboxStats.audioUnderruns += starved - this->webStarvedSeen;
+				this->webStarvedSeen = starved;
+			}
 			U32 frames = KDspAudioMath::getGuestVisibleQueuedFrames(queued < 0 ? 0 : (U32)queued, this->want.freq);
 			return frames * this->want.channels * bytesPerSampleWant();
 		}
@@ -318,6 +326,7 @@ public:
 	// Keep the negotiated OSS geometry even if output falls back to SDL.
 	bool useWorkletBufferLayout = false;
 	int webDevice = 0;
+	U32 webStarvedSeen = 0xffffffff; // the worklet's starvation count at the last [stats] read, none yet
 	bool webFailed = false;
 	U32 maxFragments = 0;
 	// SDL path: output in the device format, pulled by sdlCallback (one ScriptProcessor period at a time)
@@ -532,6 +541,7 @@ void KDspAudioSdl::openAudio(U32 format, U32 freq, U32 channels) {
 	this->preferWorklet = this->preferWorklet && bw_audio_available();
 	if (this->preferWorklet) {
 		this->webFailed = false;
+		this->webStarvedSeen = 0xffffffff;
 		this->webDevice = bw_audio_open(channels, freq,
 			getWriteCapacityWant() / (bytesPerSampleWant() * channels));
 		this->preferWorklet = this->webDevice != 0;

@@ -6,7 +6,7 @@
 # kernel headers (6.8) lack it, so it never uses ntsync. With the header, both still fall back to
 # wineserver waits when /dev/ntsync can't be opened, as now.
 # Same source, patches (tools/buildWine/wine_builds.json's 11.0 patches), compiler and flags as the
-# root fs, plus vn/wine/ntdll-*.patch (cheaper yields, sleeps and timed-out waits).
+# root fs, plus vn/wine/ntdll-*.patch (cheaper yields, sleeps and timed-out waits, and NtCurrentTeb).
 # With NTSYNC=0 (no header) and NTDLL_PATCHES=0, both files are byte-identical to the root fs's (v0.1.3).
 # Wine is LGPL-2.1: build-jp-overlay.sh ships the source notes. Needs Docker.
 # Usage: vn/build-wine-ntsync.sh <out dir>  (writes ntdll.so, wineserver and patches/, the root fs patches applied)
