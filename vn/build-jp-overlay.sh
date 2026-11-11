@@ -102,7 +102,8 @@ printf 'wineboot.exe.so, explorer.exe.so, quartz.dll.so and dsound.dll.so in opt
 # ntsync: the root fs's ntdll.so and wineserver rebuilt with linux/ntsync.h, so event, mutex and
 # semaphore waits skip wineserver once the kernel has /dev/ntsync (falls back to the server without).
 # ntdll also gets vn/wine/ntdll-*.patch: Sleep(n > 0) and timed-out waits no longer yield, a yield (Sleep(0), empty
-# PeekMessage) skips its two getrusage calls, and SleepEx(n, TRUE) waits on the thread's ntsync alert, not wineserver.
+# PeekMessage) skips its two getrusage calls, SleepEx(n, TRUE) waits on the thread's ntsync alert, not wineserver,
+# and NtCurrentTeb reads a __thread variable instead of calling pthread_getspecific.
 "$here/build-wine-ntsync.sh" "$work/ntsync"
 mv "$work/ntsync/ntdll.so" "$work/opt/wine/lib/wine/i386-unix/"
 mkdir -p "$work/opt/wine/bin"
