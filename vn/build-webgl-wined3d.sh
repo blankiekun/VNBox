@@ -39,7 +39,7 @@ if [ "${WEBGL_FIX:-1}" != 0 ]; then
   for p in "$here"/webgl/*.patch; do cp "$p" "$work/patches/900-$(basename "$p")"; done
 fi
 mkdir -p "$out"
-docker run --rm -v "$work:/w" -v "$out:/out" -e HOST_UID="$(id -u)" -e JOBS="${JOBS:-$(nproc)}" ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c bash -euo pipefail -c '
+docker run --rm --network host -v "$work:/w" -v "$out:/out" -e HOST_UID="$(id -u)" -e JOBS="${JOBS:-$(nproc)}" ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c bash -euo pipefail -c '
   apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     gcc-multilib gcc-mingw-w64-i686 binutils-mingw-w64-i686 flex bison make xz-utils patch >/dev/null
   # Under /usr/src/wine, the path -ffile-prefix-map gives the upstream build.
