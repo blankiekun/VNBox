@@ -242,7 +242,8 @@ enum : U32 {
     HOST_VORBIS = HOST_CLOCK + 3, // + VB_*: libvorbis.dll's decode exports (hostvorbis.cpp)
     HOST_FREETYPE = HOST_VORBIS + 32, // + FTH_*: libfreetype.so.6's exports win32u uses (hostfreetype.cpp)
     HOST_DIBDRV = HOST_FREETYPE + 32, // + entry: win32u.so's DIB primitives (hostdibdrv.cpp)
-    HOST_GLYPHM = 0x1000 // + GM_*: win32u.so's text measuring (hostglyphm.cpp)
+    HOST_GLYPHM = 0x1000, // + GM_*: win32u.so's text measuring (hostglyphm.cpp)
+    HOST_DSOUND = 0x1100 // + DS_*: dsound.dll.so's mix loops (hostdsound.cpp)
 };
 static const char* const hostLibcNames[LIBC_COUNT] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
@@ -252,6 +253,9 @@ static const char* const hostLibcNames[LIBC_COUNT] = {
 U32 hostFreetypeFnId(const char* name); // hostfreetype.cpp
 bool hostFreetypeEnabled();
 bool hostFreetypeRun(CPU* cpu, U32 fn);
+U32 hostDsoundFnId(const char* name); // hostdsound.cpp
+bool hostDsoundEnabled();
+bool hostDsoundRun(CPU* cpu, U32 fn);
 U32 hostLibcFnId(const char* name);
 static bool hostLibcEnabled() {
 #ifdef __EMSCRIPTEN__
@@ -278,6 +282,7 @@ struct HostElfLib {
 static HostElfLib hostElfLibs[] = {
     { "/libc.so.6", false, 0, hostLibcFnId, hostLibcEnabled, {}, {}, {} }, // LIBC_*
     { "/libfreetype.so.6", true, HOST_FREETYPE - 1, hostFreetypeFnId, hostFreetypeEnabled, {}, {}, {} },
+    { "/dsound.dll.so", false, HOST_DSOUND - 1, hostDsoundFnId, hostDsoundEnabled, {}, {}, {} }, // jp.zip's patched one
 };
 static std::atomic<bool> hostElfAny; // some table is ready
 static U8 hostLibcPageOffsets[K_PAGE_SIZE / 8]; // bit per page offset of an entry: getOp's cheap filter
@@ -607,6 +612,7 @@ static bool libcStrtol(KMemory* memory, U32 nptr, U32 endptr, S32 base, bool isS
 // above it); on success sets EAX and pops the return address into eip, as the function's `ret` would.
 // False (nothing changed) means the guest function has to run.
 bool hostLibcRun(CPU* cpu, U32 fn) {
+    if (fn >= HOST_DSOUND) return hostDsoundRun(cpu, fn - HOST_DSOUND);
     if (fn >= HOST_GLYPHM) return hostGlyphmRun(cpu, fn - HOST_GLYPHM);
     if (fn == HOST_ACM) return hostAcmRun(cpu);
     if (fn >= HOST_DIBDRV) return hostDibdrvRun(cpu, fn - HOST_DIBDRV);

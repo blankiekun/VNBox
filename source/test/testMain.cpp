@@ -35,6 +35,7 @@
 #include "cpu/testHostFreetype.h"
 #include "cpu/testHostDibdrv.h"
 #include "cpu/testHostGlyphm.h"
+#include "cpu/testHostDsound.h"
 #include "cpu/testHostWined3d.h"
 #include "opengl/testHostWined3dWgl.h"
 #include "cpu/testCMov.h"
@@ -951,6 +952,8 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostLibcHead, "Test a hooked export's head op does the call or goes on with the guest function"},
     {testHostLibcDeclines, "Test native libc leaves DF, segments, code, copy-on-write and unloaded pages to the guest"},
     {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
+    {testHostDsoundSameBytes, "Test host dsound convert/mix leave the bytes the guest functions do"},
+    {testHostDsoundDeclines, "Test host dsound convert/mix leave what they can't do to the guest"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostAcmBadFile, "Test a corrupt vorbis.acm can't make the host allocate gigabytes"},
