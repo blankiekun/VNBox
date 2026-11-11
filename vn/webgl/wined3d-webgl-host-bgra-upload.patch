@@ -1,0 +1,78 @@
+diff --git a/dlls/wined3d/texture_gl.c b/dlls/wined3d/texture_gl.c
+index bb75e26..2ff50f6 100644
+--- a/dlls/wined3d/texture_gl.c
++++ b/dlls/wined3d/texture_gl.c
+@@ -1898,13 +1898,49 @@ static bool wined3d_texture_gl_convert_webgl_row(enum wined3d_format_id format_i
+     return true;
+ }
+ 
++/* VNBox: WebGL can't take BGRA, and swizzling every row here runs as emulated x86, per pixel, on every present. The
++ * engine's glTexSubImage2D does it as host code when given these formats (source/opengl/glcommon.cpp). An engine that
++ * doesn't know them answers the query with NULL, and the rows are converted below as before. */
++#define VNBOX_GL_QUERY_HOST_BGRA_UPLOAD 0x56420000
++#define VNBOX_GL_BGRX_TO_RGBA 0x56420001 /* alpha becomes 0xff */
++#define VNBOX_GL_BGRA_TO_RGBA 0x56420002
++
++static GLenum wined3d_texture_gl_webgl_host_format(enum wined3d_format_id format_id,
++        const struct wined3d_gl_info *gl_info)
++{
++    static int host_upload = -1;
++
++    if (host_upload < 0)
++    {
++        host_upload = !!gl_info->gl_ops.gl.p_glGetString(VNBOX_GL_QUERY_HOST_BGRA_UPLOAD);
++        /* The GL_INVALID_ENUM of an engine that doesn't know the query. */
++        while (gl_info->gl_ops.gl.p_glGetError());
++    }
++    if (!host_upload)
++        return 0;
++
++    switch (format_id)
++    {
++        case WINED3DFMT_B8G8R8X8_UNORM:
++        case WINED3DFMT_B8G8R8X8_UNORM_SRGB:
++            return VNBOX_GL_BGRX_TO_RGBA;
++
++        case WINED3DFMT_B8G8R8A8_UNORM:
++        case WINED3DFMT_B8G8R8A8_UNORM_SRGB:
++            return VNBOX_GL_BGRA_TO_RGBA;
++
++        default:
++            return 0;
++    }
++}
++
+ static bool wined3d_texture_gl_upload_webgl_converted(const struct wined3d_format *src_format,
+         GLenum target, unsigned int level, unsigned int src_row_pitch, unsigned int src_slice_pitch,
+         unsigned int dst_x, unsigned int dst_y, unsigned int dst_z, unsigned int update_w,
+         unsigned int update_h, unsigned int update_d, const BYTE *addr, const struct wined3d_gl_info *gl_info)
+ {
+     unsigned int y, z, upload_components, upload_row_pitch;
+-    GLenum upload_format, upload_type;
++    GLenum upload_format, upload_type, host_format;
+     uint8_t *upload;
+ 
+     if (!wined3d_texture_gl_get_webgl_upload_format(src_format, &upload_format, &upload_type))
+@@ -1931,6 +1967,22 @@ static bool wined3d_texture_gl_upload_webgl_converted(const struct wined3d_forma
+     if (target == GL_TEXTURE_1D || target == GL_TEXTURE_1D_ARRAY)
+         return false;
+ 
++    if (update_d == 1 && target != GL_TEXTURE_2D_ARRAY && target != GL_TEXTURE_3D
++            && !(src_row_pitch % 4) && src_row_pitch >= update_w * 4
++            && (host_format = wined3d_texture_gl_webgl_host_format(src_format->id, gl_info)))
++    {
++        gl_info->gl_ops.gl.p_glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++        if (src_row_pitch != update_w * 4)
++            gl_info->gl_ops.gl.p_glPixelStorei(GL_UNPACK_ROW_LENGTH, src_row_pitch / 4);
++        gl_info->gl_ops.gl.p_glTexSubImage2D(target, level, dst_x, dst_y, update_w, update_h,
++                host_format, GL_UNSIGNED_BYTE, addr);
++        if (src_row_pitch != update_w * 4)
++            gl_info->gl_ops.gl.p_glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++        gl_info->gl_ops.gl.p_glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++        checkGLcall("Upload WebGL texture data");
++        return true;
++    }
++
+     upload_row_pitch = update_w * upload_components;
+     if (!(upload = malloc(upload_row_pitch * update_h)))
+     {
