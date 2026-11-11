@@ -12,8 +12,8 @@
 #if defined(__TEST) && defined(BOXEDWINE_HOST_FREETYPE)
 
 // Host FreeType (hostfreetype.cpp): the calls win32u makes on a font (FT_New_Memory_Face on the guest's copy of the
-// file, FT_Set_Pixel_Sizes, FT_Set_Charmap, FT_Load_Glyph with its GGO load flags, then FT_Outline_Translate as guest
-// code on the mirrored outline and FT_Outline_Get_Bitmap / FT_Render_Glyph) must leave in guest memory what host
+// file, FT_Set_Pixel_Sizes, FT_Set_Charmap, FT_Load_Glyph with its GGO load flags, FT_Outline_EmboldenXY for a fake
+// bold font, then FT_Outline_Translate as guest code on the mirrored outline and FT_Outline_Get_Bitmap / FT_Render_Glyph) must leave in guest memory what host
 // FreeType gives for the same calls on its own face: face fields, size metrics, glyph metrics, outline arrays, bitmaps.
 // Catches a mirror field at the wrong offset, a pointer left pointing at host memory, a slot not synced after a call,
 // a render that ignores the guest's moved points, and calls on objects the host doesn't own being taken.
@@ -159,6 +159,13 @@ void testHostFreetypeGlyphs() {
                         !memory->memcmp(gaddr(gs.outline.contours), wo.contours, wo.n_contours * 2), "outline", g, ppem, flags);
                 }
                 if (ws->format != FT_GLYPH_FORMAT_OUTLINE || !wo.n_points) continue;
+                if (li < 2) { // fake bold, as freetype.c's get_bold_glyph_outline (FT_Outline_Embolden is EmboldenXY(s, s)); mono: x only
+                    FT_Pos xs = FT_MulDiv(ppem, 1 << 6, 24), ys = li == 0 ? 0 : xs;
+                    FT_Error eerr = FT_Outline_EmboldenXY(&wo, xs, ys);
+                    if (!call("FT_Outline_EmboldenXY", { slot + (U32)offsetof(FT_GlyphSlotRec, outline), (U32)xs, (U32)ys }) || EAX != (U32)eerr)
+                        testFail("FT_Outline_EmboldenXY result");
+                    expect(!memory->memcmp(gaddr(gs.outline.points), wo.points, wo.n_points * sizeof(FT_Vector)), "emboldened outline", g, ppem, flags);
+                }
                 FT_BBox bb;
                 FT_Outline_Get_CBox(&wo, &bb);
                 bb.xMin &= ~63; bb.yMin &= ~63; bb.xMax = (bb.xMax + 63) & ~63; bb.yMax = (bb.yMax + 63) & ~63;
@@ -200,6 +207,20 @@ void testHostFreetypeGlyphs() {
     }
     if (glyphs < 1000) testFail("only %u glyphs compared", glyphs);
 
+    // FT_Outline_EmboldenXY trusts the contour ends: an outline FT_Outline_Check rejects is the guest's, an empty one the host's.
+    const U32 badPoints = heap + 0x3800, badContours = heap + 0x3900;
+    FT_Outline bad = {};
+    bad.n_points = 4;
+    bad.n_contours = 1;
+    bad.points = (FT_Vector*)(uintptr_t)badPoints;
+    bad.contours = (short*)(uintptr_t)badContours;
+    memory->writew(badContours, 4000); // past the last point
+    memory->memcpy(outlineRec, &bad, sizeof(bad));
+    if (call("FT_Outline_EmboldenXY", { outlineRec, 64, 64 })) testFail("FT_Outline_EmboldenXY on a contour past the points taken");
+    FT_Outline empty = {};
+    memory->memcpy(outlineRec, &empty, sizeof(empty));
+    if (!call("FT_Outline_EmboldenXY", { outlineRec, 64, 64 }) || EAX != (U32)FT_Outline_EmboldenXY(&empty, 64, 64)) testFail("FT_Outline_EmboldenXY on an empty outline");
+
     // A debug trap (hardware breakpoint set, or TF) doesn't change who owns a face. The mirror has no driver, so guest
     // FT_Load_Glyph would fault on driver->root.library and guest FT_Done_Face would fail and leak the host face.
     if (!call("FT_New_Memory_Face", { GUEST_LIB, font, (U32)data.size(), 0, aface }) || EAX) testFail("second FT_New_Memory_Face not done on the host");
@@ -217,6 +238,7 @@ void testHostFreetypeGlyphs() {
     // what is still open goes to the guest, whose functions are valid for it and step through its watched writes
     if (call("FT_New_Memory_Face", { GUEST_LIB, font, (U32)data.size(), 0, aface })) testFail("new face taken under a debug trap");
     if (call("FT_Outline_Get_Bitmap", { GUEST_LIB, tslot + (U32)offsetof(FT_GlyphSlotRec, outline), bitmapRec })) testFail("FT_Outline_Get_Bitmap taken under a debug trap");
+    if (call("FT_Outline_EmboldenXY", { tslot + (U32)offsetof(FT_GlyphSlotRec, outline), 64, 64 })) testFail("FT_Outline_EmboldenXY taken under a debug trap");
     cpu->debugTrapActive = false;
     if (call("FT_Load_Glyph", { face2, 1, 0 })) testFail("call on a face freed under a debug trap taken");
 
