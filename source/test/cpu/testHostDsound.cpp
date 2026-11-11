@@ -31,7 +31,7 @@ namespace {
 constexpr U32 DS_CONVERT = 0, DS_MIX = 1;
 constexpr U32 HEAP = TEST_HEAP_ADDRESS; // 32 RW pages (testCPU.cpp)
 constexpr U32 IN = HEAP, OUT = HEAP + 0x2000, SRC = HEAP + 0x4000, DST = HEAP + 0x6000, VOLS = HEAP + 0x8000;
-constexpr U32 SCALE = HEAP + 0x8100, DATA_END = HEAP + 0x8200, STACK = HEAP + 0x10000, RET = 0x12345678;
+constexpr U32 DATA_END = HEAP + 0x8200, SCALE = DATA_END, STACK = HEAP + 0x10000, RET = 0x12345678;
 constexpr U32 CONVERT_FN = TEST_CODE_ADDRESS + 0x1000, MIX_FN = TEST_CODE_ADDRESS + 0x1200;
 
 const U8 convertCode[] = { // vnbox_dsound_convert, 0x274c9 in that dsound.dll.so
