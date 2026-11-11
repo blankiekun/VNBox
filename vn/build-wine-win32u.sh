@@ -7,6 +7,7 @@
 # built against (it loads those libraries at run time; no Vulkan, as the web root fs has none).
 # win32u-dibdrv-export.patch exports the DIB primitive tables, which VNBox runs as host code (hostdibdrv.cpp).
 # win32u-glyphmetrics-export.patch exports what VNBox needs to answer cached text measuring as host code (hostglyphm.cpp).
+# win32u-monitor-map.patch skips the monitor lookup and float mapping of a polled cursor position when it maps to itself.
 # With WIN32U_PATCHES=0, win32u.so is byte-identical to the root fs's (v0.1.3, checked).
 # Wine is LGPL-2.1: build-jp-overlay.sh ships the patches. Needs Docker.
 # Usage: vn/build-wine-win32u.sh <out dir>  (writes win32u.so)
