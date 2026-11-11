@@ -428,6 +428,13 @@ addToLibrary({
     // Preserve one pthread round trip while distinguishing empty from failed.
     return device ? BoxedwineAudio.queued(device) : -1;
   },
+  // Times the worklet ran dry mid-stream, for [stats] (the device's own counter, never reset).
+  bw_audio_starved__deps: ['$BoxedwineAudio'],
+  bw_audio_starved__proxy: 'sync',
+  bw_audio_starved: (id) => {
+    const device = BoxedwineAudio.devices.get(id);
+    return device ? Atomics.load(device.control, 4) >>> 0 : 0;
+  },
   bw_audio_queued__deps: ['$BoxedwineAudio'],
   bw_audio_queued__proxy: 'sync',
   bw_audio_queued: (id) => {
