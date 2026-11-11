@@ -950,6 +950,8 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostHookPatchedExport, "Test a game's patch on a hooked export runs instead of the hook"},
     {testHostLibcHead, "Test a hooked export's head op does the call or goes on with the guest function"},
     {testHostLibcDeclines, "Test native libc leaves DF, segments, code, copy-on-write and unloaded pages to the guest"},
+    {testHostCrt, "Test native Wine CRT memcpy/memset/strlen/strstr/_strnicmp"},
+    {testHostCrtExports, "Test the Wine CRT exports are found in a builtin .dll.so"},
     {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
