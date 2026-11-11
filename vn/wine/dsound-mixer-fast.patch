@@ -20,7 +20,7 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
  
  	if ((pwfxe->Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT) || ((pwfxe->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE)
  	    && (IsEqualGUID(&pwfxe->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT))))
-@@ -277,9 +282,66 @@
+@@ -277,9 +282,78 @@
  {
      if (mixpos >= buflen && !(dsb->playflags & DSBPLAY_LOOPING))
          return 0.0f;
@@ -30,10 +30,38 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
      return dsb->get(dsb, buffer + (mixpos % buflen), channel);
  }
  
++/* VNBox: n frames of 16-bit PCM (s16) or float input from p, istride bytes apart, to out, ochannels
++ * floats apart: channels values per frame, then out[1] = out[0] when dup (mono to stereo, channels 1).
++ * A leaf with no other state, exported so that Boxedwine runs it as host code
++ * (source/emulation/cpu/normal/hostdsound.cpp, same results); this code is the fallback. */
++__attribute__((visibility("default"), noinline))
++void vnbox_dsound_convert(const BYTE *p, UINT istride, float *out, UINT ochannels, UINT n, UINT channels, BOOL s16, BOOL dup)
++{
++    UINT c;
++
++    if (s16 && channels == 2)
++        for (; n; n--, p += istride, out += ochannels)
++        {
++            out[0] = ((const SHORT *)p)[0] / (float)0x8000;
++            out[1] = ((const SHORT *)p)[1] / (float)0x8000;
++        }
++    else if (s16 && dup)
++        for (; n; n--, p += istride, out += ochannels)
++            out[0] = out[1] = *(const SHORT *)p / (float)0x8000;
++    else
++        for (; n; n--, p += istride, out += ochannels)
++        {
++            for (c = 0; c < channels; c++)
++                out[c] = s16 ? ((const SHORT *)p)[c] / (float)0x8000 : ((const float *)p)[c];
++            if (dup) out[1] = out[0];
++        }
++}
++
 +/* VNBox: under Boxedwine's x86 JIT every call costs far more than the work here, and the generic
 + * loops make two indirect calls (get, put) per sample. This converts the common cases (16-bit PCM
 + * or float input, same channel count or mono to stereo, plain store) in a call-free loop.
 + * Frames from..to-1 of the run starting at byte mixpos; same results as the generic loop.
++ * The per-sample work is in vnbox_dsound_convert.
 + * Returns FALSE (nothing done) for other formats. */
 +static BOOL cp_run_fast(IDirectSoundBufferImpl *dsb, BYTE *buffer, DWORD buflen, DWORD mixpos, UINT from, UINT to)
 +{
@@ -42,7 +70,6 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
 +    BOOL s16 = dsb->get == getbpp[1];
 +    BOOL dup = dsb->put == put_mono2stereo && dsb->put_aux == putieee32;
 +    float *out = dsb->device->tmp_buffer + from * ochannels;
-+    const BYTE *p;
 +
 +    if ((!s16 && dsb->get != getbpp[4]) || (dsb->put != putieee32 && !dup))
 +        return FALSE;
@@ -61,25 +88,10 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
 +        }
 +        n = (buflen - mixpos + istride - 1) / istride; /* frames before the end of the buffer */
 +        if (n > to - from) n = to - from;
-+        p = buffer + mixpos;
++        vnbox_dsound_convert(buffer + mixpos, istride, out, ochannels, n, channels, s16, dup);
 +        from += n;
 +        mixpos += n * istride;
-+        if (s16 && channels == 2)
-+            for (; n; n--, p += istride, out += ochannels)
-+            {
-+                out[0] = ((const SHORT *)p)[0] / (float)0x8000;
-+                out[1] = ((const SHORT *)p)[1] / (float)0x8000;
-+            }
-+        else if (s16 && dup)
-+            for (; n; n--, p += istride, out += ochannels)
-+                out[0] = out[1] = *(const SHORT *)p / (float)0x8000;
-+        else
-+            for (; n; n--, p += istride, out += ochannels)
-+            {
-+                for (c = 0; c < channels; c++)
-+                    out[c] = s16 ? ((const SHORT *)p)[c] / (float)0x8000 : ((const float *)p)[c];
-+                if (dup) out[1] = out[0];
-+            }
++        out += n * ochannels;
 +    }
 +    return TRUE;
 +}
@@ -87,7 +99,7 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
  static UINT cp_fields_noresample(IDirectSoundBufferImpl *dsb, UINT count)
  {
      UINT istride = dsb->pwfx->nBlockAlign;
-@@ -295,6 +357,13 @@
+@@ -295,6 +369,13 @@
          committed_samples = committed_samples <= count ? committed_samples : count;
      }
  
@@ -101,7 +113,7 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
      for (i = 0; i < committed_samples; i++)
          for (channel = 0; channel < dsb->mix_channels; channel++)
              dsb->put(dsb, i * ostride, channel, get_current_sample(dsb, dsb->committedbuff,
-@@ -387,7 +456,10 @@
+@@ -387,7 +468,10 @@
              float* cache = &intermediate[channel * required_input + ipos];
              for (j = 0; j < fir_used; j++)
                  sum += fir_copy[j] * cache[j];
@@ -113,3 +125,75 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
          }
      }
  
+@@ -479,11 +563,27 @@
+ 	}
+ }
+ 
+-static void DSOUND_MixerVol(const IDirectSoundBufferImpl *dsb, INT frames)
++/* VNBox: DSOUND_MixerVol's multiply then mixieee32 (the same operations in the same order) as one leaf with
++ * no other state, exported so that Boxedwine runs it as host code (source/emulation/cpu/normal/hostdsound.cpp,
++ * same results); this code is the fallback. vols NULL: no volume. */
++__attribute__((visibility("default"), noinline))
++void vnbox_dsound_mix(float *src, float *dst, UINT frames, UINT channels, const float *vols)
++{
++	UINT i, chan;
++
++	if (vols)
++		for (i = 0; i < frames; ++i)
++			for (chan = 0; chan < channels; ++chan)
++				src[i * channels + chan] *= vols[chan];
++	for (i = 0; i < frames * channels; ++i)
++		dst[i] += src[i];
++}
++
++/* VNBox: fills vols and returns TRUE when the volume applies; vnbox_dsound_mix multiplies */
++static BOOL DSOUND_MixerVol(const IDirectSoundBufferImpl *dsb, INT frames, float *vols)
+ {
+ 	INT	i;
+-	float vols[DS_MAX_CHANNELS];
+-	UINT channels = dsb->device->pwfx->nChannels, chan;
++	UINT channels = dsb->device->pwfx->nChannels;
+ 
+ 	TRACE("(%p,%d)\n",dsb,frames);
+ 	TRACE("left = %lx, right = %lx\n", dsb->volpan.dwTotalAmpFactor[0],
+@@ -492,22 +592,17 @@
+ 	if ((!(dsb->dsbd.dwFlags & DSBCAPS_CTRLPAN) || (dsb->volpan.lPan == 0)) &&
+ 	    (!(dsb->dsbd.dwFlags & DSBCAPS_CTRLVOLUME) || (dsb->volpan.lVolume == 0)) &&
+ 	     !(dsb->dsbd.dwFlags & DSBCAPS_CTRL3D))
+-		return; /* Nothing to do */
++		return FALSE; /* Nothing to do */
+ 
+ 	if (channels > DS_MAX_CHANNELS)
+ 	{
+ 		FIXME("There is no support for %u channels\n", channels);
+-		return;
++		return FALSE;
+ 	}
+ 
+ 	for (i = 0; i < channels; ++i)
+ 		vols[i] = dsb->volpan.dwTotalAmpFactor[i] / ((float)0xFFFF);
+-
+-	for(i = 0; i < frames; ++i){
+-		for(chan = 0; chan < channels; ++chan){
+-			dsb->device->tmp_buffer[i * channels + chan] *= vols[chan];
+-		}
+-	}
++	return TRUE;
+ }
+ 
+ /**
+@@ -536,10 +631,11 @@
+ 	ibuf = dsb->device->tmp_buffer;
+ 
+ 	if (secondarybuffer_is_audible(dsb)) {
+-		/* Apply volume if needed */
+-		DSOUND_MixerVol(dsb, frames);
++		float vols[DS_MAX_CHANNELS];
+ 
+-		mixieee32(ibuf, mix_buffer, frames * dsb->device->pwfx->nChannels);
++		/* Apply volume if needed, and mix */
++		vnbox_dsound_mix(ibuf, mix_buffer, frames, dsb->device->pwfx->nChannels,
++				DSOUND_MixerVol(dsb, frames, vols) ? vols : NULL);
+ 	}
+ 
+ 	/* check for notification positions */

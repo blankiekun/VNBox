@@ -344,8 +344,9 @@ bool doMainLoop() {
     // A hidden page gets no frames: the guest and audio keep running, nothing is drawn (vnbox_set_hidden),
     // a tick waiting for a frame goes on at once, and the next tick once visible draws the latest frame.
     // Firefox also stops frames in a display:none iframe, with document.hidden still false (a wrapper minimizing its
-    // window). A frame not there after 100 ms ends the wait, and no tick waits again until a frame comes: not pacing,
-    // the guest runs flat out then, this only removes a wait that may never end.
+    // window). A frame not there after 24 ms (a frame and a half at 60 Hz) ends the wait, and no tick waits again until a
+    // frame comes: not pacing, the guest runs flat out then, this only removes a wait that may never end. It was 100 ms:
+    // a browser 2-4 frames late (34-63 ms seen) held the guest that long, and the audio worklet holds about 30-40 ms.
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
@@ -377,7 +378,7 @@ bool doMainLoop() {
             if (delay >= 0) wait(delay);
             else if (!document.hidden && !noFrames && performance.now() - lastFrame > 12) {
                 raf = requestAnimationFrame(framed);
-                rafLate = setTimeout(function() { noFrames = true; cancelAnimationFrame(raf); framed(); }, 100);
+                rafLate = setTimeout(function() { noFrames = true; cancelAnimationFrame(raf); framed(); }, 24);
             }
             else post();
         }, function(e) {

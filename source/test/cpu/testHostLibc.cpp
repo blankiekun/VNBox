@@ -23,6 +23,8 @@
 #endif
 
 U32 hostLibcFnId(const char* name);
+U32 hostCrtFnId(const char* name);
+std::vector<std::pair<U64, U32>> hostCrtParseTest(KFile* file);
 bool hostLibcRun(CPU* cpu, U32 fn);
 bool hostClockRun(CPU* cpu, U32 fn); // hostclock.cpp, fn: 1 NtQueryPerformanceCounter, 2 NtQuerySystemTime, 3 RtlGetSystemTimePrecise
 
@@ -49,8 +51,9 @@ void setup() {
 }
 
 // Calls fn(a0, a1, a2) the way a guest `call` arrives; checks the registers for a done or a declined call.
-U32 call(const char* name, U32 a0, U32 a1, U32 a2, bool expectNative, U32 eip = 0x1000) {
-    U32 fn = hostLibcFnId(name);
+// crt: the Wine CRT DLLs' export of that name (hostCrtFnId), not glibc's.
+U32 call(const char* name, U32 a0, U32 a1, U32 a2, bool expectNative, U32 eip = 0x1000, bool crt = false) {
+    U32 fn = crt ? hostCrtFnId(name) : hostLibcFnId(name);
     if (!fn) testFail("%s is not a wrapped function", name);
     ESP = STACK;
     memory->writed(STACK, RET);
@@ -530,6 +533,140 @@ void testHostLibcDeclines() {
     call("memcpy", DST, MAPPED, 16, true); // reading it is fine
     expect("read from a copy-on-write page", memory->readb(DST + 8), 0x33);
     memory->unmap(MAPPED, 2 * K_PAGE_SIZE);
+}
+
+// Wine's CRT DLLs (dlls/msvcrt/string.c) must give what that code gives. Catches: memcpy copying forward over an overlap (msvcrt's
+// memcpy is memmove, glibc's here is rep movsb), strstr missing a match a naive restart skips, not taking the first match, reading
+// past a page or the haystack for an empty needle, _strnicmp folding to upper case ('[' sorts after 'A' that way) or comparing
+// past n or the terminator, and every case its locale branch or invalid parameter handler decides left to the guest.
+void testHostCrt() {
+    setup();
+    auto crt = [](const char* name, U32 a0, U32 a1, U32 a2, bool expectNative) { return call(name, a0, a1, a2, expectNative, 0x1000, true); };
+    U8 ref[64], got[64];
+    for (int i = 0; i < 64; i++) ref[i] = (U8)(i + 1);
+    U32 src = HEAP + K_PAGE_SIZE - 20; // crosses into the next page
+    for (int shift : { 7, -7 }) {
+        memory->memcpy(src, ref, 64);
+        U32 dst = src + 8 + shift;
+        expect("memcpy result", crt("memcpy", dst, src + 8, 40, true), dst);
+        U8 want[64];
+        ::memcpy(want, ref, 64);
+        ::memmove(want + 8 + shift, want + 8, 40);
+        memory->memcpy(got, src, 64);
+        if (memcmp(got, want, 64)) testFail("CRT memcpy over an overlap (shift %d) is not memmove", shift);
+    }
+    expect("memset", crt("memset", HEAP + 0x40, 0x1CC, 3, true), HEAP + 0x40);
+    expect("memset byte", memory->readb(HEAP + 0x42), 0xCC);
+
+    U32 s = HEAP + K_PAGE_SIZE - 5;
+    memory->strcpy(s, "hello, world");
+    expect("strlen", crt("strlen", s, 0, 0, true), 12);
+    memory->strcpy(HEAP + 0x100, "o, w");
+    memory->strcpy(HEAP + 0x110, "world");
+    memory->strcpy(HEAP + 0x120, "worlds");
+    memory->strcpy(HEAP + 0x130, "o");
+    expect("strstr across pages", crt("strstr", s, HEAP + 0x100, 0, true), s + 4);
+    expect("strstr at the end", crt("strstr", s, HEAP + 0x110, 0, true), s + 7);
+    expect("strstr first match", crt("strstr", s, HEAP + 0x130, 0, true), s + 4);
+    expect("strstr past the terminator", crt("strstr", s, HEAP + 0x120, 0, true), 0);
+    expect("strstr empty needle", crt("strstr", UNMAPPED, HEAP + 0x200, 0, true), UNMAPPED); // the haystack isn't read
+    memory->strcpy(HEAP + 0x300, "abcabcabd");
+    memory->strcpy(HEAP + 0x320, "abcabd");
+    expect("strstr partial match restart", crt("strstr", HEAP + 0x300, HEAP + 0x320, 0, true), HEAP + 0x303);
+    memory->strcpy(HEAP + 0x340, "aaaaab");
+    memory->strcpy(HEAP + 0x360, "aaab");
+    expect("strstr repeated prefix", crt("strstr", HEAP + 0x340, HEAP + 0x360, 0, true), HEAP + 0x342);
+    expect("strstr empty haystack", crt("strstr", HEAP + 0x200, HEAP + 0x360, 0, true), 0);
+    memory->memset(LAST_PAGE + K_PAGE_SIZE - 16, 'a', 16);
+    crt("strstr", LAST_PAGE + K_PAGE_SIZE - 16, HEAP + 0x110, 0, false); // the haystack runs into the unmapped page
+    crt("strstr", HEAP + 0x300, LAST_PAGE + K_PAGE_SIZE - 16, 0, false); // so does the needle
+
+    memory->strcpy(HEAP + 0x400, "Hello[");
+    memory->strcpy(HEAP + 0x410, "hELLOa");
+    memory->strcpy(HEAP + 0x420, "hELLO");
+    memory->strcpy(HEAP + 0x430, "ab\x82");
+    memory->strcpy(HEAP + 0x440, "ax\x82");
+    memory->strcpy(HEAP + 0x450, "ay\x82");
+    expect("_strnicmp equal", crt("_strnicmp", HEAP + 0x400, HEAP + 0x410, 5, true), 0);
+    expect("_strnicmp lowers", crt("_strnicmp", HEAP + 0x400, HEAP + 0x410, 6, true), (U32)('[' - 'a'));
+    expect("_strnicmp terminator", crt("_strnicmp", HEAP + 0x420, HEAP + 0x400, 100, true), (U32)-'[');
+    expect("_strnicmp n=0", crt("_strnicmp", 0, 0, 0, true), 0);
+    expect("_strnicmp stops at n", crt("_strnicmp", HEAP + 0x430, HEAP + 0x430, 2, true), 0);
+    expect("_strnicmp stops at a difference", crt("_strnicmp", HEAP + 0x440, HEAP + 0x450, 3, true), (U32)-1);
+    crt("_strnicmp", HEAP + 0x430, HEAP + 0x430, 3, false); // a byte from 0x80: the locale's tables decide
+    crt("_strnicmp", 0, HEAP + 0x400, 3, false);          // NULL: the invalid parameter handler
+    crt("_strnicmp", HEAP + 0x400, 0, 3, false);
+    crt("_strnicmp", HEAP + 0x400, HEAP + 0x410, 0x80000000, false); // count > INT_MAX: the same, from msvcr80 on
+    crt("_strnicmp", LAST_PAGE + K_PAGE_SIZE - 16, LAST_PAGE + K_PAGE_SIZE - 16, 100, false); // runs into the unmapped page
+
+    cpu->flags |= DF; // the shared gate (testHostLibcDeclines) holds for these too
+    memory->memcpy(src, ref, 64);
+    crt("memcpy", src + 1, src, 16, false);
+    crt("strstr", s, HEAP + 0x100, 0, false);
+    cpu->flags &= ~DF;
+    memory->memcpy(got, src, 64);
+    if (memcmp(got, ref, 64)) testFail("a declined CRT memcpy changed memory");
+}
+
+// Catches: the CRT exports looked for in .dynsym (Wine's builtins have none there), a function address read as an RVA from the
+// NT header (it is the ELF address) or mapped to a file offset without its section's address-offset gap, a forwarder or a
+// function that isn't wrapped taken, and an ordinal past the function table read. A made-up builtin, laid out like winebuild's.
+void testHostCrtExports() {
+    constexpr U32 TEXT = 0x1000, DATA_OFFSET = 0x2000, DATA = 0x3000, PE_NT = DATA, EXPORTS = 0x100, SH = 0x2a00;
+    std::vector<U8> f(SH + 5 * 40);
+    auto put32 = [&](U32 at, U32 v) { for (int i = 0; i < 4; i++) f[at + i] = (U8)(v >> (i * 8)); };
+    auto put16 = [&](U32 at, U32 v) { f[at] = (U8)v; f[at + 1] = (U8)(v >> 8); };
+    auto data = [&](U32 rva) { return DATA_OFFSET + rva; }; // file offset of an RVA from the NT header
+    ::memcpy(&f[0], "\x7f" "ELF\x01\x01", 6);
+    put16(18, 3); // EM_386
+    put32(32, SH);
+    put16(46, 40);
+    put16(48, 5);
+    auto section = [&](U32 i, U32 type, U32 flags, U32 addr, U32 offset, U32 size, U32 link) {
+        U32 s = SH + i * 40;
+        put32(s + 4, type); put32(s + 8, flags); put32(s + 12, addr); put32(s + 16, offset); put32(s + 20, size); put32(s + 24, link);
+    };
+    section(1, 1, 6, TEXT, TEXT, 0x100, 0);               // .text: SHF_ALLOC | SHF_EXECINSTR
+    section(2, 1, 3, DATA, DATA_OFFSET, 0x800, 0);        // .data, 0x1000 above its file offset like the real ones
+    section(3, 11, 2, 0x200, 0x2800, 32, 4);              // .dynsym: the null symbol, __wine_spec_nt_header
+    section(4, 3, 2, 0x300, 0x2900, 23, 0);               // .dynstr
+    ::memcpy(&f[0x2901], "__wine_spec_nt_header", 21);
+    put32(0x2810, 1);
+    put32(0x2814, PE_NT);
+    put16(0x281e, 2);
+    put32(data(0), 0x4550);
+    put16(data(24), 0x10b);
+    put32(data(24 + 96), EXPORTS);
+    put32(data(24 + 100), 0x200);
+    const char* names[] = { "memcpy", "_strnicmp", "strstr", "strcmp", "memset" };
+    const U32 functions[] = { TEXT + 0x10, TEXT + 0x20, DATA + 0x2c0, TEXT + 0x30 }; // strstr: a forwarder's string in .data
+    put32(data(EXPORTS + 20), 4);
+    put32(data(EXPORTS + 24), 5);
+    put32(data(EXPORTS + 28), EXPORTS + 0x28);
+    put32(data(EXPORTS + 32), EXPORTS + 0x40);
+    put32(data(EXPORTS + 36), EXPORTS + 0x60);
+    U32 name = EXPORTS + 0x80;
+    for (U32 i = 0; i < 5; i++) {
+        if (i < 4) put32(data(EXPORTS + 0x28 + i * 4), functions[i]);
+        put32(data(EXPORTS + 0x40 + i * 4), name);
+        put16(data(EXPORTS + 0x60 + i * 2), i); // memset's ordinal 4 is past the 4 functions
+        ::memcpy(&f[data(name)], names[i], strlen(names[i]) + 1);
+        name += (U32)strlen(names[i]) + 1;
+    }
+    KProcessPtr process = testContext().process;
+    U32 fd = process->memfd_create(B("hostcrt-test"), 0);
+    if ((S32)fd < 0) testFail("memfd_create failed");
+    std::shared_ptr<KFile> file = std::dynamic_pointer_cast<KFile>(process->getFileDescriptor(fd)->kobject);
+    if (file->pwriteNative(f.data(), 0, (U32)f.size()) != (U32)f.size()) testFail("file write failed");
+    std::vector<std::pair<U64, U32>> entries = hostCrtParseTest(file.get());
+    process->close(fd);
+    expect("exports found", (U32)entries.size(), 2);
+    if (entries.size() == 2) {
+        expect("memcpy offset", (U32)entries[0].first, TEXT + 0x10);
+        expect("memcpy is memmove", entries[0].second, hostLibcFnId("memmove"));
+        expect("_strnicmp offset", (U32)entries[1].first, TEXT + 0x20);
+        expect("_strnicmp", entries[1].second, hostCrtFnId("_strnicmp"));
+    }
 }
 
 // Catches: a Frida hook (bw_hook_add) under TF raising SIGILL, the hook not firing, or more than the one op running: the audit's

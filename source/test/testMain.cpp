@@ -35,6 +35,7 @@
 #include "cpu/testHostFreetype.h"
 #include "cpu/testHostDibdrv.h"
 #include "cpu/testHostGlyphm.h"
+#include "cpu/testHostDsound.h"
 #include "cpu/testHostWined3d.h"
 #include "opengl/testHostWined3dWgl.h"
 #include "cpu/testCMov.h"
@@ -950,13 +951,18 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostHookPatchedExport, "Test a game's patch on a hooked export runs instead of the hook"},
     {testHostLibcHead, "Test a hooked export's head op does the call or goes on with the guest function"},
     {testHostLibcDeclines, "Test native libc leaves DF, segments, code, copy-on-write and unloaded pages to the guest"},
+    {testHostCrt, "Test native Wine CRT memcpy/memset/strlen/strstr/_strnicmp"},
+    {testHostCrtExports, "Test the Wine CRT exports are found in a builtin .dll.so"},
     {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
+    {testHostDsoundSameBytes, "Test host dsound convert/mix leave the bytes the guest functions do"},
+    {testHostDsoundDeclines, "Test host dsound convert/mix leave what they can't do to the guest"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostAcmBadFile, "Test a corrupt vorbis.acm can't make the host allocate gigabytes"},
     {testHostAcmBadSource, "Test a bad source length can't make the host allocate gigabytes"},
     {testHostVorbisDecode, "Test native libvorbis decode"},
     {testHostVorbisSeek, "Test native libvorbis restart, trackonly and a second stream on the same objects"},
+    {testHostVorbisPack16, "Test native libvorbisfile ov_read pack"},
 #endif
 #ifdef BOXEDWINE_HOST_FREETYPE
     {testHostFreetypeGlyphs, "Test host FreeType faces and glyphs as win32u uses them"},

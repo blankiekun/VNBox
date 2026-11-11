@@ -12,5 +12,6 @@
 
 void testHostVorbisDecode();
 void testHostVorbisSeek();
+void testHostVorbisPack16();
 
 #endif
