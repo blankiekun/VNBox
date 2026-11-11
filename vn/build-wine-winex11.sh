@@ -44,7 +44,7 @@ if [ "${WINEX11_PATCHES:-1}" != 0 ]; then
   for p in "$here"/wine/winex11-*.patch; do cp "$p" "$work/patches/900-$(basename "$p")"; done
 fi
 mkdir -p "$out"
-docker run --rm -v "$work:/w" -v "$out:/out" -e HOST_UID="$(id -u)" ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c bash -euo pipefail -c '
+docker run --rm --network host -v "$work:/w" -v "$out:/out" -e HOST_UID="$(id -u)" ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c bash -euo pipefail -c '
   dpkg --add-architecture i386 && apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     --no-install-recommends gcc-multilib libc6-dev:i386 flex bison make xz-utils patch pkg-config \
     libx11-dev:i386 libxext-dev:i386 libxrender-dev:i386 libxrandr-dev:i386 libxi-dev:i386 libxfixes-dev:i386 \
