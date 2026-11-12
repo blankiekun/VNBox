@@ -128,6 +128,7 @@ void testZipEntryTimes();
 void testDiscImageLayouts();
 void testIsoFilesAndDiscChanges();
 void testMalformedIsoDirectories();
+void testRawSectorFileReads();
 void testFileCacheIdentitySurvivesRenameAndHardLink();
 void testHostFolderSyncUpdatesLoadedChildren();
 void testSharedFileMappingGrowthKeepsPagesShared();
@@ -1386,6 +1387,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testDiscImageLayouts, "Test disc image layouts, CUE sheets beside BINs and MDS files", TEST_ENTRY_SERIAL},
     {testIsoFilesAndDiscChanges, "Test ISO file types, seeks and disc changes", TEST_ENTRY_SERIAL},
     {testMalformedIsoDirectories, "Test malformed ISO directory rejection", TEST_ENTRY_SERIAL},
+    {testRawSectorFileReads, "Test raw sector disc image file reads", TEST_ENTRY_SERIAL},
     {testStatxEmptyPathUsesOpenFile, "Test statx empty path uses open file identity", TEST_ENTRY_SERIAL},
     {testXInputValuatorLayout, "Test XInput valuator guest ABI layout"},
 };

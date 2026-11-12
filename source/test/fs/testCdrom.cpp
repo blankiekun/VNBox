@@ -224,4 +224,44 @@ void testMalformedIsoDirectories() {
             testFail("malformed ISO variant %u left a partial mounted directory", variant);
     }
 }
+
+void testRawSectorFileReads() {
+    DiscFixture fixture;
+    // FILE.TXT is 5000 bytes in sectors 24 to 26, with a pattern that differs per byte
+    auto image = isoImage();
+    image.resize(27 * SECTOR);
+    isoNumber(image.data() + 16 * SECTOR + 80, 27);
+    isoRecord(image.data() + ROOT + 68, 24, 5000, "FILE.TXT;1", 10, false);
+    std::vector<U8> expected(5000);
+    for (U32 i = 0; i < expected.size(); ++i)
+        image[24 * SECTOR + i] = expected[i] = (U8)(i * 7 + (i >> 8));
+    for (U32 raw : {2352u, 2336u}) {
+        U32 header = raw == 2352 ? 16 : 8;
+        std::vector<U8> sectors(27 * raw, 0xEE); // header and error correction bytes must never be returned
+        for (U32 s = 0; s < 27; ++s)
+            memcpy(sectors.data() + s * raw + header, image.data() + s * SECTOR, SECTOR);
+        memcpy(sectors.data() + 16 * raw + header, "\001CD001\001", 7);
+        cdromInit({fixture.write("raw.bin", sectors)}, B("/mnt/cdrom"), B(""));
+        if (!cdromInsert(0)) {
+            testFail("%u byte sector image did not mount", raw);
+            continue;
+        }
+        auto node = Fs::getNodeFromLocalPath(B(""), B("/mnt/cdrom/FILE.TXT"), true);
+        std::unique_ptr<FsOpenNode> file(node ? node->open(K_O_RDONLY) : nullptr);
+        if (!file) {
+            testFail("%u byte sector image file missing", raw);
+            continue;
+        }
+        for (U32 start : {0u, 1u, 2047u, 2048u, 2049u, 4999u}) {
+            for (U32 len : {1u, 2048u, 3000u, 5000u}) {
+                std::vector<U8> got(len + 1, 0x55);
+                U32 want = std::min(len, 5000 - start);
+                if (file->seek(start) != (S64)start || file->readNative(got.data(), len) != (S32)want
+                        || memcmp(got.data(), expected.data() + start, want) || got[want] != 0x55)
+                    testFail("%u byte sector read of %u bytes at %u returned the wrong bytes", raw, len, start);
+            }
+        }
+        cdromEject();
+    }
+}
 #endif
