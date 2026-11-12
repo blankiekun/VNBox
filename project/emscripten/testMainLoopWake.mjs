@@ -142,6 +142,23 @@ test('an idle tick whose timer is due runs the next tick at once, not after a fr
     assert.equal(b.frames.size, 1); // only the frame loop's
 });
 
+// The bug: a busy guest's timer due sooner than the frame (an audio driver's 10 ms period) waited behind it, up to 24 ms.
+test('a guest timer due during a wait for a frame runs the next tick when due, and frames are still waited for', async () => {
+    const b = browser();
+    await b.advance(20);
+    await b.finish(-1 - 5);
+    await b.advance(4);
+    assert.equal(b.ticks.length, 1);
+    await b.advance(1);
+    assert.equal(b.ticks.length, 2);
+    assert.equal(b.frames.size, 1); // the wait's frame is cancelled: only the frame loop's
+    await b.finish(busy); // not taken for a missing frame: the next busy tick still waits
+    await b.advance(0);
+    assert.equal(b.ticks.length, 2);
+    await b.paint();
+    assert.equal(b.ticks.length, 3);
+});
+
 // The bug: a loop going on after the wasm trapped, or a dead page with no message.
 test('a failed tick says so and is the last', async () => {
     const b = browser();

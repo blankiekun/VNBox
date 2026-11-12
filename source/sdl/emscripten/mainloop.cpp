@@ -149,8 +149,8 @@ static void updateMainLoopTiming(bool idle) {
         }
     }
 #ifdef BOXEDWINE_JSPI
-    // a busy guest waits for a due frame so the browser can paint; an idle guest whose timer is due runs at once
-    jspiTickDelay = mode == EM_TIMING_SETTIMEOUT ? value : idle ? -1 : -1 - 24;
+    // a busy guest waits for a due frame so the browser can paint, but not past its next timer; an idle guest whose timer is due runs at once
+    jspiTickDelay = mode == EM_TIMING_SETTIMEOUT ? value : idle ? -1 : -1 - (int)std::min(getNextTimer(), 24u);
     mainLoopTimingMode = mode;
     mainLoopTimingValue = value;
     return;
@@ -350,6 +350,7 @@ bool doMainLoop() {
     // window). A frame not there after 24 ms (a frame and a half at 60 Hz) ends the wait, and no tick waits again until a
     // frame comes: not pacing, the guest runs flat out then, this only removes a wait that may never end. It was 100 ms:
     // a browser 2-4 frames late (34-63 ms seen) held the guest that long, and the audio worklet holds about 30-40 ms.
+    // A guest timer due sooner (an audio driver's 10 ms period) ends the wait when it is due.
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
@@ -381,7 +382,8 @@ bool doMainLoop() {
             if (delay >= 0) wait(delay);
             else if (delay < -1 && !document.hidden && !noFrames && performance.now() - lastFrame > 12) {
                 raf = requestAnimationFrame(framed);
-                rafLate = setTimeout(function() { noFrames = true; cancelAnimationFrame(raf); framed(); }, 24);
+                var limit = -1 - delay; // 24, or sooner when a guest timer is due: that one is not a missing frame
+                rafLate = setTimeout(function() { if (limit == 24) noFrames = true; cancelAnimationFrame(raf); framed(); }, limit);
             }
             else post();
         }, function(e) {
