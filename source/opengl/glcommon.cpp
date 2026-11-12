@@ -77,7 +77,8 @@ EM_JS(void, boxedwine_record_element_array_buffer_data_js,
         if (typeof GLctx === "undefined" || !GLctx || size < 0) {
             return;
         }
-        var buffer = GLctx.getParameter(0x8895); // GL_ELEMENT_ARRAY_BUFFER_BINDING
+        // Emscripten's binding for GL_ELEMENT_ARRAY_BUFFER (see boxedwine_buffer_bound_js), not a getParameter.
+        var buffer = GL.buffers[GLctx.currentElementArrayBufferBinding];
         if (!buffer) {
             return;
         }
@@ -86,11 +87,16 @@ EM_JS(void, boxedwine_record_element_array_buffer_data_js,
             buffers = new WeakMap();
             Module['boxedwineElementArrayBufferBytes'] = buffers;
         }
-        var bytes = new Uint8Array(size);
+        var bytes = buffers.get(buffer);
+        if (!bytes || bytes.length !== size) {
+            bytes = new Uint8Array(size);
+            buffers.set(buffer, bytes);
+        } else if (!data) {
+            bytes.fill(0);
+        }
         if (data && size) {
             bytes.set(HEAPU8.subarray(data, data + size));
         }
-        buffers.set(buffer, bytes);
     });
 
 EM_JS(void, boxedwine_record_element_array_buffer_sub_data_js,
@@ -98,7 +104,7 @@ EM_JS(void, boxedwine_record_element_array_buffer_sub_data_js,
         if (typeof GLctx === "undefined" || !GLctx || offset < 0 || size <= 0 || !data) {
             return;
         }
-        var buffer = GLctx.getParameter(0x8895); // GL_ELEMENT_ARRAY_BUFFER_BINDING
+        var buffer = GL.buffers[GLctx.currentElementArrayBufferBinding];
         var buffers = Module['boxedwineElementArrayBufferBytes'];
         var bytes = buffer && buffers ? buffers.get(buffer) : null;
         if (!bytes || offset + size > bytes.length) {
@@ -218,7 +224,7 @@ EM_JS(double, boxedwine_prepare_element_array_client_draw_js,
             return -1;
         }
 
-        var buffer = GLctx.getParameter(0x8895); // GL_ELEMENT_ARRAY_BUFFER_BINDING
+        var buffer = GL.buffers[GLctx.currentElementArrayBufferBinding];
         var buffers = Module['boxedwineElementArrayBufferBytes'];
         var bytes = buffer && buffers ? buffers.get(buffer) : null;
         var end = offset + count * elementSize;
@@ -1179,10 +1185,10 @@ static void texSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffs
     bool restoreUnpackState = false;
     if (!PIXEL_UNPACK_BUFFER() && pixels && width > 0 && height > 0 &&
             type != GL_BITMAP) {
-        GL_FUNC(pglGetIntegerv)(GL_UNPACK_ALIGNMENT, &unpackAlignment);
-        GL_FUNC(pglGetIntegerv)(GL_UNPACK_ROW_LENGTH, &unpackRowLength);
-        GL_FUNC(pglGetIntegerv)(GL_UNPACK_SKIP_ROWS, &unpackSkipRows);
-        GL_FUNC(pglGetIntegerv)(GL_UNPACK_SKIP_PIXELS, &unpackSkipPixels);
+        getPixelStore(GL_UNPACK_ALIGNMENT, &unpackAlignment);
+        getPixelStore(GL_UNPACK_ROW_LENGTH, &unpackRowLength);
+        getPixelStore(GL_UNPACK_SKIP_ROWS, &unpackSkipRows);
+        getPixelStore(GL_UNPACK_SKIP_PIXELS, &unpackSkipPixels);
 
         GLint bytesPerPixel = get_bytes_per_pixel(format, type);
         if (bytesPerPixel > 0 &&
@@ -1232,7 +1238,7 @@ static void texSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffs
 static void texSubImage2DFromGuestBgra(CPU* cpu, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, U32 address) {
     thread_local static std::vector<U32> rgba;
     GLint rowLength = 0;
-    GL_FUNC(pglGetIntegerv)(GL_UNPACK_ROW_LENGTH, &rowLength);
+    getPixelStore(GL_UNPACK_ROW_LENGTH, &rowLength);
     const U32 stride = (U32)(rowLength ? rowLength : width) * 4;
     const U32 alpha = format == VNBOX_GL_BGRX_TO_RGBA ? 0xff000000 : 0;
     rgba.resize((size_t)width * height);
@@ -1282,6 +1288,9 @@ U32 getPixelsLen(bool read, U32 dimensions, GLsizei width, GLsizei height, GLsiz
 
 const GLubyte* OPENGL_CALL_TYPE glcommonHost_glGetString(GLenum name) {
 #ifdef __EMSCRIPTEN__
+    if (name == VNBOX_GL_QUERY_HOST_BGRA_UPLOAD) {
+        return nullptr; // host wined3d converts BGRA rows itself; glcommonHost_glTexSubImage2D has no private formats
+    }
     if (const char* fixed = webglFixedString(name)) {
         return (const GLubyte*)fixed;
     }

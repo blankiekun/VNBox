@@ -395,6 +395,28 @@ void testHostFreetypeTables() {
     if (!call("FT_Done_Face", { face }) || EAX) testFail("FT_Done_Face");
     FT_Done_Face(want);
 
+    // A host face reads the font from the guest's mapping when it needs the bytes, as guest FreeType does, not from a
+    // copy of the whole file taken when it opened (which paged in, or fetched, every page of the font): glyph data the
+    // guest's bytes no longer have after the open is gone for the host face too.
+    if (!call("FT_New_Memory_Face", { GUEST_LIB, font, (U32)data.size(), 0, aface }) || EAX) testFail("FT_New_Memory_Face not done on the host");
+    face = memory->readd(aface);
+    std::vector<U8> changed = data;
+    if (FT_New_Memory_Face(lib, changed.data(), (FT_Long)changed.size(), 0, &want)) testFail("host FreeType can't open the test font");
+    for (U32 i = 0, n = data[4] << 8 | data[5]; i < n; i++) { // the table directory: tag, checksum, offset, length (big endian)
+        const U8* t = &data[12 + i * 16];
+        if (memcmp(t, "glyf", 4)) continue;
+        U32 offset = t[8] << 24 | t[9] << 16 | t[10] << 8 | t[11], length = t[12] << 24 | t[13] << 16 | t[14] << 8 | t[15];
+        ::memset(&changed[offset], 0, length);
+        memory->memset(font + offset, 0, length);
+    }
+    err = FT_Load_Glyph(want, gi, FT_LOAD_NO_SCALE);
+    if (err || want->glyph->outline.n_points) testFail("the glyph data is still there");
+    if (!call("FT_Load_Glyph", { face, gi, FT_LOAD_NO_SCALE }) || EAX != (U32)err) testFail("FT_Load_Glyph after the font changed: %x", EAX);
+    if (guest<FT_GlyphSlotRec>(gaddr(guest<FT_FaceRec>(face).glyph)).outline.n_points) testFail("the host face loaded the glyph from a copy of the font");
+    if (!call("FT_Done_Face", { face }) || EAX) testFail("FT_Done_Face");
+    FT_Done_Face(want);
+    memory->memcpy(font, data.data(), (U32)data.size());
+
     // A bitmap font: the slot's bitmap in guest memory, through glyphs small, big and small again (its buffer grows once).
     std::vector<U8> fnt = fntFont();
     if (FT_New_Memory_Face(lib, fnt.data(), (FT_Long)fnt.size(), 0, &want)) testFail("host FreeType can't open the FNT font");

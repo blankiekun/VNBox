@@ -803,6 +803,21 @@ void testX11ResizeMarksDirty() {
     changes.width = 6;
     window->configure(CWWidth, &changes);
     if (!window->isDirty) testFail("X11 configure to a new size did not mark the window dirty");
+    // A request that changes nothing must not redraw the display.
+    server->isDisplayDirty = false;
+    changes.x = 5;
+    window->configure(CWX | CWWidth, &changes);
+    if (server->isDisplayDirty) testFail("X11 configure with unchanged geometry marked the display dirty");
+    changes.x = 7;
+    window->configure(CWX, &changes);
+    if (!server->isDisplayDirty) testFail("X11 configure to a new position did not mark the display dirty");
+    // Raising a window over a sibling changes what is shown, with no geometry change.
+    auto above = server->createNewWindow(0, server->getRoot(), 2, 2, 16, 0, 0, InputOutput, 0, visual);
+    server->isDisplayDirty = false;
+    changes.stack_mode = 0; // Above
+    window->configure(CWStackMode, &changes);
+    if (!server->isDisplayDirty) testFail("X11 raising a window did not mark the display dirty");
+    server->destroyWindow(above->id);
     server->destroyWindow(window->id);
 }
 
@@ -914,6 +929,39 @@ void testX11FreeCursor() {
     window->cursor = nullptr;
     if (!alive.expired()) testFail("X11 freed cursor outlived its last user");
     server->destroyWindow(window->id);
+}
+
+// Bug: every pointer motion stayed in the event queue, so a click waited behind all the positions before it.
+void testX11MotionCoalesced() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto thread = testContext().thread;
+    auto server = XServer::getServer();
+    DisplayDataPtr data = server->getDisplayDataByAddressOfDisplay(thread->memory, server->openDisplay(thread));
+    XEvent motion = {};
+    motion.type = MotionNotify;
+    motion.xmotion.window = 5;
+    for (int x = 1; x <= 3; x++) {
+        motion.xmotion.x = x;
+        data->putEvent(motion);
+    }
+    XEvent press = {};
+    press.type = ButtonPress;
+    press.xbutton.window = 5;
+    data->putEvent(press);
+    motion.xmotion.x = 4;
+    data->putEvent(motion);
+    motion.xmotion.x = 5;
+    motion.xmotion.state = 1; // a button is now held: not the same motion
+    data->putEvent(motion);
+    U32 count = data->lockEvents();
+    if (count != 4) testFail("X11 queued motion was not coalesced, %u events", count);
+    else if (data->getEvent(0)->xmotion.x != 3 || data->getEvent(1)->type != ButtonPress || data->getEvent(2)->xmotion.x != 4 || data->getEvent(3)->xmotion.x != 5)
+        testFail("X11 motion coalescing lost the newest position or reordered a press");
+    data->unlockEvents();
+    server->closeDisplay(thread, data);
 }
 
 void testX11PaletteInvalidation() {

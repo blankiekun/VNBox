@@ -158,6 +158,32 @@ extern "C" EMSCRIPTEN_KEEPALIVE void bw_prefetch(U32 addr, U32 size) {
     hostHookPrefetch.push_back({ addr, size });
 }
 
+// Loads the prefetch ranges a slice per syscall, at most 16 file pages (one 64 KiB lazy file block), so
+// a whole exe doesn't stop the game for the length of its read. True once they are all loaded.
+bool hostHookPrefetchStep(KThread* thread) {
+    for (U32 loaded = 0; !hostHookPrefetch.empty();) {
+        auto& range = hostHookPrefetch.back();
+        U32 page = range.first >> K_PAGE_SHIFT;
+        U64 end = std::min((U64)range.first + range.second, (U64)0x100000000ull);
+        if (!range.second || page >= K_NUMBER_OF_PAGES) {
+            hostHookPrefetch.pop_back();
+            continue;
+        }
+        MMU& mmu = getMemData(thread->memory)->mmu[page];
+        if (mmu.getPageType() == PageType::File && thread->memory->canRead(page)) {
+            if (loaded++ == 16) return false;
+            thread->memory->readb(page << K_PAGE_SHIFT); // loads the page
+        }
+        U64 next = (U64)(page + 1) << K_PAGE_SHIFT;
+        if (next >= end) {
+            hostHookPrefetch.pop_back();
+        } else {
+            range = { (U32)next, (U32)(end - next) };
+        }
+    }
+    return true;
+}
+
 #ifdef __EMSCRIPTEN__
 // window.boxedwineFrida (frida-compat.js) gets the exports on its first poll.
 // 0: nothing to do, 1: load the prefetch ranges then attach, 2: load them then poll again.
@@ -188,22 +214,31 @@ void hostHookSyscall(KThread* thread) {
             i++;
         }
     }
-    static U32 count;
-    if (++count % 1024) return;
+    static U32 count, prefetchPid; // prefetchPid: the process hostHookPrefetch's ranges are in
+    static int then = -1; // the answer of the poll that asked for them, acted on once they are loaded
+    if (!hostHookPrefetch.empty()) {
+        if (pid != prefetchPid) {
+            if (!KSystem::getProcess(prefetchPid)) { // it exited before they loaded
+                hostHookPrefetch.clear();
+                then = -1;
+            }
+            return;
+        }
+        if (!hostHookPrefetchStep(thread)) return;
+    } else if (++count % 1024) {
+        return;
+    }
     U32 teb = thread->cpu->seg[FS].address;
     for (int round = 0; round < 4; round++) {
-        int r = boxedwine_frida_poll(pid, thread->id, teb);
-        for (auto& range : hostHookPrefetch) {
-            U32 first = range.first >> K_PAGE_SHIFT;
-            U32 last = (U32)(std::min((U64)range.first + range.second, (U64)0x100000000ull) - 1) >> K_PAGE_SHIFT;
-            for (U32 page = first; range.second && page <= last && page < K_NUMBER_OF_PAGES; page++) {
-                MMU& mmu = getMemData(thread->memory)->mmu[page];
-                if (mmu.getPageType() == PageType::File && thread->memory->canRead(page)) {
-                    thread->memory->readb(page << K_PAGE_SHIFT); // loads the page
-                }
+        int r = then >= 0 ? then : boxedwine_frida_poll(pid, thread->id, teb);
+        then = -1;
+        if (!hostHookPrefetch.empty()) {
+            prefetchPid = pid;
+            if (!hostHookPrefetchStep(thread)) {
+                then = r;
+                return;
             }
         }
-        hostHookPrefetch.clear();
         if (r == 1) {
             boxedwine_frida_attach(pid, thread->id, teb);
             hostHookSyscall(thread); // invalidate what the script hooked

@@ -3650,23 +3650,45 @@ function vnboxMovieBlob(path) {
     return node.lazyBlob || typeof lazyFiles !== "undefined" && lazyFiles[node.lazyFile] || null; // lazyBlob: sab mode, the worker's File
 }
 
+function vnboxMovieScripts() {
+    vnboxMovieLoad = vnboxMovieLoad || ["vnbox-movie-decoder.js", "vnbox-movie.js"].reduce((done, name) => done.then(() => new Promise((resolve, reject) => {
+        var script = document.createElement("script");
+        script.src = vnboxMovieBase + name;
+        script.onload = resolve;
+        script.onerror = () => reject(new Error("could not load " + name));
+        document.head.appendChild(script);
+    })), Promise.resolve()).then(() => {
+        vnboxMovieModule = vnboxMovieModule || VnboxMovieDecoder(); // the wasm compiles now, not when the first movie opens
+        vnboxMovieQueue.forEach(c => vnboxMovieCommand(c[0], c[1], c[2]));
+        vnboxMovieQueue = null;
+    }, error => { vnboxReport("movie", error); vnboxMovieLoad = "failed"; });
+}
+
 function boxedwineMovie(id, cmd, arg) {
     if (cmd === "open") console.log("[movie] open " + arg);
     if (typeof vnboxMovieCommand === "function") return vnboxMovieCommand(id, cmd, arg);
     if (cmd === "open") {
         if (vnboxParam("movies") === "0" || !vnboxMovieBlob(arg)) return -1;
-        vnboxMovieLoad = vnboxMovieLoad || ["vnbox-movie-decoder.js", "vnbox-movie.js"].reduce((done, name) => done.then(() => new Promise((resolve, reject) => {
-            var script = document.createElement("script");
-            script.src = vnboxMovieBase + name;
-            script.onload = resolve;
-            script.onerror = () => reject(new Error("could not load " + name));
-            document.head.appendChild(script);
-        })), Promise.resolve()).then(() => {
-            vnboxMovieQueue.forEach(c => vnboxMovieCommand(c[0], c[1], c[2]));
-            vnboxMovieQueue = null;
-        }, error => { vnboxReport("movie", error); vnboxMovieLoad = "failed"; });
+        vnboxMovieScripts();
     }
     if (cmd === "status") return vnboxMovieLoad === "failed" ? 1 : 0;
     if (vnboxMovieQueue) vnboxMovieQueue.push([id, cmd, arg]);
     return 1;
 }
+
+// At the game's first frame, when its folder has an MPEG file, load the decoder so the first movie finds it ready.
+function vnboxMovieHas(dir) {
+    var names;
+    try { names = FS.readdir(dir); } catch (e) { return false; }
+    return names.some(name => name !== "." && name !== ".." && (/\.mpe?g$/i.test(name) || vnboxMovieHas(dir + "/" + name)));
+}
+
+var vnboxMoviePresents = {};
+["boxedwinePresentFrame", "boxedwinePresentSoftwareFrame"].forEach(name => {
+    var present = vnboxMoviePresents[name] = Module[name];
+    Module[name] = function () {
+        for (var n in vnboxMoviePresents) Module[n] = vnboxMoviePresents[n]; // once: later frames call the originals
+        if (vnboxParam("movies") !== "0" && vnboxMovieHas(Config.d_drive)) vnboxMovieScripts();
+        return present.apply(this, arguments);
+    };
+});

@@ -483,6 +483,42 @@ void testCodePageCopyOnWriteReferences() {
     verifyReg32(0, 4, "copy-on-write patched code eax");
 }
 
+void testRamPageRefCounts() {
+    // Every page's count lives in one table (flat on 32-bit hosts such as
+    // wasm32, hashed on 64-bit). A wrong count frees a page still mapped.
+    RamPage page = ramPageAlloc();
+    U8* data = ramPageGet(page);
+    if (ramPageUseCount(page) != 1 || data[0] != 0 || data[K_PAGE_SIZE - 1] != 0) {
+        failed("a new RAM page is not zeroed with one reference");
+    }
+    data[0] = 0x5a;
+    ramPageRetain(page);
+    ramPageRetain(page);
+    if (ramPageUseCount(page) != 3 || ramPageIsNative(page)) {
+        failed("retained RAM page has the wrong count");
+    }
+    ramPageMarkSystem(page, true);
+    if (!ramPageIsSystem(page)) {
+        failed("RAM page lost its system mark");
+    }
+    ramPageMarkSystem(page, false);
+    ramPageRelease(page);
+    ramPageRelease(page);
+    if (ramPageUseCount(page) != 1 || data[0] != 0x5a) {
+        failed("released RAM page has the wrong count or lost its data");
+    }
+    ramPageRelease(page);
+    if (ramPageUseCount(page) != 0) {
+        failed("freed RAM page still has references");
+    }
+    // A freed page is the next one handed out, zeroed, with a fresh count.
+    RamPage reused = ramPageAlloc();
+    if (reused.value != page.value || ramPageUseCount(reused) != 1 || ramPageGet(reused)[0] != 0) {
+        failed("freed RAM page was not reused zeroed with one reference");
+    }
+    ramPageRelease(reused);
+}
+
 void testLinearMemoryAliasAndFaults() {
     if (!ramPageUseLinearMemory()) {
         return;
@@ -1270,5 +1306,38 @@ void testDecodedOpInvalidationDefersCrossThreadReuse() {
     context.process->deleteThread(holdingThread);
 }
 #endif
+
+void testGuestMemcpyOverlap() {
+    // Guest-to-guest copies are staged through the host. Overlap in either
+    // direction and a copy across pages must match memmove.
+    const U32 base = 0x22000000;
+    const U32 size = 4 * K_PAGE_SIZE;
+    if (testMemory->mmap(testContext().thread, base, size, K_PROT_READ | K_PROT_WRITE,
+            K_MAP_FIXED | K_MAP_PRIVATE | K_MAP_ANONYMOUS, -1, 0) != base) {
+        failed("guest memcpy mmap failed");
+        return;
+    }
+    for (U32 shift : {(U32)5, (U32)K_PAGE_SIZE + 3}) {
+        for (bool forward : {true, false}) {
+            std::vector<U8> expected(size);
+            for (U32 i = 0; i < size; ++i) {
+                expected[i] = (U8)(i * 7 + 1);
+                testMemory->writeb(base + i, expected[i]);
+            }
+            U32 len = size - shift;
+            U32 src = forward ? base : base + shift;
+            U32 dest = forward ? base + shift : base;
+            testMemory->memcpy(dest, src, len);
+            memmove(expected.data() + (dest - base), expected.data() + (src - base), len);
+            for (U32 i = 0; i < size; ++i) {
+                if (testMemory->readb(base + i) != expected[i]) {
+                    failed("guest memcpy overlap shift=%u forward=%d wrong byte at %u", shift, forward, i);
+                    break;
+                }
+            }
+        }
+    }
+    testMemory->unmap(base, size);
+}
 
 #endif

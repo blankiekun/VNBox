@@ -100,6 +100,7 @@ void testX11DestroyWindowTree();
 void testX11ClientWindowsGoWithIt();
 void testX11ClipboardOwnerGone();
 void testX11FreeCursor();
+void testX11MotionCoalesced();
 void testX11PalettedDrawing();
 void testX11PatternFills();
 void testX11PaletteInvalidation();
@@ -127,6 +128,7 @@ void testZipEntryTimes();
 void testDiscImageLayouts();
 void testIsoFilesAndDiscChanges();
 void testMalformedIsoDirectories();
+void testRawSectorFileReads();
 void testFileCacheIdentitySurvivesRenameAndHardLink();
 void testHostFolderSyncUpdatesLoadedChildren();
 void testSharedFileMappingGrowthKeepsPagesShared();
@@ -197,6 +199,7 @@ void testUtimensatPreservesAccessTimeInStat();
 void testFutimensPreservesAccessTimeInFstat();
 void testFutimensTime64SignExtendedSecondsPreservesAccessTimeInFstat();
 void testDirectoryReparseSidecarReplacedAfterRemoveAndRecreate();
+void testFailedRenameReturnsWithoutSleeping();
 void testDotDotAfterDotResolvesToParentDirectory();
 void testLinuxPathResolutionSemantics();
 void testUtf8NamesSurviveNativeFilesystemReload();
@@ -949,13 +952,14 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostClock, "Test native clock reads (QPC, system time)"},
     {testHostLibcMutex, "Test native pthread_mutex_lock/unlock"},
     {testHostHookPatchedExport, "Test a game's patch on a hooked export runs instead of the hook"},
+    {testHostHookPrefetchSlices, "Test a hook script's prefetch loads a slice per syscall, not a whole exe", TEST_ENTRY_SERIAL},
     {testHostLibcHead, "Test a hooked export's head op does the call or goes on with the guest function"},
     {testHostLibcDeclines, "Test native libc leaves DF, segments, code, copy-on-write and unloaded pages to the guest"},
     {testHostCrt, "Test native Wine CRT memcpy/memset/strlen/strstr/_strnicmp"},
     {testHostCrtExports, "Test the Wine CRT exports are found in a builtin .dll.so"},
     {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
-    {testHostDsoundSameBytes, "Test host dsound convert/mix leave the bytes the guest functions do"},
-    {testHostDsoundDeclines, "Test host dsound convert/mix leave what they can't do to the guest"},
+    {testHostDsoundSameBytes, "Test host dsound convert/mix/resample leave the bytes the guest functions do"},
+    {testHostDsoundDeclines, "Test host dsound convert/mix/resample leave what they can't do to the guest"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostAcmBadFile, "Test a corrupt vorbis.acm can't make the host allocate gigabytes"},
@@ -1157,6 +1161,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testSelfModifyingFront, "Test Self Modifying Code Same Block(Previous)"},
     {testSelfModifyingBack, "Test Self Modifying Code Same Block(Next)"},
     {testCodePageCopyOnWriteReferences, "Test code-page copy-on-write references"},
+    {testRamPageRefCounts, "Test RAM page reference counts", TEST_ENTRY_SERIAL},
     {testLinearMemoryAliasAndFaults, "Test linear-memory alias and fault handling", TEST_ENTRY_SERIAL},
     {testLinearMemoryFileFirstTouches, "Test linear-memory file and COW first touches", TEST_ENTRY_SERIAL},
     {testLinearMemoryWraparound, "Test linear-memory wraparound loads and stores", TEST_ENTRY_SERIAL},
@@ -1168,6 +1173,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testJitOverlappingBlockUnmap, "Test JIT overlapping block unmap", TEST_ENTRY_SERIAL},
     {testJitOverlappingBlockRemoveCode, "Test JIT overlapping block code removal", TEST_ENTRY_SERIAL},
     {testJitOverlappingBlockOwnership, "Test JIT overlapping block ownership", TEST_ENTRY_SERIAL},
+    {testGuestMemcpyOverlap, "Test guest memcpy overlap", TEST_ENTRY_SERIAL},
 #ifdef BOXEDWINE_MULTI_THREADED
     {testDecodedOpInvalidationDefersCrossThreadReuse, "Test decoded op invalidation defers cross-thread reuse"},
     {testDecodedOpCacheCloneExecDetach, "Test decoded op cache CLONE_VM exec detach"},
@@ -1204,6 +1210,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testX11ClientWindowsGoWithIt, "Test X11 a closed display or exited process takes its windows"},
     {testX11ClipboardOwnerGone, "Test X11 clipboard owner gone"},
     {testX11FreeCursor, "Test X11 XFreeCursor keeps a cursor in use"},
+    {testX11MotionCoalesced, "Test X11 queued pointer motion is coalesced"},
     {testX11PalettedDrawing, "Test X11 paletted drawing and clipping"},
     {testX11PatternFills, "Test X11 tiled and stippled rectangle fills"},
     {testX11PaletteInvalidation, "Test X11 shared palette invalidation"},
@@ -1308,6 +1315,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testFutimensPreservesAccessTimeInFstat, "Test futimens preserves access time in fstat", TEST_ENTRY_SERIAL},
     {testFutimensTime64SignExtendedSecondsPreservesAccessTimeInFstat, "Test futimens time64 sign-extended seconds in fstat", TEST_ENTRY_SERIAL},
     {testDirectoryReparseSidecarReplacedAfterRemoveAndRecreate, "Test directory reparse sidecar replacement after recreate", TEST_ENTRY_SERIAL},
+    {testFailedRenameReturnsWithoutSleeping, "Test failed rename returns without sleeping", TEST_ENTRY_SERIAL},
     {testDotDotAfterDotResolvesToParentDirectory, "Test ./.. resolves to parent directory", TEST_ENTRY_SERIAL},
     {testLinuxPathResolutionSemantics, "Test Linux pathname resolution semantics", TEST_ENTRY_SERIAL},
     {testUtf8NamesSurviveNativeFilesystemReload, "Test UTF-8 file names survive native filesystem reload", TEST_ENTRY_SERIAL},
@@ -1381,6 +1389,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testDiscImageLayouts, "Test disc image layouts, CUE sheets beside BINs and MDS files", TEST_ENTRY_SERIAL},
     {testIsoFilesAndDiscChanges, "Test ISO file types, seeks and disc changes", TEST_ENTRY_SERIAL},
     {testMalformedIsoDirectories, "Test malformed ISO directory rejection", TEST_ENTRY_SERIAL},
+    {testRawSectorFileReads, "Test raw sector disc image file reads", TEST_ENTRY_SERIAL},
     {testStatxEmptyPathUsesOpenFile, "Test statx empty path uses open file identity", TEST_ENTRY_SERIAL},
     {testXInputValuatorLayout, "Test XInput valuator guest ABI layout"},
 };

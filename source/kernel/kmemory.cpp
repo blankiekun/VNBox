@@ -1043,11 +1043,12 @@ U32 KMemory::unmapLocked(U32 address, U32 len, std::vector<MappedFilePtr>& retir
     std::vector<PreparedSplit> splits;
     bool preparedCodeInvalidation = false;
     try {
-        mappings.reserve(process->mappedFiles.size());
-        retirements.reserve(process->mappedFiles.size());
-        splits.reserve(process->mappedFiles.size());
+        // Only mappings that overlap the range matter below; the rest would be skipped.
         for (const auto& entry : process->mappedFiles) {
-            mappings.push_back(entry.value);
+            const MappedFilePtr& mapping = entry.value;
+            if (mapping->address < rangeEnd && rangeStart < (U64)mapping->address + mapping->len) {
+                mappings.push_back(mapping);
+            }
         }
         for (const MappedFilePtr& mapping : mappings) {
             U64 mappingStart = mapping->address;
@@ -1270,17 +1271,13 @@ void KMemory::memcpy(U32 dest, U32 src, U32 len) {
     if (dest + len < dest || src + len < src) {
         kpanic("integer overflow in memcpy");
 	}
-	if (dest < src) {
-        for (U32 i = 0; i < len; i++, src++, dest++) {
-            writeb(dest, readb(src));
-        }
-    } else {
-        dest += len - 1;
-        src += len - 1;
-        for (U32 i = 0; i < len; i++, src--, dest--) {
-            writeb(dest, readb(src));
-        }
-	}
+    if (!len) {
+        return;
+    }
+    // Stage through a host buffer: whole pages are copied instead of a byte at a time, and overlap is safe either way.
+    std::vector<U8> buffer(len);
+    memcpy(buffer.data(), src, len);
+    memcpy(dest, buffer.data(), len);
 }
 
 void KMemory::memcpy(void* p, U32 address, U32 len) {

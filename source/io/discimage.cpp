@@ -723,17 +723,37 @@ U32 DiscImage::readData(U64 byteOffset, U8* buffer, U32 len) {
             }
             continue;
         }
-        todo = std::min(todo, DISC_DATA_SECTOR_SIZE - within);
-        if (extent->file < 0 || extent->audio) {
-            memset(buffer + done, 0, todo);
-        } else {
+        if (extent->file >= 0 && !extent->audio) {
+            // raw sectors: read the run of sectors with one host read, then copy the user data out of each
+            U32 first = std::min(todo, DISC_DATA_SECTOR_SIZE - within);
+            U64 left = (U64)extent->start + extent->count - sector;
+            U64 wanted = ((U64)within + todo + DISC_DATA_SECTOR_SIZE - 1) / DISC_DATA_SECTOR_SIZE;
+            U32 sectors = (U32)std::min<U64>(std::min(left, wanted), 256);
+            U32 run = std::min<U32>(todo, sectors * DISC_DATA_SECTOR_SIZE - within);
+            U64 span = (U64)(sectors - 1) * (extent->sectorSize - DISC_DATA_SECTOR_SIZE) + run;
+            std::vector<U8> raw((size_t)span);
             U64 at = extent->fileOffset + (sector - extent->start) * extent->sectorSize + extent->dataOffset + within;
-            U32 read = readFile(extent->file, at, buffer + done, todo);
-            if (read < todo) {
-                done += read;
-                break;
+            U32 read = readFile(extent->file, at, raw.data(), (U32)span);
+            U32 copied = 0;
+            for (U32 i = 0; i < sectors && copied < run; i++) {
+                U32 n = std::min(run - copied, i ? DISC_DATA_SECTOR_SIZE : first);
+                U64 from = i ? (U64)i * extent->sectorSize - within : 0;
+                if (from + n > read) {
+                    if (from < read) {
+                        memcpy(buffer + done + copied, raw.data() + from, (size_t)(read - from));
+                        copied += (U32)(read - from);
+                    }
+                    done += copied;
+                    return done;
+                }
+                memcpy(buffer + done + copied, raw.data() + from, n);
+                copied += n;
             }
+            done += copied;
+            continue;
         }
+        todo = std::min(todo, DISC_DATA_SECTOR_SIZE - within);
+        memset(buffer + done, 0, todo);
         done += todo;
     }
     return done;

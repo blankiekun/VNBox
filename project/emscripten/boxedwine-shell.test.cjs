@@ -1111,3 +1111,30 @@ test('the JIT database ends its wait once on an abort, an error, or an open that
     assert.equal(await run(errored.open, errored.fire), 1);
     assert.equal(await run(() => { throw new Error('SecurityError'); }), 1);
 });
+
+// The bug: the movie decoder was fetched and compiled when the first movie opened, so it started late.
+test('the movie decoder loads at the first frame, only when the game folder has a movie', async () => {
+    const run = async (tree, query = '') => {
+        const shell = bootShell(page + query);
+        const scripts = [];
+        shell.context.document.head = { appendChild: (script) => scripts.push(script.src) };
+        shell.context.document.createElement = () => ({});
+        shell.context.FS.readdir = (dir) => {
+            const node = tree[dir];
+            if (!node) throw new Error('ENOENT');
+            return ['.', '..', ...node];
+        };
+        shell.context.setConfiguration();
+        assert.deepEqual(scripts, []);
+        shell.context.Module.boxedwinePresentSoftwareFrame(1, 1, null, null);
+        await new Promise((resolve) => setImmediate(resolve));
+        const first = scripts.length;
+        shell.context.Module.boxedwinePresentSoftwareFrame(1, 1, null, null);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(scripts.length, first, 'only the first frame loads');
+        return first;
+    };
+    assert.equal(await run({ '/d_drive': ['game.exe', 'movie'], '/d_drive/movie': ['OP.MPG'] }), 1);
+    assert.equal(await run({ '/d_drive': ['game.exe', 'movie'], '/d_drive/movie': ['OP.avi'] }), 0);
+    assert.equal(await run({ '/d_drive': ['OP.mpeg'] }, 'movies=0'), 0);
+});

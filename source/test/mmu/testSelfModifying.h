@@ -15,6 +15,7 @@ void testSelfModifyingMovsb();
 void testSelfModifyingFront();
 void testSelfModifyingBack();
 void testCodePageCopyOnWriteReferences();
+void testRamPageRefCounts();
 void testLinearMemoryAliasAndFaults();
 void testLinearMemoryFileFirstTouches();
 void testLinearMemoryWraparound();
@@ -26,6 +27,7 @@ void testDecodedOpLargeRangeRemoval();
 void testJitOverlappingBlockUnmap();
 void testJitOverlappingBlockRemoveCode();
 void testJitOverlappingBlockOwnership();
+void testGuestMemcpyOverlap();
 
 #ifdef BOXEDWINE_MULTI_THREADED
 void testDecodedOpInvalidationDefersCrossThreadReuse();
