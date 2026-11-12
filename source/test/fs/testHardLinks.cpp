@@ -6318,6 +6318,29 @@ void testDirectoryReparseSidecarReplacedAfterRemoveAndRecreate() {
     cleanupRoot(root);
 }
 
+void testFailedRenameReturnsWithoutSleeping() {
+    BString root = B("tmp/test-failed-rename-root");
+    cleanupRoot(root);
+    initTestFileSystem(root);
+    Fs::makeLocalDirs(B("/tmp"));
+    std::shared_ptr<FsNode> node = addRegularFile(B("/tmp/from"));
+    if (!node) {
+        testFail("rename source was not created");
+        cleanupRoot(root);
+        return;
+    }
+    auto start = std::chrono::steady_clock::now();
+    U32 result = testContext().process->rename(B("/tmp/from"), B("/tmp/missing-dir/to"));
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    if (result == 0) {
+        testFail("rename into a missing directory succeeded");
+    }
+    if (ms >= 100) {
+        testFail("a failed rename slept");
+    }
+    cleanupRoot(root);
+}
+
 void testDotDotAfterDotResolvesToParentDirectory() {
     BString root = B("tmp/test-dot-dot-after-dot-root");
     cleanupRoot(root);

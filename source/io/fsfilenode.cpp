@@ -647,8 +647,10 @@ U32 FsFileNode::rename(BString path) {
             this->parent = parentNode;            
         } else {
             result = -translateErr(errno);
+#ifdef _WIN32
             KNativeThread::sleep(100); // not sure why on Windows doesNativePathExist fails sometimes, debian stretch /usr/bin/dpkg -i /var/local/xbitmaps_1.1.1-2_all.deb seems to cause this in a reproducible way
             continue;
+#endif
         }
         break;
     }
