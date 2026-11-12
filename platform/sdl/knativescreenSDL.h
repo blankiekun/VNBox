@@ -139,11 +139,15 @@ private:
     bool emscriptenSoftwareDirty = false;
     U8* emscriptenRgbaBuffer = nullptr; // the frame in the canvas's byte order
     U32 emscriptenRgbaBufferSize = 0;
+    bool emscriptenRgbaShown = false; // the RGBA buffer holds the frame on the canvas
+    const U8* emscriptenFullScreenSrc = nullptr; // this composite's frame is one window's pixels, not yet copied to the buffer
+    U32 emscriptenFullScreenPitch = 0;
     bool emscriptenDesktopFillPending = false; // clear() was called and the desktop colour is not in the buffer yet
     void fillEmscriptenDesktop();
     U8* emscriptenShownFrame = nullptr; // the frame on the canvas
     U32 emscriptenShownFrameSize = 0, emscriptenShownWidth = 0, emscriptenShownHeight = 0;
     bool emscriptenShownValid = false;
+    bool emscriptenShownFrameCurrent = false; // emscriptenShownFrame holds the frame on the canvas (a full screen window's frame isn't copied there)
     bool emscriptenSoftwareDisabled = false;
 #endif
 
