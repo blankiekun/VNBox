@@ -483,6 +483,42 @@ void testCodePageCopyOnWriteReferences() {
     verifyReg32(0, 4, "copy-on-write patched code eax");
 }
 
+void testRamPageRefCounts() {
+    // Every page's count lives in one table (flat on 32-bit hosts such as
+    // wasm32, hashed on 64-bit). A wrong count frees a page still mapped.
+    RamPage page = ramPageAlloc();
+    U8* data = ramPageGet(page);
+    if (ramPageUseCount(page) != 1 || data[0] != 0 || data[K_PAGE_SIZE - 1] != 0) {
+        failed("a new RAM page is not zeroed with one reference");
+    }
+    data[0] = 0x5a;
+    ramPageRetain(page);
+    ramPageRetain(page);
+    if (ramPageUseCount(page) != 3 || ramPageIsNative(page)) {
+        failed("retained RAM page has the wrong count");
+    }
+    ramPageMarkSystem(page, true);
+    if (!ramPageIsSystem(page)) {
+        failed("RAM page lost its system mark");
+    }
+    ramPageMarkSystem(page, false);
+    ramPageRelease(page);
+    ramPageRelease(page);
+    if (ramPageUseCount(page) != 1 || data[0] != 0x5a) {
+        failed("released RAM page has the wrong count or lost its data");
+    }
+    ramPageRelease(page);
+    if (ramPageUseCount(page) != 0) {
+        failed("freed RAM page still has references");
+    }
+    // A freed page is the next one handed out, zeroed, with a fresh count.
+    RamPage reused = ramPageAlloc();
+    if (reused.value != page.value || ramPageUseCount(reused) != 1 || ramPageGet(reused)[0] != 0) {
+        failed("freed RAM page was not reused zeroed with one reference");
+    }
+    ramPageRelease(reused);
+}
+
 void testLinearMemoryAliasAndFaults() {
     if (!ramPageUseLinearMemory()) {
         return;

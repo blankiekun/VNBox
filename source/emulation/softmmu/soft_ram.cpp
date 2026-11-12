@@ -57,7 +57,13 @@ public:
 
 // All accesses need ramMutex, including existing-page lookups: another
 // thread can insert pages and rehash the table (Vantage CPU test 2).
+#ifdef BOXEDWINE_64
 static std::unordered_map<U64, RamInfo> refCounts;
+#else
+// A 32-bit host's RAM index is its address >> K_PAGE_SHIFT, so a flat table
+// covers every page: no hashing, node allocation or rehash per page touched.
+static RamInfo refCounts[(size_t)1 << (32 - K_PAGE_SHIFT)];
+#endif
 static std::vector<RAM_TYPE> freeIndexes;
 
 enum class LinearMemoryMode {
@@ -918,7 +924,11 @@ RamPage ramPageAllocNative(U8* native) {
 }
 
 void shutdownRam() {
+#ifdef BOXEDWINE_64
     refCounts.clear();
+#else
+    std::fill(std::begin(refCounts), std::end(refCounts), RamInfo());
+#endif
 #if (defined(__linux__) || defined(__APPLE__)) && (defined(BOXEDWINE_JIT_X64) || defined(BOXEDWINE_JIT_ARMV8))
     if (linearRam) {
         munmap(linearRam, (U64)1 << 32);
