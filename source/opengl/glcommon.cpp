@@ -1282,6 +1282,9 @@ U32 getPixelsLen(bool read, U32 dimensions, GLsizei width, GLsizei height, GLsiz
 
 const GLubyte* OPENGL_CALL_TYPE glcommonHost_glGetString(GLenum name) {
 #ifdef __EMSCRIPTEN__
+    if (name == VNBOX_GL_QUERY_HOST_BGRA_UPLOAD) {
+        return nullptr; // host wined3d converts BGRA rows itself; glcommonHost_glTexSubImage2D has no private formats
+    }
     if (const char* fixed = webglFixedString(name)) {
         return (const GLubyte*)fixed;
     }
