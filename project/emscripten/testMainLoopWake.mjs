@@ -11,6 +11,8 @@ const end = source.indexOf('    });', source.indexOf('requestAnimationFrame(fram
 assert(start >= 0 && end > start);
 const code = source.slice(start, end).replace(/#ifdef[\s\S]*?#endif/g, '');
 
+const busy = -1 - 24; // a busy tick with no guest timer due within the longest frame wait
+
 function browser({hidden = false} = {}) {
     let now = 0, ids = 0;
     const timers = new Map(), frames = new Map(), messages = [], listeners = new Map(), ticks = [];
@@ -85,7 +87,7 @@ test('input while a tick is running does not start another', async () => {
 test('hiding the page ends a wait for a frame, and hidden ticks wait for none', async () => {
     const b = browser();
     await b.advance(20);
-    await b.finish(-1);
+    await b.finish(busy);
     assert.equal(b.frames.size, 2); // the frame loop's and the wait's
     await b.advance(0);
     assert.equal(b.ticks.length, 1);
@@ -94,7 +96,7 @@ test('hiding the page ends a wait for a frame, and hidden ticks wait for none', 
     await b.advance(0);
     assert.equal(b.ticks.length, 2);
     await b.advance(20);
-    await b.finish(-1);
+    await b.finish(busy);
     await b.advance(0);
     assert.equal(b.ticks.length, 3);
 });
@@ -114,19 +116,46 @@ test('showing the page wakes an idle wait', async () => {
 test('a frame that never comes ends the wait at 24 ms, and no tick waits again until a frame comes', async () => {
     const b = browser();
     await b.advance(20);
-    await b.finish(-1);
+    await b.finish(busy);
     await b.advance(23);
     assert.equal(b.ticks.length, 1);
     await b.advance(1);
     assert.equal(b.ticks.length, 2);
     await b.advance(20);
-    await b.finish(-1); // no frames: straight on
+    await b.finish(busy); // no frames: straight on
     await b.advance(0);
     assert.equal(b.ticks.length, 3);
     await b.paint();    // frames are back: the wait is back
     await b.advance(20);
+    await b.finish(busy);
+    await b.advance(0);
+    assert.equal(b.ticks.length, 3);
+});
+
+// The bug: an idle guest whose timer was due (an audio driver's 10 ms period) waited behind the next frame, up to 24 ms.
+test('an idle tick whose timer is due runs the next tick at once, not after a frame', async () => {
+    const b = browser();
+    await b.advance(20);
     await b.finish(-1);
     await b.advance(0);
+    assert.equal(b.ticks.length, 2);
+    assert.equal(b.frames.size, 1); // only the frame loop's
+});
+
+// The bug: a busy guest's timer due sooner than the frame (an audio driver's 10 ms period) waited behind it, up to 24 ms.
+test('a guest timer due during a wait for a frame runs the next tick when due, and frames are still waited for', async () => {
+    const b = browser();
+    await b.advance(20);
+    await b.finish(-1 - 5);
+    await b.advance(4);
+    assert.equal(b.ticks.length, 1);
+    await b.advance(1);
+    assert.equal(b.ticks.length, 2);
+    assert.equal(b.frames.size, 1); // the wait's frame is cancelled: only the frame loop's
+    await b.finish(busy); // not taken for a missing frame: the next busy tick still waits
+    await b.advance(0);
+    assert.equal(b.ticks.length, 2);
+    await b.paint();
     assert.equal(b.ticks.length, 3);
 });
 

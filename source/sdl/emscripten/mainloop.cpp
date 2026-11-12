@@ -101,7 +101,9 @@ static U32 lastTitleUpdate = 0;
 static int mainLoopTimingMode = -1;
 static int mainLoopTimingValue = -1;
 #ifdef BOXEDWINE_JSPI
-static int jspiTickDelay = -1; // what boxedwine_tick returns: ms to wait before the next tick, -1 = next message
+// what boxedwine_tick returns: ms to wait before the next tick, or below 0 the next tick runs from a message, after a due
+// frame but at most -1 - jspiTickDelay ms later (-1: at once)
+static int jspiTickDelay = -1;
 #endif
 static U32 idleWaitMs = 16; // the idleWait= URL param: longest idle wait while no guest timer is due sooner
 
@@ -147,7 +149,8 @@ static void updateMainLoopTiming(bool idle) {
         }
     }
 #ifdef BOXEDWINE_JSPI
-    jspiTickDelay = mode == EM_TIMING_SETTIMEOUT ? value : -1;
+    // a busy guest waits for a due frame so the browser can paint, but not past its next timer; an idle guest whose timer is due runs at once
+    jspiTickDelay = mode == EM_TIMING_SETTIMEOUT ? value : idle ? -1 : -1 - (int)std::min(getNextTimer(), 24u);
     mainLoopTimingMode = mode;
     mainLoopTimingValue = value;
     return;
@@ -338,7 +341,7 @@ bool doMainLoop() {
     // re-entering while a tick is suspended, paced like updateMainLoopTiming paces
     // emscripten's loop (a message while the guest has work, a timeout while it sleeps).
     // Firefox runs a chain of messages ahead of painting (one frame per ~80 ms while the
-    // guest is busy, during movies and loads): once a frame is due, the next tick waits for it.
+    // guest is busy, during movies and loads): once a frame is due, the next busy tick waits for it.
     // Input during an idle wait runs the next tick right after the event's handlers have queued it.
     // Mouse motion does not: moving over an idle screen would run a tick per event, the next timer takes it.
     // A hidden page gets no frames: the guest and audio keep running, nothing is drawn (vnbox_set_hidden),
@@ -347,6 +350,7 @@ bool doMainLoop() {
     // window). A frame not there after 24 ms (a frame and a half at 60 Hz) ends the wait, and no tick waits again until a
     // frame comes: not pacing, the guest runs flat out then, this only removes a wait that may never end. It was 100 ms:
     // a browser 2-4 frames late (34-63 ms seen) held the guest that long, and the audio worklet holds about 30-40 ms.
+    // A guest timer due sooner (an audio driver's 10 ms period) ends the wait when it is due.
     EM_ASM({
         var tick = WebAssembly.promising(wasmExports["boxedwine_tick"]);
         var channel = new MessageChannel();
@@ -376,9 +380,10 @@ bool doMainLoop() {
         });
         var next = function() { tick().then(function(delay) {
             if (delay >= 0) wait(delay);
-            else if (!document.hidden && !noFrames && performance.now() - lastFrame > 12) {
+            else if (delay < -1 && !document.hidden && !noFrames && performance.now() - lastFrame > 12) {
                 raf = requestAnimationFrame(framed);
-                rafLate = setTimeout(function() { noFrames = true; cancelAnimationFrame(raf); framed(); }, 24);
+                var limit = -1 - delay; // 24, or sooner when a guest timer is due: that one is not a missing frame
+                rafLate = setTimeout(function() { if (limit == 24) noFrames = true; cancelAnimationFrame(raf); framed(); }, limit);
             }
             else post();
         }, function(e) {
