@@ -198,6 +198,7 @@ void testUtimensatPreservesAccessTimeInStat();
 void testFutimensPreservesAccessTimeInFstat();
 void testFutimensTime64SignExtendedSecondsPreservesAccessTimeInFstat();
 void testDirectoryReparseSidecarReplacedAfterRemoveAndRecreate();
+void testFailedRenameReturnsWithoutSleeping();
 void testDotDotAfterDotResolvesToParentDirectory();
 void testLinuxPathResolutionSemantics();
 void testUtf8NamesSurviveNativeFilesystemReload();
@@ -1310,6 +1311,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testFutimensPreservesAccessTimeInFstat, "Test futimens preserves access time in fstat", TEST_ENTRY_SERIAL},
     {testFutimensTime64SignExtendedSecondsPreservesAccessTimeInFstat, "Test futimens time64 sign-extended seconds in fstat", TEST_ENTRY_SERIAL},
     {testDirectoryReparseSidecarReplacedAfterRemoveAndRecreate, "Test directory reparse sidecar replacement after recreate", TEST_ENTRY_SERIAL},
+    {testFailedRenameReturnsWithoutSleeping, "Test failed rename returns without sleeping", TEST_ENTRY_SERIAL},
     {testDotDotAfterDotResolvesToParentDirectory, "Test ./.. resolves to parent directory", TEST_ENTRY_SERIAL},
     {testLinuxPathResolutionSemantics, "Test Linux pathname resolution semantics", TEST_ENTRY_SERIAL},
     {testUtf8NamesSurviveNativeFilesystemReload, "Test UTF-8 file names survive native filesystem reload", TEST_ENTRY_SERIAL},
