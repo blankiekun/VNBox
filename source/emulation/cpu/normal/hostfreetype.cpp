@@ -26,7 +26,7 @@
 // bytes come out) instead.
 //
 // A face is host or guest for its whole life: the faces win32u opens with FT_New_Memory_Face (every font it draws
-// with) are opened on the host, on a copy of the font bytes, in a host twin of the guest FT_Library. Every other face
+// with) are opened on the host, reading the font bytes from the guest's mapping, in a host twin of the guest FT_Library. Every other face
 // (win32u's FT_New_Face while it lists the installed fonts, fontconfig's, dwrite's) stays guest code, and so does
 // every call on it: a hooked function that gets a face, slot or library it doesn't know runs the guest function.
 // The guest reads a host face's public fields directly (face->glyph->outline, ->size->metrics, ->charmaps, the
@@ -38,8 +38,6 @@
 // FT_Library_SetLcdFilter and FT_Property_Set run on the twin too, then as guest code.
 // nativeFreetype=0 (URL) turns it off.
 #include "../../softmmu/kmemory_soft.h"
-#include <map>
-#include <tuple>
 #ifdef BOXEDWINE_HOST_FREETYPE
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -109,13 +107,12 @@ struct HostFtLibrary {
     FT_Library lib = nullptr;
     bool ok = true; // false: a setting the twin can't follow was made, new faces stay guest
 };
-struct HostFtData { std::vector<U8> bytes; U32 refs = 0; };
 struct HostFtFace {
     KProcess* process;
     U32 pid, guestLib;
     FT_Face face = nullptr;
-    std::shared_ptr<HostFtData> data;
-    U64 dataKey;
+    FT_StreamRec stream = {}; // the font: base, stream.size in the guest
+    U32 base = 0;
     std::vector<std::pair<U32, U32>> chunks; // guest mmaps: address, length
     U32 next = 0, end = 0; // bump allocation in the last chunk
     U32 gFace = 0, gCharmaps = 0, gCharmapPtrs = 0, gSizes = 0, gSize = 0, gSlot = 0, gFamily = 0, gStyle = 0;
@@ -126,7 +123,6 @@ struct HostFtFace {
 static std::unordered_map<U64, HostFtLibrary> hostFtLibraries; // pid << 32 | guest FT_Library
 static std::unordered_map<U64, std::unique_ptr<HostFtFace>> hostFtFaces; // pid << 32 | guest face mirror
 static std::unordered_map<U64, HostFtFace*> hostFtSlots; // pid << 32 | guest glyph slot mirror
-static std::map<std::tuple<U32, U32, U32>, std::weak_ptr<HostFtData>> hostFtDatas; // pid, guest base, size
 
 static void hostFtFree(U64 key, bool unmap) {
     auto it = hostFtFaces.find(key);
@@ -148,10 +144,19 @@ static void hostFtPurge() {
         if (!p || p.get() != e.second->process) stale.push_back(e.first);
     }
     for (U64 key : stale) hostFtFree(key, false);
-    for (auto it = hostFtDatas.begin(); it != hostFtDatas.end();) {
-        if (it->second.expired()) it = hostFtDatas.erase(it);
-        else ++it;
-    }
+}
+
+// The face's font bytes, read from the guest's mapping when FreeType needs them, as guest FreeType reads them: a new
+// face doesn't page in (or fetch, in a lazy game folder) the whole file. count 0 is a seek. Bytes no longer mapped
+// are a read error, where guest FreeType would fault.
+static unsigned long hostFtRead(FT_Stream stream, unsigned long offset, unsigned char* buffer, unsigned long count) {
+    if (offset > stream->size) return count ? 0 : 1;
+    count = std::min(count, stream->size - offset);
+    HostFtFace* f = (HostFtFace*)stream->descriptor.pointer;
+    KMemory* memory = f->process->memory;
+    if (!count || !memory->canRead(f->base + (U32)offset, (U32)count)) return 0;
+    memory->memcpy(buffer, f->base + (U32)offset, (U32)count);
+    return count;
 }
 
 static HostFtFace* hostFtFace(CPU* cpu, U32 face) {
@@ -221,6 +226,7 @@ static U32 hostFtCharmap(const HostFtFace& f, FT_CharMap cm) {
 // The face record and its size record, as the host's now (charmap and size metrics change).
 static void hostFtSyncFace(CPU* cpu, HostFtFace& f) {
     FT_FaceRec r = *f.face;
+    r.face_flags &= ~FT_FACE_FLAG_EXTERNAL_STREAM; // the host's stream; the guest's FT_New_Memory_Face face has its own
     r.family_name = gptr<FT_String>(f.gFamily);
     r.style_name = gptr<FT_String>(f.gStyle);
     r.available_sizes = gptr<FT_Bitmap_Size>(r.num_fixed_sizes ? f.gSizes : 0);
@@ -335,20 +341,18 @@ static bool hostFtNewMemoryFace(CPU* cpu, U32 lib, U32 base, U32 size, S32 index
     HostFtLibrary* l = hostFtLibrary(process->id, lib);
     if (!l || !aface || !memory->canWrite(aface, 4) || !size || size > 0x10000000 || !memory->canRead(base, size)) return false;
     hostFtPurge();
-    auto key = std::make_tuple(process->id, base, size);
-    std::shared_ptr<HostFtData> data = hostFtDatas[key].lock(); // shared with live faces of the same guest mapping only
-    if (!data) {
-        data = std::make_shared<HostFtData>();
-        data->bytes.resize(size);
-        memory->memcpy(data->bytes.data(), base, size);
-        hostFtDatas[key] = data;
-    }
     auto f = std::make_unique<HostFtFace>();
     f->process = process;
     f->pid = process->id;
     f->guestLib = lib;
-    f->data = data;
-    FT_Error err = FT_New_Memory_Face(l->lib, data->bytes.data(), (FT_Long)size, index, &f->face);
+    f->base = base;
+    f->stream.size = size;
+    f->stream.read = hostFtRead;
+    f->stream.descriptor.pointer = f.get();
+    FT_Open_Args args = {};
+    args.flags = FT_OPEN_STREAM;
+    args.stream = &f->stream;
+    FT_Error err = FT_Open_Face(l->lib, &args, index, &f->face);
     if (err) { // the same error the guest gets (same FreeType)
         memory->writed(aface, 0);
         result = err;
