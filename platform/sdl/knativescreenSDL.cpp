@@ -138,6 +138,29 @@ static void pixelsToRgba(const U8* src, U8* dst, U32 count) {
     }
 }
 
+// pixelsToRgba(src) equal to the count pixels at rgba?
+static bool sameAsRgba(const U8* src, const U8* rgba, U32 count) {
+    U32 i = 0;
+#ifdef __wasm_simd128__
+    const v128_t opaque = wasm_u32x4_splat(0xff000000);
+    auto diff = [&opaque](const U8* s, const U8* d) { // nonzero where the 4 pixels differ
+        v128_t v = wasm_v128_load(s);
+        v = wasm_i8x16_shuffle(v, v, 2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+        return wasm_v128_xor(wasm_v128_or(v, opaque), wasm_v128_load(d));
+    };
+    // 16 pixels a test, as sameBytes does 64 bytes
+    for (; i + 16 <= count; i += 16, src += 64, rgba += 64) {
+        v128_t d = wasm_v128_or(wasm_v128_or(diff(src, rgba), diff(src + 16, rgba + 16)),
+            wasm_v128_or(diff(src + 32, rgba + 32), diff(src + 48, rgba + 48)));
+        if (wasm_v128_any_true(d)) return false;
+    }
+#endif
+    for (; i < count; ++i, src += 4, rgba += 4) {
+        if (rgba[0] != src[2] || rgba[1] != src[1] || rgba[2] != src[0] || rgba[3] != 0xff) return false;
+    }
+    return true;
+}
+
 static bool useEmscriptenSoftwareRenderer(bool skipRenderer) {
     return KSystem::videoOption != VIDEO_NO_WINDOW && !skipRenderer;
 }
@@ -369,6 +392,7 @@ void KNativeScreenSDL::clear() {
         }
     }
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
+    emscriptenFullScreenSrc = nullptr;
     const bool skipRenderer = skipHiddenRenderer(visible, showOnDraw);
     if (!renderer && !emscriptenSoftwareDisabled && useEmscriptenSoftwareRenderer(skipRenderer)) {
         U32 size = screenWidth() * screenHeight() * 4;
@@ -449,19 +473,26 @@ void KNativeScreenSDL::putBitsOnWnd(U32 id, U8* bits, U32 bitsPerPixel, U32 srcP
     } else if (bitsPerPixel == 8 && wnd->bits) {
         bits = wnd->bits;
     } else if (bitsPerPixel == 16 && (isDirty || !wnd->bits)) {
+        // a 5 or 6 bit channel's 8 bit value, (v * 255) / 31 or 63, looked up instead of divided per pixel
+        static const struct Expand565 {
+            U32 r[32], g[64], b[32];
+            Expand565() {
+                for (U32 v = 0; v < 64; v++) {
+                    g[v] = ((v * 255) / 63) << 8;
+                    if (v < 32) {
+                        r[v] = ((v * 255) / 31) << 16;
+                        b[v] = (v * 255) / 31;
+                    }
+                }
+            }
+        } expand;
         wnd->ensureSize(dstPitch * height);
         for (U32 y = 0; y < height; y++) {
             U16* srcLine = (U16*)(bits + srcPitch * y);
             U32* dstLine = (U32*)(wnd->bits + dstPitch * y);
             for (U32 x = 0; x < width; x++, dstLine++, srcLine++) {
-                U32 r = (*srcLine & 0xF800) >> 11;
-                U32 g = (*srcLine & 0x07E0) >> 5;
-                U32 b = *srcLine & 0x001F;
-
-                r = (r * 255) / 31;
-                g = (g * 255) / 63;
-                b = (b * 255) / 31;
-                *dstLine = (r << 16) | (g << 8) | b;
+                U32 p = *srcLine;
+                *dstLine = expand.r[p >> 11] | expand.g[(p >> 5) & 0x3F] | expand.b[p & 0x1F];
             }
         }
         bits = wnd->bits;
@@ -572,10 +603,26 @@ void KNativeScreenSDL::putBitsOnWnd(U32 id, U8* bits, U32 bitsPerPixel, U32 srcP
         fillEmscriptenDesktop();
         if (copyW > 0 && copyH > 0) {
             U32 softwareSrcPitch = bitsPerPixel == 32 ? srcPitch : dstPitch;
-            for (S32 y = 0; y < copyH; ++y) {
-                U8* srcLine = bits + (srcY + y) * softwareSrcPitch + srcX * 4;
-                U8* dstLine = emscriptenSoftwareBuffer + ((copyY + y) * screenWidth() + copyX) * 4;
-                memcpy(dstLine, srcLine, copyW * 4);
+#ifndef BOXEDWINE_MULTI_THREADED
+            if (copyW == (S32)screenWidth() && copyH == (S32)screenHeight()) {
+                // This window is the whole frame so far. Nothing else runs before present() on this one
+                // thread, so its pixels stay put: present converts them for the canvas without this copy.
+                emscriptenFullScreenSrc = bits + srcY * softwareSrcPitch + srcX * 4;
+                emscriptenFullScreenPitch = softwareSrcPitch;
+            } else
+#endif
+            {
+                if (emscriptenFullScreenSrc) { // drawn over a full screen window: that one goes in the buffer first
+                    for (U32 y = 0; y < screenHeight(); ++y) {
+                        memcpy(emscriptenSoftwareBuffer + y * screenWidth() * 4, emscriptenFullScreenSrc + y * emscriptenFullScreenPitch, screenWidth() * 4);
+                    }
+                    emscriptenFullScreenSrc = nullptr;
+                }
+                for (S32 y = 0; y < copyH; ++y) {
+                    U8* srcLine = bits + (srcY + y) * softwareSrcPitch + srcX * 4;
+                    U8* dstLine = emscriptenSoftwareBuffer + ((copyY + y) * screenWidth() + copyX) * 4;
+                    memcpy(dstLine, srcLine, copyW * 4);
+                }
             }
             lastUpdateTime = KSystem::getMilliesSinceStart();
             emscriptenSoftwareDirty = true;
@@ -611,6 +658,8 @@ void KNativeScreenSDL::present() {
         presented = true;
     }
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_OPENGL_SDL)
+    const U8* fullScreenSrc = emscriptenFullScreenSrc; // only valid until this composite ends
+    emscriptenFullScreenSrc = nullptr;
     if (!renderer && !emscriptenSoftwareDisabled && useEmscriptenSoftwareRenderer(skipRenderer) && emscriptenSoftwareBuffer) {
         if (showOnDraw || !visible) {
             KOpenGLPtr openGL = KNativeSystem::getOpenGL();
@@ -626,8 +675,18 @@ void KNativeScreenSDL::present() {
         }
         fillEmscriptenDesktop(); // no window drew
         U32 frameBytes = screenWidth() * screenHeight() * 4;
-        if (emscriptenSoftwareDirty && emscriptenShownValid && emscriptenShownWidth == screenWidth()
-                && emscriptenShownHeight == screenHeight() && sameBytes(emscriptenSoftwareBuffer, emscriptenShownFrame, frameBytes)) {
+        bool same = false;
+        if (emscriptenSoftwareDirty && emscriptenShownValid && emscriptenShownWidth == screenWidth() && emscriptenShownHeight == screenHeight()) {
+            if (!fullScreenSrc) {
+                same = emscriptenShownFrameCurrent && sameBytes(emscriptenSoftwareBuffer, emscriptenShownFrame, frameBytes);
+            } else if (emscriptenRgbaShown) { // the canvas's frame is still in the RGBA buffer
+                same = true;
+                for (U32 y = 0; same && y < screenHeight(); ++y) {
+                    same = sameAsRgba(fullScreenSrc + y * emscriptenFullScreenPitch, emscriptenRgbaBuffer + y * screenWidth() * 4, screenWidth());
+                }
+            }
+        }
+        if (same) {
             // Every draw composites every window again (overlapping ones too): a frame equal to
             // the one on the canvas skips the RGBA conversion and putImageData.
             emscriptenSoftwareDirty = false;
@@ -640,20 +699,32 @@ void KNativeScreenSDL::present() {
                 emscriptenRgbaBuffer = new U8[frameBytes];
                 emscriptenRgbaBufferSize = frameBytes;
             }
-            pixelsToRgba(emscriptenSoftwareBuffer, emscriptenRgbaBuffer, frameBytes / 4);
+            if (fullScreenSrc) {
+                for (U32 y = 0; y < screenHeight(); ++y) {
+                    pixelsToRgba(fullScreenSrc + y * emscriptenFullScreenPitch, emscriptenRgbaBuffer + y * screenWidth() * 4, screenWidth());
+                }
+            } else {
+                pixelsToRgba(emscriptenSoftwareBuffer, emscriptenRgbaBuffer, frameBytes / 4);
+            }
             bool shown = boxedwinePresentSoftwareFrame(emscriptenRgbaBuffer, screenWidth(), screenHeight());
             if (vnboxStats.on) vnboxStats.presentSwMs += emscripten_get_now() - presentStart;
+            emscriptenRgbaShown = shown;
             if (shown) {
                 emscriptenSoftwareDirty = false;
                 presented = true;
-                if (emscriptenShownFrameSize < frameBytes) {
-                    delete[] emscriptenShownFrame;
-                    emscriptenShownFrame = new U8[frameBytes];
-                    emscriptenShownFrameSize = frameBytes;
+                if (fullScreenSrc) {
+                    emscriptenShownFrameCurrent = false; // the RGBA buffer is what the next frame is compared with
+                } else {
+                    if (emscriptenShownFrameSize < frameBytes) {
+                        delete[] emscriptenShownFrame;
+                        emscriptenShownFrame = new U8[frameBytes];
+                        emscriptenShownFrameSize = frameBytes;
+                    }
+                    // Swapped, not copied: the next composite writes the whole buffer again
+                    std::swap(emscriptenShownFrame, emscriptenSoftwareBuffer);
+                    std::swap(emscriptenShownFrameSize, emscriptenSoftwareBufferSize);
+                    emscriptenShownFrameCurrent = true;
                 }
-                // Swapped, not copied: the next composite writes the whole buffer again
-                std::swap(emscriptenShownFrame, emscriptenSoftwareBuffer);
-                std::swap(emscriptenShownFrameSize, emscriptenSoftwareBufferSize);
                 emscriptenShownValid = true;
                 emscriptenShownWidth = screenWidth();
                 emscriptenShownHeight = screenHeight();
