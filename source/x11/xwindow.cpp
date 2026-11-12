@@ -1089,24 +1089,30 @@ int XWindow::configure(U32 mask, XWindowChanges* changes) {
 	bool sizeChanged = false;
 	U32 width = this->width();
 	U32 height = this->height();
+	bool changed = false; // a real X server sends no Expose for a request that changes nothing
 
 	if (mask & CWX) {
+		changed |= left != changes->x;
 		left = changes->x;
 		sizeChanged = true;
 	}
 	if (mask & CWY) {
+		changed |= top != changes->y;
 		top = changes->y;
 		sizeChanged = true;
 	}
 	if (mask & CWWidth) {
+		changed |= width != changes->width;
 		width = changes->width;
 		sizeChanged = true;
 	}
 	if (mask & CWHeight) {
+		changed |= height != changes->height;
 		height = changes->height;
 		sizeChanged = true;
 	}
 	if (mask & CWBorderWidth) {
+		changed |= border_width != changes->border_width;
 		border_width = changes->border_width;
 	}
 	if (mask & CWSibling) {
@@ -1119,6 +1125,7 @@ int XWindow::configure(U32 mask, XWindowChanges* changes) {
 			if (index >= 0 && index < (int)parent->zchildren.size() - 1) {
 				parent->zchildren.erase(parent->zchildren.begin() + index);
 				parent->zchildren.push_back(shared_from_this());
+				changed = true; // raised: what is on top changed
 			}
 		}
 	}
@@ -1129,13 +1136,15 @@ int XWindow::configure(U32 mask, XWindowChanges* changes) {
 		}
 		KNativeSystem::moveWindow(shared_from_this());
 	}
-	XServer::getServer()->isDisplayDirty = true; // moved, resized or restacked
-	configureNotify();
+	if (changed) {
+		XServer::getServer()->isDisplayDirty = true; // moved, resized or restacked
+	}
+	configureNotify(); // still sent: Wine may wait for it
 	if (sizeChanged) {
 		fitToScreen();
 	}
 	// :TODO:
-	if (c_class == InputOutput && isMapped) {
+	if (changed && c_class == InputOutput && isMapped) {
 		XServer::getServer()->iterateEventMask(id, ExposureMask, [this](const DisplayDataPtr& data) {
 			exposeNofity(data, 0, 0, this->width(), this->height(), 0);
 			});

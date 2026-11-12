@@ -316,6 +316,12 @@ static void writePixel(U8* row, U32 x, U32 bits, U32 value) {
 }
 
 void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src) {
+	XPixmapPtr mask;
+	if (gc.values.clip_mask) mask = XServer::getServer()->getPixmap(gc.values.clip_mask);
+	drawPixel(gc, x, y, src, mask.get());
+}
+
+void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src, XDrawable* mask) {
 	if (!data || x < 0 || y < 0 || (U32)x >= w || (U32)y >= h) return;
 	S64 cx = (S64)x - gc.values.clip_x_origin, cy = (S64)y - gc.values.clip_y_origin;
 	if (gc.hasClipRects) {
@@ -329,7 +335,6 @@ void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src) {
 		if (!visible) return;
 	}
 	if (gc.values.clip_mask) {
-		auto mask = XServer::getServer()->getPixmap(gc.values.clip_mask);
 		if (!mask || !mask->getData() || cx < 0 || cy < 0 || cx >= mask->width() || cy >= mask->height() ||
 			!(mask->getData()[cy * mask->getBytesPerLine() + cx / 8] & (1 << (cx & 7)))) return;
 	}
@@ -426,6 +431,8 @@ int XDrawable::fillRectangle(KThread* thread, const std::shared_ptr<XGC>& gc, S3
 	S32 bottom = (S32)std::min<S64>(h, (S64)y + height);
 	if (!data || left >= right || top >= bottom) return Success;
 	bool simpleCopy = style == FillSolid && gc->values.function == GXcopy && gc->values.plane_mask == 0xffffffff && !gc->hasClipRects && !gc->values.clip_mask;
+	XPixmapPtr clipMask; // looked up once, not for every pixel
+	if (gc->values.clip_mask) clipMask = XServer::getServer()->getPixmap(gc->values.clip_mask);
 	for (S32 dstY = top; dstY < bottom; dstY++) {
 		if (simpleCopy && bits == 32) {
 			U32* row = (U32*)(data + dstY * bytes_per_line);
@@ -450,7 +457,7 @@ int XDrawable::fillRectangle(KThread* thread, const std::shared_ptr<XGC>& gc, S3
 					source = pixel ? gc->values.foreground : gc->values.background;
 				} else source = pixel;
 			}
-			drawPixel(*gc, dstX, dstY, source);
+			drawPixel(*gc, dstX, dstY, source, clipMask.get());
 		}
 	}
 	setDirty();
