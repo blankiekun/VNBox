@@ -949,6 +949,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostClock, "Test native clock reads (QPC, system time)"},
     {testHostLibcMutex, "Test native pthread_mutex_lock/unlock"},
     {testHostHookPatchedExport, "Test a game's patch on a hooked export runs instead of the hook"},
+    {testHostHookPrefetchSlices, "Test a hook script's prefetch loads a slice per syscall, not a whole exe", TEST_ENTRY_SERIAL},
     {testHostLibcHead, "Test a hooked export's head op does the call or goes on with the guest function"},
     {testHostLibcDeclines, "Test native libc leaves DF, segments, code, copy-on-write and unloaded pages to the guest"},
     {testHostCrt, "Test native Wine CRT memcpy/memset/strlen/strstr/_strnicmp"},

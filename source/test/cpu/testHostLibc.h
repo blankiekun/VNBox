@@ -18,6 +18,7 @@ void testHostLibcStrtol();
 void testHostClock();
 void testHostLibcMutex();
 void testHostHookPatchedExport();
+void testHostHookPrefetchSlices();
 void testHostLibcHead();
 void testHostLibcDeclines();
 void testHostCrt();
