@@ -352,9 +352,11 @@ struct DibCall {
         return g.buf + (size_t)i * g.hostStride;
     }
 
-    void copyIn() {
+    // skip: a region the call overwrites byte for byte, not copied in
+    void copyIn(S32 skip = -1) {
         for (U32 i = 0; i < regionCount; i++) {
             DibRegion& g = regions[i];
+            if ((S32)i == skip) continue;
             for (S32 y = g.y0; y < g.y1; y++) dibCopy(memory, (U32)(g.bits + (S64)y * g.stride + g.b0), hostRow(g, y), g.hostStride, false);
         }
     }
@@ -423,7 +425,15 @@ bool hostDibdrvRun(CPU* cpu, U32 index) {
     case DIB_MASK_RECT: // (dst, rc, src, origin, rop2)
         if (!dibRead(memory, a[1], &rc, 16) || !dibRead(memory, a[3], &pt, 8)) return dibGuestCall(slot);
         if (!call.add(a[0], rc, true) || !call.add(a[2], dibRectAt(pt, rc.right - rc.left, rc.bottom - rc.top), false) || !call.prepare()) return dibGuestCall(slot);
-        call.copyIn();
+        if (slot == DIB_COPY_RECT && a[4] == 13 && e.table <= 5 && call.args[0].region != call.args[1].region) {
+            // R2_COPYPEN at 8-32 bpp (copy_rect_32/24/16/8) memmoves every byte of the rect: when the dst's host rows
+            // are exactly the rect (no partial DWORD or 24 bpp triplet at either edge), its old bytes are never read
+            const DibRegion& g = call.regions[call.args[0].region];
+            S32 left = diGet(call.args[0].info, DI_RECT) + rc.left, right = diGet(call.args[0].info, DI_RECT) + rc.right;
+            call.copyIn(left == 0 && (U64)right * g.bpp == (U64)g.hostStride * 8 ? (S32)call.args[0].region : -1);
+        } else {
+            call.copyIn();
+        }
         if (slot == DIB_COPY_RECT) ((void (*)(const void*, const void*, const void*, const void*, S32, S32))fn)(call.args[0].info, &rc, call.args[1].info, &pt, (S32)a[4], (S32)a[5]);
         else ((void (*)(const void*, const void*, const void*, const void*, S32))fn)(call.args[0].info, &rc, call.args[1].info, &pt, (S32)a[4]);
         call.copyOut();
@@ -496,10 +506,18 @@ bool hostDibdrvRun(CPU* cpu, U32 index) {
         S32 length = params[3];
         if (length <= 0 || length > 0x1000000) return dibGuestCall(slot);
         // one side steps every pixel (dst for stretch_row, src for shrink_row), the other when err > 0; a step after
-        // the last pixel isn't read or written
+        // the last pixel isn't read or written. Wine's Bresenham terms (err_add_2 = 2 minor, err_add_1 = 2 minor - 2 major,
+        // err_start in (err_add_1, err_add_2]) keep err in that range, so the moves over n steps are
+        // ceil((err_start + (n - 1) err_add_2) / 2 major), without stepping; any other terms are stepped through.
         S32 err = params[0], moves = 0;
-        for (S32 i = 0; i < length - 1; i++) {
-            if (err > 0) { moves++; err += params[1]; } else err += params[2];
+        S64 add = params[2], d = add - params[1];
+        if (add >= 0 && add <= d && err > add - d && err <= add) {
+            S64 num = err + (S64)(length - 2) * add;
+            moves = num <= 0 ? 0 : (S32)((num + d - 1) / d);
+        } else {
+            for (S32 i = 0; i < length - 1; i++) {
+                if (err > 0) { moves++; err += params[1]; } else err += params[2];
+            }
         }
         S32 dstSteps = slot == DIB_STRETCH_ROW ? length - 1 : moves, srcSteps = slot == DIB_STRETCH_ROW ? moves : length - 1;
         if (!call.add(a[0], dibRowSpan(pt, dstSteps, params[4]), true) || !call.add(a[2], dibRowSpan(pt2, srcSteps, params[5]), false) || !call.prepare()) return dibGuestCall(slot);
