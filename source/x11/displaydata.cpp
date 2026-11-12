@@ -33,6 +33,10 @@ void DisplayData::putEvent(const XEvent& event, bool inFront) {
 		BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(eventMutex);
 		if (inFront) {
 			eventQueue.push_front(event);
+		} else if (event.type == MotionNotify && !eventQueue.empty() && eventQueue.back().type == MotionNotify &&
+			eventQueue.back().xmotion.window == event.xmotion.window && eventQueue.back().xmotion.state == event.xmotion.state) {
+			// a real X server keeps one pending motion: a click must not wait behind a backlog of positions
+			eventQueue.back() = event;
 		} else {
 			eventQueue.push_back(event);
 		}

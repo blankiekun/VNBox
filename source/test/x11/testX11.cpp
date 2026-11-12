@@ -916,6 +916,39 @@ void testX11FreeCursor() {
     server->destroyWindow(window->id);
 }
 
+// Bug: every pointer motion stayed in the event queue, so a click waited behind all the positions before it.
+void testX11MotionCoalesced() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto thread = testContext().thread;
+    auto server = XServer::getServer();
+    DisplayDataPtr data = server->getDisplayDataByAddressOfDisplay(thread->memory, server->openDisplay(thread));
+    XEvent motion = {};
+    motion.type = MotionNotify;
+    motion.xmotion.window = 5;
+    for (int x = 1; x <= 3; x++) {
+        motion.xmotion.x = x;
+        data->putEvent(motion);
+    }
+    XEvent press = {};
+    press.type = ButtonPress;
+    press.xbutton.window = 5;
+    data->putEvent(press);
+    motion.xmotion.x = 4;
+    data->putEvent(motion);
+    motion.xmotion.x = 5;
+    motion.xmotion.state = 1; // a button is now held: not the same motion
+    data->putEvent(motion);
+    U32 count = data->lockEvents();
+    if (count != 4) testFail("X11 queued motion was not coalesced, %u events", count);
+    else if (data->getEvent(0)->xmotion.x != 3 || data->getEvent(1)->type != ButtonPress || data->getEvent(2)->xmotion.x != 4 || data->getEvent(3)->xmotion.x != 5)
+        testFail("X11 motion coalescing lost the newest position or reordered a press");
+    data->unlockEvents();
+    server->closeDisplay(thread, data);
+}
+
 void testX11PaletteInvalidation() {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
     x11_init();
