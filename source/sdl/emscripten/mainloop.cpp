@@ -101,7 +101,9 @@ static U32 lastTitleUpdate = 0;
 static int mainLoopTimingMode = -1;
 static int mainLoopTimingValue = -1;
 #ifdef BOXEDWINE_JSPI
-static int jspiTickDelay = -1; // what boxedwine_tick returns: ms to wait before the next tick, -1 = next message
+// what boxedwine_tick returns: ms to wait before the next tick, or below 0 the next tick runs from a message, after a due
+// frame but at most -1 - jspiTickDelay ms later (-1: at once)
+static int jspiTickDelay = -1;
 #endif
 static U32 idleWaitMs = 16; // the idleWait= URL param: longest idle wait while no guest timer is due sooner
 
@@ -147,7 +149,8 @@ static void updateMainLoopTiming(bool idle) {
         }
     }
 #ifdef BOXEDWINE_JSPI
-    jspiTickDelay = mode == EM_TIMING_SETTIMEOUT ? value : -1;
+    // a busy guest waits for a due frame so the browser can paint; an idle guest whose timer is due runs at once
+    jspiTickDelay = mode == EM_TIMING_SETTIMEOUT ? value : idle ? -1 : -1 - 24;
     mainLoopTimingMode = mode;
     mainLoopTimingValue = value;
     return;
@@ -338,7 +341,7 @@ bool doMainLoop() {
     // re-entering while a tick is suspended, paced like updateMainLoopTiming paces
     // emscripten's loop (a message while the guest has work, a timeout while it sleeps).
     // Firefox runs a chain of messages ahead of painting (one frame per ~80 ms while the
-    // guest is busy, during movies and loads): once a frame is due, the next tick waits for it.
+    // guest is busy, during movies and loads): once a frame is due, the next busy tick waits for it.
     // Input during an idle wait runs the next tick right after the event's handlers have queued it.
     // Mouse motion does not: moving over an idle screen would run a tick per event, the next timer takes it.
     // A hidden page gets no frames: the guest and audio keep running, nothing is drawn (vnbox_set_hidden),
@@ -376,7 +379,7 @@ bool doMainLoop() {
         });
         var next = function() { tick().then(function(delay) {
             if (delay >= 0) wait(delay);
-            else if (!document.hidden && !noFrames && performance.now() - lastFrame > 12) {
+            else if (delay < -1 && !document.hidden && !noFrames && performance.now() - lastFrame > 12) {
                 raf = requestAnimationFrame(framed);
                 rafLate = setTimeout(function() { noFrames = true; cancelAnimationFrame(raf); framed(); }, 24);
             }
