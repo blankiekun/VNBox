@@ -245,7 +245,8 @@ enum : U32 {
     HOST_FREETYPE = HOST_VORBIS + 32, // + FTH_*: libfreetype.so.6's exports win32u uses (hostfreetype.cpp)
     HOST_DIBDRV = HOST_FREETYPE + 32, // + entry: win32u.so's DIB primitives (hostdibdrv.cpp)
     HOST_GLYPHM = 0x1000, // + GM_*: win32u.so's text measuring (hostglyphm.cpp)
-    HOST_DSOUND = 0x1100 // + DS_*: dsound.dll.so's mix loops (hostdsound.cpp)
+    HOST_DSOUND = 0x1100, // + DS_*: dsound.dll.so's mix loops (hostdsound.cpp)
+    HOST_STATIC_CRT = 0x1200 // + signature index: MSVC CRT functions linked into a game's own code (hoststaticcrt.cpp)
 };
 static const char* const hostLibcNames[LIBC_STRSTR] = {
     "", "memcpy", "memmove", "memset", "memcmp", "memchr", "strlen", "strnlen", "strcmp", "strncmp",
@@ -260,6 +261,8 @@ bool hostDsoundEnabled();
 bool hostDsoundRun(CPU* cpu, U32 fn);
 U32 hostLibcFnId(const char* name);
 U32 hostCrtFnId(const char* name);
+U32 hostStaticCrtAt(CPU* cpu, U32 eip); // hoststaticcrt.cpp
+U32 hostStaticCrtFn(CPU* cpu, U32 index);
 static bool hostLibcEnabled() {
 #ifdef __EMSCRIPTEN__
     if (vnboxUrlIs("nativeLibc", "0")) {
@@ -537,6 +540,7 @@ U32 hostLibcAt(CPU* cpu, U32 eip) {
     if (hostLibcTestFn && eip == hostLibcTestAddress) return hostHookPatched(cpu, eip) ? LIBC_NONE : hostLibcTestFn;
 #endif
     if (U32 vorbis = hostVorbisAt(cpu, eip)) return HOST_VORBIS + vorbis - 1;
+    if (U32 crt = hostStaticCrtAt(cpu, eip)) return HOST_STATIC_CRT + crt - 1;
     if ((!hostElfAny && !hostAcmAny && !hostClockAny && !hostDibdrvAny && !hostGlyphmAny) || !(hostLibcPageOffsets[(eip & K_PAGE_MASK) >> 3] & (1 << (eip & 7)))) return LIBC_NONE;
     KProcess* process = cpu->thread->process.get();
     U32 offset = process->getModuleEip(eip); // file offset in the mapping holding eip
@@ -694,6 +698,14 @@ static bool libcStrtol(KMemory* memory, U32 nptr, U32 endptr, S32 base, bool isS
 // above it); on success sets EAX and pops the return address into eip, as the function's `ret` would.
 // False (nothing changed) means the guest function has to run.
 bool hostLibcRun(CPU* cpu, U32 fn) {
+    bool msvcMove = false; // a static MSVC memcpy/memmove: touches both ranges even when dst == src
+    if (fn >= HOST_STATIC_CRT) { // the bytes are checked again on every call
+        static const U32 libcFn[] = { LIBC_NONE, LIBC_MEMMOVE, LIBC_MEMSET, LIBC_STRLEN, LIBC_STRNCMP }; // by hoststaticcrt.cpp's SC_*
+        U32 kind = hostStaticCrtFn(cpu, fn - HOST_STATIC_CRT);
+        if (!kind || kind >= sizeof(libcFn) / sizeof(libcFn[0])) return false;
+        fn = libcFn[kind];
+        msvcMove = fn == LIBC_MEMMOVE;
+    }
     if (fn >= HOST_DSOUND) return hostDsoundRun(cpu, fn - HOST_DSOUND);
     if (fn >= HOST_GLYPHM) return hostGlyphmRun(cpu, fn - HOST_GLYPHM);
     if (fn == HOST_ACM) return hostAcmRun(cpu);
@@ -710,7 +722,7 @@ bool hostLibcRun(CPU* cpu, U32 fn) {
     switch (fn) {
     case LIBC_MEMCPY: // rep movsb
     case LIBC_MEMMOVE: // backward when dst > src, nothing when dst == src
-        if (fn == LIBC_MEMMOVE && a0 == a1) { result = a0; break; }
+        if (fn == LIBC_MEMMOVE && a0 == a1 && !msvcMove) { result = a0; break; }
         if (!libcRange(memory, a1, a2, false) || !libcRange(memory, a0, a2, true)) return false;
         libcCopy(memory, a0, a1, a2, fn == LIBC_MEMMOVE && a0 > a1);
         memory->checkDebugTrapOnMemoryWrite(a0, a2);

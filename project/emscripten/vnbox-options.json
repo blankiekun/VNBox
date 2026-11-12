@@ -67,6 +67,13 @@
       "group": "Speed", "restart": true, "experimental": false
     },
     {
+      "name": "nativeStaticCrt",
+      "label": "Native built-in C library",
+      "description": "Runs the C library copy, fill, length and compare functions that a game's own program has built in (recognised by their exact code) as browser code instead of emulated x86. Same results.",
+      "type": "bool", "default": true, "urlValues": { "true": "1", "false": "0" },
+      "group": "Speed", "restart": true, "experimental": false
+    },
+    {
       "name": "nativeGlyphMetrics",
       "label": "Native text measuring",
       "description": "Answers Wine's cached text measuring (text extents, glyph metrics) as browser code instead of emulated x86.",

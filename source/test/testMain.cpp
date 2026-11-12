@@ -36,6 +36,7 @@
 #include "cpu/testHostDibdrv.h"
 #include "cpu/testHostGlyphm.h"
 #include "cpu/testHostDsound.h"
+#include "cpu/testHostStaticCrt.h"
 #include "cpu/testHostWined3d.h"
 #include "opengl/testHostWined3dWgl.h"
 #include "cpu/testCMov.h"
@@ -956,6 +957,9 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
     {testHostDsoundSameBytes, "Test host dsound convert/mix leave the bytes the guest functions do"},
     {testHostDsoundDeclines, "Test host dsound convert/mix leave what they can't do to the guest"},
+    {testHostStaticCrtCalls, "Test static MSVC CRT bodies are hosted with the same results"},
+    {testHostStaticCrtMatch, "Test a changed or overwritten static CRT body is not hosted"},
+    {testHostStaticCrtHead, "Test a static CRT call runs through the head op"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostAcmBadFile, "Test a corrupt vorbis.acm can't make the host allocate gigabytes"},
