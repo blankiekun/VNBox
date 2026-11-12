@@ -26,6 +26,7 @@ void testDecodedOpLargeRangeRemoval();
 void testJitOverlappingBlockUnmap();
 void testJitOverlappingBlockRemoveCode();
 void testJitOverlappingBlockOwnership();
+void testGuestMemcpyOverlap();
 
 #ifdef BOXEDWINE_MULTI_THREADED
 void testDecodedOpInvalidationDefersCrossThreadReuse();

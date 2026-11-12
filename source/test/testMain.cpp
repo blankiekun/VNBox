@@ -1170,6 +1170,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testJitOverlappingBlockUnmap, "Test JIT overlapping block unmap", TEST_ENTRY_SERIAL},
     {testJitOverlappingBlockRemoveCode, "Test JIT overlapping block code removal", TEST_ENTRY_SERIAL},
     {testJitOverlappingBlockOwnership, "Test JIT overlapping block ownership", TEST_ENTRY_SERIAL},
+    {testGuestMemcpyOverlap, "Test guest memcpy overlap", TEST_ENTRY_SERIAL},
 #ifdef BOXEDWINE_MULTI_THREADED
     {testDecodedOpInvalidationDefersCrossThreadReuse, "Test decoded op invalidation defers cross-thread reuse"},
     {testDecodedOpCacheCloneExecDetach, "Test decoded op cache CLONE_VM exec detach"},
