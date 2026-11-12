@@ -13901,33 +13901,60 @@ void JitWasmCodeGen::emitChainReturn(S32 targetLocal) {
 // other case returns to the dispatcher. The budget check also bounds a chain
 // that never returns, and nextOp stays set for the dispatcher either way.
 // A caller that just stored a known non-null target into cpu->nextOp passes
-// its local: the sequence then reads the op through it instead of reloading
-// cpu->nextOp per field, and skips the null check.
+// its local: the sequence then reads the op through it and skips the null
+// check. Otherwise cpu->nextOp is read once into a scratch local.
+// Values used twice (the op, blockInstructionCount, pfnJitCode) are kept in
+// scratch locals when the pool has room: no call or store to them runs in
+// between, and the build is single-threaded.
 void JitWasmCodeGen::emitChainToNextOp(S32 targetLocal) {
 #ifndef BOXEDWINE_MULTI_THREADED
+    static_assert(sizeof(DecodedOp*) == 4 && sizeof(U32) == 4 &&
+        offsetof(CPU, wasmJitBailout) == offsetof(CPU, wasmJitActiveBlock) + 4,
+        "the hop clears wasmJitActiveBlock and wasmJitBailout with one i64 store");
     if (!m_chainBlocks) {
         return;
     }
-    bool known = targetLocal >= 0;
-    if (jitCheapHopDisabled()) {
-        known = false;
+    auto tryAllocScratch = [this]() -> S32 {
+        for (U32 i = 0; i < WASM_TMP_LOCAL_COUNT; i++) {
+            if (!m_scratchInUse[i]) {
+                m_scratchInUse[i] = true;
+                return (S32)(WASM_TMP_LOCAL_BASE + i);
+            }
+        }
+        return -1;
+    };
+    bool known = targetLocal >= 0 && !jitCheapHopDisabled();
+    S32 opLocal = known ? targetLocal : -1;
+    S32 ownOpLocal = -1;
+    if (!known && !jitCheapHopDisabled()) {
+        ownOpLocal = opLocal = tryAllocScratch();
+        if (opLocal >= 0) {
+            m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+            m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
+            m_emitter.emitLocalSet((U32)opLocal);
+        }
     }
-    auto nextOp = [this, known, targetLocal](U32 field, bool half = false) {
-        if (known) {
-            m_emitter.emitLocalGet((U32)targetLocal);
+    S32 countLocal = tryAllocScratch();
+    S32 codeLocal = tryAllocScratch();
+    auto pushOp = [this, opLocal]() {
+        if (opLocal >= 0) {
+            m_emitter.emitLocalGet((U32)opLocal);
         } else {
             m_emitter.emitLocalGet(WASM_CPU_LOCAL);
             m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
         }
+    };
+    auto nextOp = [this, &pushOp](U32 field, bool half = false) {
+        pushOp();
         if (half) m_emitter.emitI32Load16U(field); else m_emitter.emitI32Load(field);
     };
     // nextOp && nextOp->pfn == startJITOp && !yield && blockInstructionCount < contextTimeRemaining
+    // && nextOp->pfnJitCode, one branch. A null op reads low linear memory, which is mapped.
     nextOp((U32)offsetof(DecodedOp, pfn));
     m_emitter.emitI32Const((S32)(uintptr_t)(OpCallback)wasmStartJITOp);
     m_emitter.emitOp(WASM_I32_EQ);
     if (!known) {
-        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-        m_emitter.emitI32Load((U32)offsetof(CPU, nextOp));
+        pushOp();
         m_emitter.emitOp(WASM_I32_EQZ);
         m_emitter.emitOp(WASM_I32_EQZ);
         m_emitter.emitOp(WASM_I32_AND);
@@ -13938,13 +13965,17 @@ void JitWasmCodeGen::emitChainToNextOp(S32 targetLocal) {
     m_emitter.emitOp(WASM_I32_AND);
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Load((U32)offsetof(CPU, blockInstructionCount));
+    if (countLocal >= 0) m_emitter.emitLocalTee((U32)countLocal);
     m_emitter.emitI32Const((S32)(uintptr_t)&contextTimeRemaining);
     m_emitter.emitI32Load(0);
     m_emitter.emitOp(WASM_I32_LT_S);
     m_emitter.emitOp(WASM_I32_AND);
-    m_emitter.setNextBranchHint(WasmBranchHint::Likely);
-    m_emitter.emitIf();
     nextOp((U32)offsetof(DecodedOp, pfnJitCode));
+    if (codeLocal >= 0) m_emitter.emitLocalTee((U32)codeLocal);
+    m_emitter.emitOp(WASM_I32_EQZ);
+    m_emitter.emitOp(WASM_I32_EQZ);
+    m_emitter.emitOp(WASM_I32_AND);
+    m_emitter.setNextBranchHint(WasmBranchHint::Likely);
     m_emitter.emitIf();
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     { // HOPCOUNT: g_hopCnt[base + (mod[src] == mod[dst])]++
@@ -13999,23 +14030,31 @@ void JitWasmCodeGen::emitChainToNextOp(S32 targetLocal) {
 #endif
     // What wasmStartJITOp's loop and boxedwine_wasm_call_block do per block.
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Load((U32)offsetof(CPU, blockInstructionCount));
+    if (countLocal >= 0) {
+        m_emitter.emitLocalGet((U32)countLocal);
+    } else {
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitI32Load((U32)offsetof(CPU, blockInstructionCount));
+    }
     nextOp((U32)offsetof(DecodedOp, blockOpCount), true);
     m_emitter.emitOp(WASM_I32_ADD);
     m_emitter.emitI32Store((U32)offsetof(CPU, blockInstructionCount));
+    // wasmJitActiveBlock = 0 and wasmJitBailout = NONE in one store: the two fields are adjacent.
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Const(0);
-    m_emitter.emitI32Store((U32)offsetof(CPU, wasmJitActiveBlock));
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Const(WASM_JIT_BAILOUT_NONE);
-    m_emitter.emitI32Store((U32)offsetof(CPU, wasmJitBailout));
+    m_emitter.emitI64Const(0);
+    m_emitter.emitI64Store((U32)offsetof(CPU, wasmJitActiveBlock), 2);
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Const(0); // relocBase: only relocatable (persistence) blocks use one, and they guard 0
-    nextOp((U32)offsetof(DecodedOp, pfnJitCode));
+    if (codeLocal >= 0) {
+        m_emitter.emitLocalGet((U32)codeLocal);
+    } else {
+        nextOp((U32)offsetof(DecodedOp, pfnJitCode));
+    }
     m_emitter.emitReturnCallIndirect(m_typeVoidI32I32, 0);
     m_emitter.emitEnd();
-    m_emitter.emitEnd();
+    if (codeLocal >= 0) freeScratch((U32)codeLocal);
+    if (countLocal >= 0) freeScratch((U32)countLocal);
+    if (ownOpLocal >= 0) freeScratch((U32)ownOpLocal);
 #endif
 }
 
@@ -14221,12 +14260,17 @@ void JitWasmCodeGen::jumpEip(RegPtr reg) {
     // state once, after the nonfaulting cache lookup.
     syncDirtyRegsToHost();
     U32 address = allocScratch(), page = allocScratch(), target = allocScratch();
+#ifdef BOXEDWINE_MULTI_THREADED
+    // Another thread can set terminating at any time. Single-threaded, only
+    // terminateCurrentThread sets it for the running thread, and it sets
+    // cpu->yield too, which the hop tests before it tail-calls.
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitI32Load((U32)offsetof(CPU, thread));
     m_emitter.emitI32Load8U((U32)offsetof(KThread, terminating));
     m_emitter.emitOp(WASM_I32_EQZ);
     m_emitter.setNextBranchHint(WasmBranchHint::Likely);
     m_emitter.emitIf();
+#endif
     pushRegValue(reg);
     if (cpu->thread->process->hasSetSeg[CS]) {
         m_emitter.emitLocalGet(WASM_CPU_LOCAL);
@@ -14268,14 +14312,14 @@ void JitWasmCodeGen::jumpEip(RegPtr reg) {
     m_emitter.emitIf();
     // A live cache entry can still belong to the other CS decode mode.
     // Leave replacement/invalidation to getNextOp on a format mismatch.
+    // cpu->big is this block's decode mode while it runs: a block is entered
+    // only through an op of the current mode, and CS changes only in far
+    // branches, which are emulated and end the block (compile()).
     m_emitter.emitLocalGet(target);
     m_emitter.emitI32Load8U((U32)offsetof(DecodedOp, flags2));
     m_emitter.emitI32Const(OP_FLAG2_DECODED_32BIT);
     m_emitter.emitOp(WASM_I32_AND);
-    m_emitter.emitOp(WASM_I32_EQZ);
-    m_emitter.emitLocalGet(WASM_CPU_LOCAL);
-    m_emitter.emitI32Load((U32)offsetof(CPU, big));
-    m_emitter.emitOp(WASM_I32_EQZ);
+    m_emitter.emitI32Const((S32)(this->firstOp->flags2 & OP_FLAG2_DECODED_32BIT));
     m_emitter.emitOp(WASM_I32_EQ);
     m_emitter.setNextBranchHint(WasmBranchHint::Likely);
     m_emitter.emitIf();
@@ -14292,7 +14336,9 @@ void JitWasmCodeGen::jumpEip(RegPtr reg) {
     m_emitter.emitEnd();
     m_emitter.emitEnd();
     m_emitter.emitEnd();
+#ifdef BOXEDWINE_MULTI_THREADED
     m_emitter.emitEnd();
+#endif
     freeScratch(target); freeScratch(page); freeScratch(address);
     blockExit();
 }
