@@ -514,12 +514,23 @@ function lazyHoldStores(names, onHeld) {
 function lazyMountOverlay(mountPoint) {
     if (!IDBFS.lazyFiltered) { // persist only files the game wrote, not the folder's own
         var getLocalSet = IDBFS.getLocalSet;
-        IDBFS.getLocalSet = (mount, callback) => getLocalSet(mount, (err, set) => {
-            if (set && mount.mountpoint.startsWith(LAZY_APP_MOUNT_ROOT)) {
-                for (var path in set.entries) if ((FS.analyzePath(path).object || {}).lazyPristine) delete set.entries[path];
-            }
-            callback(err, set);
-        });
+        // IDBFS's own walk (lstat per path, mounts followed), over the nodes: a path lookup per game file on
+        // every save is a hitch, and the game thread waits for it.
+        IDBFS.getLocalSet = (mount, callback) => {
+            if (!mount.mountpoint.startsWith(LAZY_APP_MOUNT_ROOT)) return getLocalSet(mount, callback);
+            var entries = {};
+            var walk = (dir, dirPath) => {
+                for (var name in dir.contents) {
+                    var node = dir.contents[name], path = dirPath + "/" + name;
+                    if (node.mounted) node = node.mounted.root;
+                    if (node.lazyPristine || FS.isLink(node.mode) && (FS.analyzePath(path).object || {}).lazyPristine) continue; // a link to one, as before
+                    entries[path] = { timestamp: node.node_ops.getattr(node).mtime };
+                    if (FS.isDir(node.mode)) walk(node, path);
+                }
+            };
+            try { walk(mount.root, mount.mountpoint); } catch (e) { return callback(e); }
+            callback(null, { type: "local", entries: entries });
+        };
         IDBFS.lazyFiltered = true;
     }
     FS.mkdirTree(mountPoint);
@@ -550,7 +561,7 @@ function mountLazyApp(mountPoint, name, dirHandle) {
 }
 
 async function mountLazyAppJspi(mountPoint, name, dirHandle) {
-    var entries = [];
+    var entries = [], files = [];
     var walk = async (dir, prefix) => {
         for await (var [entryName, h] of dir.entries()) {
             var path = prefix + entryName;
@@ -558,14 +569,24 @@ async function mountLazyAppJspi(mountPoint, name, dirHandle) {
                 entries.push({ path: path, dir: true });
                 await walk(h, path + "/");
             } else {
-                var f = await h.getFile();
-                entries.push({ path: path, file: lazyFiles.length, size: f.size, bytes: lazyEagerTake(f.size) ? new Uint8Array(await f.arrayBuffer()) : null });
-                lazyFiles.push(f);
-                lazyHandles.push(h);
+                files.push({ path: path, h: h });
+                entries.push(files.at(-1));
             }
         }
     };
     await walk(await dirHandle, "");
+    // Opened and read 32 at a time, in listing order: one await per file is seconds for a big folder.
+    for (var i = 0; i < files.length; i += 32) {
+        var batch = files.slice(i, i + 32), got = await Promise.all(batch.map(e => e.h.getFile()));
+        await Promise.all(batch.map((e, j) => {
+            var f = got[j];
+            e.file = lazyFiles.length; e.size = f.size; e.bytes = null;
+            lazyFiles.push(f);
+            lazyHandles.push(e.h);
+            delete e.h;
+            return lazyEagerTake(f.size) && f.arrayBuffer().then(b => { e.bytes = new Uint8Array(b); });
+        }));
+    }
     lazyBuildTree(mountPoint + "/" + name, entries, null);
 }
 
