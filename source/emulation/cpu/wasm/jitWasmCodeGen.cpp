@@ -1106,6 +1106,7 @@ struct WasmJitInlineDep {
     DecodedOp* caller;  // caller block start
 };
 static std::unordered_map<U32, std::vector<WasmJitInlineDep>> g_wasmJitInlineDeps;
+static U64 g_wasmJitInlineDepLookups = 0;
 
 static void wasmJitAddInlineDep(KMemory* memory, U32 start, U32 end, U32 callerEip, DecodedOp* caller) {
     for (U32 page = start >> K_PAGE_SHIFT; page <= ((end - 1) >> K_PAGE_SHIFT); ++page) {
@@ -1114,8 +1115,7 @@ static void wasmJitAddInlineDep(KMemory* memory, U32 start, U32 end, U32 callerE
         for (size_t i = 0; i < deps.size();) {
             const WasmJitInlineDep& dep = deps[i];
             if (dep.memory == memory) {
-                // The caller's op is gone: its code was unmapped or rewritten. A callee page that is never
-                // invalidated (ntdll) would otherwise keep one entry per caller load for good.
+                g_wasmJitInlineDepLookups++;
                 if (memory->getDecodedOp(dep.callerEip) != dep.caller) {
                     deps[i] = deps.back();
                     deps.pop_back();
@@ -5780,6 +5780,10 @@ U32 wasmJitTestInlineDepCount() {
     U32 count = 0;
     for (const auto& page : g_wasmJitInlineDeps) count += (U32)page.second.size();
     return count;
+}
+
+U64 wasmJitTestInlineDepLookups() {
+    return g_wasmJitInlineDepLookups;
 }
 
 U64 wasmJitTestInlinedCalls() {
