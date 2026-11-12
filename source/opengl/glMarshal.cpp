@@ -22,6 +22,9 @@
 #include GLH
 #include "glcommon.h"
 #include "glMarshal.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #define MARSHAL_TYPE(type, p, m, s) type* buffer##p; U32 buffer##p##_len; type* marshal##p(CPU* cpu, U32 address, U32 count) {if (!address) return nullptr; if (!count) return (type*)address; if (buffer##p && buffer##p##_len<count) { delete[] buffer##p; buffer##p=nullptr;} if (!buffer##p) {buffer##p = new type[count]; buffer##p##_len = count;}for (U32 i=0;i<count;i++) {buffer##p[i] = cpu->memory->read##m(address);address+=s;} return buffer##p;}
 
@@ -206,22 +209,22 @@ U32 getPixelsLen(bool read, U32 dimensions, GLsizei width, GLsizei height, GLsiz
     GLint imageHeight = 0;
 
     if (read) {
-        GL_FUNC(pglGetIntegerv)(GL_UNPACK_ROW_LENGTH, &pixels_per_row);
-        GL_FUNC(pglGetIntegerv)(GL_UNPACK_SKIP_PIXELS, &skipPixels);
-        GL_FUNC(pglGetIntegerv)(GL_UNPACK_SKIP_ROWS, &skipRows);
-        GL_FUNC(pglGetIntegerv)(GL_UNPACK_ALIGNMENT, &alignment);
+        getPixelStore(GL_UNPACK_ROW_LENGTH, &pixels_per_row);
+        getPixelStore(GL_UNPACK_SKIP_PIXELS, &skipPixels);
+        getPixelStore(GL_UNPACK_SKIP_ROWS, &skipRows);
+        getPixelStore(GL_UNPACK_ALIGNMENT, &alignment);
         if (dimensions == 3) {
-            GL_FUNC(pglGetIntegerv)(GL_UNPACK_SKIP_IMAGES, &skipImages);
-            GL_FUNC(pglGetIntegerv)(GL_UNPACK_IMAGE_HEIGHT, &imageHeight);
+            getPixelStore(GL_UNPACK_SKIP_IMAGES, &skipImages);
+            getPixelStore(GL_UNPACK_IMAGE_HEIGHT, &imageHeight);
         }
     } else {
-        GL_FUNC(pglGetIntegerv)(GL_PACK_ROW_LENGTH, &pixels_per_row);
-        GL_FUNC(pglGetIntegerv)(GL_PACK_SKIP_PIXELS, &skipPixels);
-        GL_FUNC(pglGetIntegerv)(GL_PACK_SKIP_ROWS, &skipRows);
-        GL_FUNC(pglGetIntegerv)(GL_PACK_ALIGNMENT, &alignment);
+        getPixelStore(GL_PACK_ROW_LENGTH, &pixels_per_row);
+        getPixelStore(GL_PACK_SKIP_PIXELS, &skipPixels);
+        getPixelStore(GL_PACK_SKIP_ROWS, &skipRows);
+        getPixelStore(GL_PACK_ALIGNMENT, &alignment);
         if (dimensions == 3) {
-            GL_FUNC(pglGetIntegerv)(GL_PACK_SKIP_IMAGES, &skipImages);
-            GL_FUNC(pglGetIntegerv)(GL_PACK_IMAGE_HEIGHT, &imageHeight);
+            getPixelStore(GL_PACK_SKIP_IMAGES, &skipImages);
+            getPixelStore(GL_PACK_IMAGE_HEIGHT, &imageHeight);
         }
     }
     if (!pixels_per_row)
@@ -675,12 +678,79 @@ GLint marshalGet(GLenum param) {
     return result;
 }
 
+#ifdef __EMSCRIPTEN__
+// Emscripten (-sFULL_ES3) keeps these four bindings on each WebGL context in its glBindBuffer, glDeleteBuffers and
+// glBindVertexArray, and its own glTexImage*, glReadPixels, glDrawElements and glVertexAttribPointer choose their path
+// from them, so they are the bindings every GL call on that context is made with. Reading them here costs no
+// getParameter on each upload and draw.
+EM_JS(int, boxedwine_buffer_bound_js, (int target), {
+    var gl = typeof GLctx !== 'undefined' && GLctx;
+    if (!gl) {
+        return 0;
+    }
+    switch (target) {
+    case 0x8892: return gl.currentArrayBufferBinding ? 1 : 0; // GL_ARRAY_BUFFER
+    case 0x8893: return gl.currentElementArrayBufferBinding ? 1 : 0; // GL_ELEMENT_ARRAY_BUFFER
+    case 0x88EB: return gl.currentPixelPackBufferBinding ? 1 : 0; // GL_PIXEL_PACK_BUFFER
+    default: return gl.currentPixelUnpackBufferBinding ? 1 : 0; // GL_PIXEL_UNPACK_BUFFER
+    }
+});
+
+// Every pixelStorei on a WebGL context, whoever makes it (guest glPixelStorei, host wined3d, texSubImage2D, the
+// capture code, SDL), goes through that context's pixelStorei method. The wrapper forgets the parameter being set, so
+// a value read once from WebGL is kept until it is set again, whether or not WebGL accepted the new value. -1 (never
+// a pixel-store value) when there is no value, where glGetIntegerv leaves the destination as it was.
+EM_JS(int, boxedwine_pixel_store_js, (int pname), {
+    var gl = typeof GLctx !== 'undefined' && GLctx;
+    if (!gl) {
+        return -1;
+    }
+    var store = gl.boxedwinePixelStore;
+    if (!store) {
+        store = gl.boxedwinePixelStore = {};
+        var pixelStorei = gl.pixelStorei;
+        gl.pixelStorei = function(p, v) {
+            delete store[p];
+            pixelStorei.call(gl, p, v);
+        };
+    }
+    if (!(pname in store)) {
+        var value = gl.getParameter(pname);
+        if (typeof value !== 'number') {
+            return -1;
+        }
+        store[pname] = value;
+    }
+    return store[pname];
+});
+#endif
+
+// glGetIntegerv for a GL_PACK_* or GL_UNPACK_* parameter.
+void getPixelStore(GLenum pname, GLint* value) {
+#ifdef __EMSCRIPTEN__
+    GLint result = boxedwine_pixel_store_js(pname);
+    if (result >= 0) {
+        *value = result;
+    }
+#else
+    GL_FUNC(pglGetIntegerv)(pname, value);
+#endif
+}
+
 GLboolean PIXEL_PACK_BUFFER() {
+#ifdef __EMSCRIPTEN__
+    return boxedwine_buffer_bound_js(GL_PIXEL_PACK_BUFFER);
+#else
     return marshalGet(GL_PIXEL_PACK_BUFFER_BINDING)!=0;
+#endif
 }
 
 GLboolean ARRAY_BUFFER() {
+#ifdef __EMSCRIPTEN__
+    return boxedwine_buffer_bound_js(GL_ARRAY_BUFFER);
+#else
     return marshalGet(GL_ARRAY_BUFFER_BINDING)!=0;
+#endif
 }
 
 GLboolean RESULT_BUFFER() {
@@ -688,11 +758,19 @@ GLboolean RESULT_BUFFER() {
 }
 
 GLboolean ELEMENT_ARRAY_BUFFER() {
+#ifdef __EMSCRIPTEN__
+    return boxedwine_buffer_bound_js(GL_ELEMENT_ARRAY_BUFFER);
+#else
     return marshalGet(GL_ELEMENT_ARRAY_BUFFER_BINDING)!=0;
+#endif
 }
 
 GLboolean PIXEL_UNPACK_BUFFER() {
+#ifdef __EMSCRIPTEN__
+    return boxedwine_buffer_bound_js(GL_PIXEL_UNPACK_BUFFER);
+#else
     return marshalGet(GL_PIXEL_UNPACK_BUFFER_BINDING)!=0;
+#endif
 }
 
 const char* glcommon_glLightv_print_name(GLenum e) {

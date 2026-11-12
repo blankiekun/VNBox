@@ -49,6 +49,9 @@ jobs:
       - name: testMainLoopWake.mjs
         run: node --test project/emscripten/testMainLoopWake.mjs
 
+      - name: testGLStateShadow.mjs
+        run: node --test project/emscripten/testGLStateShadow.mjs
+
       - name: test_read_ahead.cpp
         run: |
           g++ -std=c++17 -I source/io tools/test_read_ahead.cpp -o "$RUNNER_TEMP/test_read_ahead"

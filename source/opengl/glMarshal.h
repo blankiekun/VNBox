@@ -332,6 +332,7 @@ U32 getMap2Count(GLenum target);
 GLint glcommon_glGetPixelMap_size(GLenum map);
 GLint get_bytes_per_pixel(GLenum format, GLenum type);
 GLint marshalGet(GLenum param);
+void getPixelStore(GLenum pname, GLint* value);
 GLboolean PIXEL_PACK_BUFFER();
 GLboolean ARRAY_BUFFER();
 GLboolean RESULT_BUFFER();
