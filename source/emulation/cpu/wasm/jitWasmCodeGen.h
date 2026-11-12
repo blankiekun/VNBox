@@ -248,7 +248,13 @@ static constexpr U32 WASM_READ_TABLE_LOCAL = WASM_MMX_LOCAL_BASE + 8;
 static constexpr U32 WASM_WRITE_TABLE_LOCAL = WASM_READ_TABLE_LOCAL + 1;
 // Next-op EIP handed to the shared bailout tail (see emitStoreBailoutCheck).
 static constexpr U32 WASM_BAIL_EIP_LOCAL = WASM_WRITE_TABLE_LOCAL + 1;
-static constexpr U32 WASM_LOCAL_COUNT = WASM_BAIL_EIP_LOCAL + 1;
+// Host address of [base+lo] for a direct loop's hoisted stack accesses, or 0:
+// ESP read, ESP write, EBP read, EBP write. Zeroed after every call while the
+// loop is open (WasmEmitter::zeroAfterCall), since page tables change only
+// inside calls in the single-threaded build.
+static constexpr U32 WASM_STACK_HOST_LOCAL_BASE = WASM_BAIL_EIP_LOCAL + 1;
+static constexpr U32 WASM_STACK_HOST_LOCAL_COUNT = 4;
+static constexpr U32 WASM_LOCAL_COUNT = WASM_STACK_HOST_LOCAL_BASE + WASM_STACK_HOST_LOCAL_COUNT;
 
 // ---------------------------------------------------------------------------
 // Mapping from emulated register index to WASM local index.
@@ -1029,6 +1035,15 @@ public:
         bool keepsCarry = false;
         LoopRegisterUsage registers;
         std::vector<ForwardTarget> forwardTargets;
+        // Hoisted page lookups for [ESP+disp] / [EBP+disp] (findStackHoists).
+        // stackHoists[0] is ESP, [1] is EBP; span 0 means not hoisted.
+        struct StackHoist {
+            S32 lo = 0;      // lowest displacement accessed
+            U32 span = 0;    // bytes from base+lo to the end of the highest access
+            bool reads = false;
+            bool writes = false; // stores and read-modify-writes
+        } stackHoists[2];
+        std::vector<DecodedOp*> stackHoistOps; // accesses that use a hoisted pointer
     };
     // Labels surrounding the function's selected loops, for forward edges
     // that stay outside them or leave/skip a loop.
@@ -1070,6 +1085,12 @@ protected:
     void movFromMemory(DecodedOp* op, JitWidth dstWidth, JitWidth srcWidth, bool signExtend = false);
     RegPtr readMemoryValue(JitWidth width, RegPtr address, RegPtr result, bool signExtend = false, bool allowGroup = true);
     void prepareReadGroupAddress(RegPtr address);
+    // Loop-invariant stack page lookups (see findStackHoists in the .cpp).
+    void findStackHoists(DirectLoop& loop);
+    void emitStackHoistInit();
+    void emitStackHoistRefresh();
+    bool stackHoistFor(JitWidth width, bool store, U32& local, U32& offset) const;
+    DecodedOp* m_stackHoistOp = nullptr; // current op, when its access uses a hoisted pointer
     ReadGroup m_readGroup;
     bool m_readGroupActive = false;
     bool m_readGroupReady = false;

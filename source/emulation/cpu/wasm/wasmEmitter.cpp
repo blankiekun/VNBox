@@ -159,6 +159,7 @@ void WasmEmitter::beginFunction(const std::vector<std::pair<U32, WasmType>>& loc
     m_ctrlDepth = 0;
     mmxCached = 0;
     m_mmxCtrl.clear();
+    zeroAfterCall.clear();
     m_currentFunctionIndex = m_lastFunctionIndex;
     clearNextBranchHint();
     // Encode locals declaration
@@ -344,12 +345,21 @@ void WasmEmitter::emitCall(U32 funcIdx, bool keepsMmxCache) {
     if (!keepsMmxCache) mmxCached = 0;
     m_currentBody.push_back(WASM_CALL);
     appendULEB128(m_currentBody, funcIdx);
+    emitZeroAfterCall();
 }
 void WasmEmitter::emitCallIndirect(U32 typeIdx, U32 tableIdx) {
     mmxCached = 0;
     m_currentBody.push_back(WASM_CALL_INDIRECT);
     appendULEB128(m_currentBody, typeIdx);
     appendULEB128(m_currentBody, tableIdx);
+    emitZeroAfterCall();
+}
+
+void WasmEmitter::emitZeroAfterCall() {
+    for (U32 local : zeroAfterCall) {
+        emitI32Const(0);
+        emitLocalSet(local);
+    }
 }
 
 void WasmEmitter::emitReturnCallIndirect(U32 typeIdx, U32 tableIdx) {

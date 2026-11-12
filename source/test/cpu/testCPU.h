@@ -77,6 +77,7 @@ void testWasmJitForwardBranches();
 void testWasmJitLoopReachability();
 void testWasmJitRepMovsdState();
 void testWasmJitMultipleLoops();
+void testWasmJitStackHoist();
 void testWasmJitConditionalSideExits();
 #ifndef BOXEDWINE_MULTI_THREADED
 void testWasmJitSideExitTargetRewritten();
