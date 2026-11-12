@@ -1097,6 +1097,24 @@ static bool jitCheapHopDisabled() {
 #endif
 }
 
+// ret / jmp reg / call reg probe CPU::wasmJumpTargets before walking the op cache (jumpEip).
+// jumpCache=0 turns it off; tests use BOXEDWINE_WASM_JIT_JUMP_CACHE=0. Single-threaded builds only.
+#ifndef BOXEDWINE_MULTI_THREADED
+static bool wasmJumpTargetCacheEnabled() {
+#if defined(__EMSCRIPTEN__) && !defined(__TEST)
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = vnboxUrlIs("jumpCache", "0") ? 0 : 1;
+        klog_fmt("[vnbox] jit jump target cache %s", enabled ? "on" : "off (jumpCache=0)");
+    }
+    return enabled != 0;
+#else
+    const char* value = std::getenv("BOXEDWINE_WASM_JIT_JUMP_CACHE");
+    return !value || strcmp(value, "0") != 0;
+#endif
+}
+#endif
+
 // A block with an inlined callee runs a copy of the callee's code without owning its ops, so code invalidation
 // can't reach it through DecodedOp::blockStart. Keyed by callee page: {callee range -> caller block}.
 struct WasmJitInlineDep {
@@ -14233,6 +14251,56 @@ void JitWasmCodeGen::jumpEip(RegPtr reg) {
         m_emitter.emitI32Load((U32)offsetof(CPU, seg) + CS * sizeof(Seg) + offsetof(Seg, address));
         m_emitter.emitOp(WASM_I32_ADD);
     }
+#ifndef BOXEDWINE_MULTI_THREADED
+    // Jump target cache (CPU::wasmJumpTargets): one probe at a computed slot instead of the dependent walk below.
+    // A hit is an op the walk found at this address with nothing removed from the op cache and no decode-mode
+    // change since (generation), so it is the op the walk would find now.
+    const bool targetCache = !wasmJitPersistenceActive() && wasmJumpTargetCacheEnabled();
+    U32 entry = 0;
+    if (targetCache) {
+        const U32 entries = (U32)offsetof(CPU, wasmJumpTargets);
+        entry = allocScratch();
+        m_emitter.emitLocalTee(address);
+        m_emitter.emitLocalGet(address);
+        m_emitter.emitI32Const(10);
+        m_emitter.emitOp(WASM_I32_SHR_U);
+        m_emitter.emitOp(WASM_I32_XOR);
+        static_assert(sizeof(CPU::WasmJumpTarget) == 16, "jump target slots are indexed with a shift by 4");
+        m_emitter.emitI32Const(4);
+        m_emitter.emitOp(WASM_I32_SHL);
+        m_emitter.emitI32Const((S32)((CPU::WASM_JUMP_TARGET_COUNT - 1) * sizeof(CPU::WasmJumpTarget)));
+        m_emitter.emitOp(WASM_I32_AND);
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitOp(WASM_I32_ADD);
+        m_emitter.emitLocalTee(entry);
+        m_emitter.emitI32Load(entries + (U32)offsetof(CPU::WasmJumpTarget, address));
+        m_emitter.emitLocalGet(address);
+        m_emitter.emitOp(WASM_I32_EQ);
+        m_emitter.emitLocalGet(entry);
+        m_emitter.emitI64Load(entries + (U32)offsetof(CPU::WasmJumpTarget, generation));
+        m_emitter.emitI32Const((S32)(uintptr_t)&g_wasmJumpTargetGeneration);
+        m_emitter.emitI64Load(0);
+        m_emitter.emitOp(WASM_I64_EQ);
+        m_emitter.emitOp(WASM_I32_AND);
+        m_emitter.setNextBranchHint(WasmBranchHint::Likely);
+        m_emitter.emitIf();
+        m_emitter.emitLocalGet(entry);
+        m_emitter.emitI32Load(entries + (U32)offsetof(CPU::WasmJumpTarget, op));
+        m_emitter.emitLocalSet(target);
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitLocalGet(target);
+        m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
+#ifdef BOXEDWINE_WASM_JIT_PROFILE
+        m_emitter.emitLocalGet(WASM_CPU_LOCAL);
+        m_emitter.emitI32Const((U32)(m_currentWasmOp ? m_currentWasmOp->inst : InstructionCount));
+        m_emitter.emitI32Store((U32)offsetof(CPU, tmpReg));
+        emitProfileSampledCall(HELPER_PROFILE_EXIT_GENERIC);
+#endif
+        WASM_JIT_HOP_KIND(2) emitChainReturn((S32)target);
+        m_emitter.emitEnd();
+        m_emitter.emitLocalGet(address);
+    }
+#endif
     m_emitter.emitLocalTee(address);
     m_emitter.emitI32Const(K_PAGE_SHIFT);
     m_emitter.emitOp(WASM_I32_SHR_U);
@@ -14279,6 +14347,22 @@ void JitWasmCodeGen::jumpEip(RegPtr reg) {
     m_emitter.emitOp(WASM_I32_EQ);
     m_emitter.setNextBranchHint(WasmBranchHint::Likely);
     m_emitter.emitIf();
+#ifndef BOXEDWINE_MULTI_THREADED
+    if (targetCache) {
+        // Fill the slot the probe missed.
+        const U32 entries = (U32)offsetof(CPU, wasmJumpTargets);
+        m_emitter.emitLocalGet(entry);
+        m_emitter.emitLocalGet(address);
+        m_emitter.emitI32Store(entries + (U32)offsetof(CPU::WasmJumpTarget, address));
+        m_emitter.emitLocalGet(entry);
+        m_emitter.emitLocalGet(target);
+        m_emitter.emitI32Store(entries + (U32)offsetof(CPU::WasmJumpTarget, op));
+        m_emitter.emitLocalGet(entry);
+        m_emitter.emitI32Const((S32)(uintptr_t)&g_wasmJumpTargetGeneration);
+        m_emitter.emitI64Load(0);
+        m_emitter.emitI64Store(entries + (U32)offsetof(CPU::WasmJumpTarget, generation));
+    }
+#endif
     m_emitter.emitLocalGet(WASM_CPU_LOCAL);
     m_emitter.emitLocalGet(target);
     m_emitter.emitI32Store((U32)offsetof(CPU, nextOp));
@@ -14293,6 +14377,9 @@ void JitWasmCodeGen::jumpEip(RegPtr reg) {
     m_emitter.emitEnd();
     m_emitter.emitEnd();
     m_emitter.emitEnd();
+#ifndef BOXEDWINE_MULTI_THREADED
+    if (targetCache) freeScratch(entry);
+#endif
     freeScratch(target); freeScratch(page); freeScratch(address);
     blockExit();
 }

@@ -7,6 +7,10 @@
 #include "../normal/normalCPU.h"
 #include <new>
 
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+U64 g_wasmJumpTargetGeneration = 1;
+#endif
+
 #if defined(BOXEDWINE_WASM_JIT) && defined(BOXEDWINE_MULTI_THREADED)
 void wasmJitMtLeaveCpu(CPU* cpu);
 void wasmJitMtUnregisterCpu(CPU* cpu);
@@ -147,6 +151,12 @@ U32 CPU::makeSegmentInternal(U32 value) {
 }
 
 void CPU::setIsBig(U32 value) {
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+    // A cached jump target was decoded in the old mode.
+    if (this->big != value) {
+        wasmJumpTargetsInvalidate();
+    }
+#endif
     this->big = value;
 }
 
@@ -203,6 +213,10 @@ void CPU::reset() {
     // Bind every cached lookup to the new address space on reset as well as
     // construction; the old shared cache may outlive this CPU.
     opCache = (DecodedOp***)&getMemData(memory)->opCache.pageData[0];
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+    // Entries name ops of the old address space's cache.
+    memset(this->wasmJumpTargets, 0, sizeof(this->wasmJumpTargets));
+#endif
 #ifdef BOXEDWINE_MULTI_THREADED
     decodedOpCacheGlobalEpoch = getMemData(memory)->opCache.getEpochAddress();
 #endif

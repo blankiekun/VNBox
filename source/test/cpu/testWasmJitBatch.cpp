@@ -609,6 +609,206 @@ struct JitShape {
 };
 }
 
+// Catches: ret / jmp reg / call reg taking a CPU::wasmJumpTargets entry that is not the op the op cache holds at the
+// address it jumps to: a return address changed on the stack (to an address sharing the entry), code rewritten at
+// the target, a decode-mode change, an exec reset; and recursion, longjmp-style and signal unwinds past pending
+// returns, the target block compiled again. The poisoned entry proves the probe is used.
+void testWasmJitJumpTargetCache() {
+    JitShape s;
+    CPU* cpu = s.cpu;
+    TestContext& context = s.context;
+    const U32 cs = cpu->seg[CS].address;
+    auto slot = [&](U32 offset) -> CPU::WasmJumpTarget& {
+        return cpu->wasmJumpTargets[CPU::wasmJumpTargetIndex(cs + offset)];
+    };
+    auto run = [&](DecodedOp* op, U32 offset) {
+        cpu->eip.u32 = offset;
+        cpu->nextOp = op;
+        cpu->yield = false;
+        for (U32 i = 0; i < 4096 && (!cpu->nextOp || cpu->nextOp->inst != TestEnd); ++i) {
+            cpu->blockInstructionCount = 0;
+            try {
+                cpu->run();
+            } catch (int) {
+                cpu->nextOp = nullptr; // a guest fault delivered its signal (as in testRunCPU)
+            }
+        }
+        if (!cpu->nextOp || cpu->nextOp->inst != TestEnd) testFail("jump target cache: code at %x did not reach its end", offset);
+    };
+    auto expect = [&](const char* what, U32 ecx, U32 edx, U32 ebx, U32 esi) {
+        if (cpu->reg[1].u32 != ecx || cpu->reg[2].u32 != edx || cpu->reg[3].u32 != ebx || cpu->reg[6].u32 != esi || cpu->reg[4].u32 != s.stackTop) {
+            testFail("jump target cache, %s: ecx=%u edx=%u ebx=%u esi=%u esp=%x (expected %u %u %u %u %x)", what,
+                cpu->reg[1].u32, cpu->reg[2].u32, cpu->reg[3].u32, cpu->reg[6].u32, cpu->reg[4].u32, ecx, edx, ebx, esi, s.stackTop);
+        }
+    };
+    // An address whose entry is the one 0x007 uses.
+    U32 alias = 0;
+    for (U32 offset = 0x400; offset < 0x2000 && !alias; ++offset) {
+        if (CPU::wasmJumpTargetIndex(cs + offset) == CPU::wasmJumpTargetIndex(cs + 0x007)) alias = offset;
+    }
+    if (!alias) testFail("jump target cache: no address shares 0x007's entry");
+
+    // main: mov eax,0x100; call eax; inc ebx; int 97. f: inc ecx; ret.
+    s.code(0x000, {0xb8, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd0, 0x43, 0xcd, 0x97});
+    s.code(0x100, {0x41, 0xc3});
+    s.code(alias, {0x46, 0xcd, 0x97}); // inc esi; int 97
+    // main2: push alias; mov eax,0x100; jmp eax -> f's ret pops alias.
+    s.code(0x020, {0x68, (U8)alias, (U8)(alias >> 8), 0x00, 0x00, 0xb8, 0x00, 0x01, 0x00, 0x00, 0xff, 0xe0});
+    // main3 / f3: recursion ecx deep. f3: dec ecx; jz +7; mov eax,0x180; call eax; inc ebx; ret.
+    s.code(0x040, {0xb8, 0x80, 0x01, 0x00, 0x00, 0xff, 0xd0, 0xcd, 0x97});
+    s.code(0x180, {0x49, 0x74, 0x07, 0xb8, 0x80, 0x01, 0x00, 0x00, 0xff, 0xd0, 0x43, 0xc3});
+    // main4 / g / h: longjmp. main4: mov edi,esp; mov eax,0x1a0; call eax; inc ebx; int 97 (not reached).
+    // g: mov eax,0x1c0; call eax; ret. h: mov esp,edi; mov eax,0x70; jmp eax. 0x70: inc esi; int 97.
+    s.code(0x060, {0x89, 0xe7, 0xb8, 0xa0, 0x01, 0x00, 0x00, 0xff, 0xd0, 0x43, 0xcd, 0x97});
+    s.code(0x070, {0x46, 0xcd, 0x97});
+    s.code(0x1a0, {0xb8, 0xc0, 0x01, 0x00, 0x00, 0xff, 0xd0, 0xc3});
+    s.code(0x1c0, {0x89, 0xfc, 0xb8, 0x70, 0x00, 0x00, 0x00, 0xff, 0xe0});
+    // main5 / k / handler: a fault in k, the SIGSEGV handler unwinds like h. main5: mov edi,esp; mov eax,0x1e0;
+    // call eax; inc ebx; int 97 (not reached). k: mov eax,[faultTarget]; ret.
+    const U32 faultTarget = TEST_HEAP_ADDRESS + 0x4000;
+    const U32 disp = faultTarget - cpu->seg[DS].address;
+    s.code(0x080, {0x89, 0xe7, 0xb8, 0xe0, 0x01, 0x00, 0x00, 0xff, 0xd0, 0x43, 0xcd, 0x97});
+    s.code(0x1e0, {0xa1, (U8)disp, (U8)(disp >> 8), (U8)(disp >> 16), (U8)(disp >> 24), 0xc3});
+    // The handler runs with flat segments: it jumps to 0x070's linear address.
+    const U32 landing = TEST_CODE_ADDRESS + 0x070;
+    s.code(0x220, {0x89, 0xfc, 0xb8, (U8)landing, (U8)(landing >> 8), (U8)(landing >> 16), (U8)(landing >> 24), 0xff, 0xe0});
+
+    DecodedOp* main = s.compile(0x000);
+    DecodedOp* main2 = s.compile(0x020);
+    DecodedOp* main3 = s.compile(0x040);
+    DecodedOp* main4 = s.compile(0x060);
+    DecodedOp* main5 = s.compile(0x080);
+    s.compile(0x100);
+    s.compile(0x180);
+    s.compile(0x1a0);
+    s.compile(0x1c0);
+    {
+        DecodedOp* target = cpu->getOp(cs + 0x007, 0); // inc ebx; int 97: compiled if the JIT takes it
+        startNewJIT(cpu, cs + 0x007, target);
+    }
+
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    run(main, 0x000);
+    expect("first ret", 1, 0, 1, 0);
+    CPU::WasmJumpTarget& entry = slot(0x007);
+    if (entry.address != cs + 0x007 || entry.op != context.memory->getDecodedOp(cs + 0x007) || entry.generation != g_wasmJumpTargetGeneration) {
+        testFail("jump target cache: a ret that walked the op cache must fill its entry");
+    }
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    run(main, 0x000);
+    expect("second ret", 1, 0, 1, 0);
+
+    // The probe is used: an entry naming another op is followed.
+    const CPU::WasmJumpTarget saved = entry;
+    entry.op = cpu->getOp(cs + alias, 0);
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    run(main, 0x000);
+    expect("poisoned entry", 1, 0, 0, 1);
+    entry = saved;
+
+    // The same ret pops another address that uses the same entry, then the first one again.
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    run(main2, 0x020);
+    expect("changed return address", 1, 0, 0, 1);
+    if (entry.address != cs + alias) testFail("jump target cache: a mismatched entry must be refilled");
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    run(main, 0x000);
+    expect("return address back", 1, 0, 1, 0);
+
+    // Recursion: twenty returns to one address, then one to main3.
+    s.regs(0, 20, 0, 0, 0, 0, 0);
+    run(main3, 0x040);
+    expect("recursion", 0, 0, 20, 0);
+
+    // longjmp-style exit past two pending returns, then a normal call and ret.
+    for (U32 i = 0; i < 2; ++i) {
+        s.regs(0, 0, 0, 0, 0, 0, 0);
+        run(main4, 0x060);
+        expect("longjmp", 0, 0, 0, 1);
+    }
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    run(main, 0x000);
+    expect("ret after longjmp", 1, 0, 1, 0);
+
+    // A signal handler unwinds past a pending return.
+    {
+        Seg savedSegs[7];
+        memcpy(savedSegs, cpu->seg, sizeof(savedSegs));
+        KSigAction savedAction = context.process->sigActions[K_SIGSEGV];
+        KSigAction& action = context.process->sigActions[K_SIGSEGV];
+        action.reset(); action.flags = K_SA_SIGINFO; action.handlerAndSigAction = TEST_CODE_ADDRESS + 0x220;
+        const U32 page = faultTarget & ~K_PAGE_MASK;
+        context.memory->mprotect(context.thread, page, K_PAGE_SIZE, 0);
+        for (U32 i = 0; i < 2; ++i) {
+            s.regs(0, 0, 0, 0, 0, 0, 0);
+            run(main5, 0x080);
+            if (cpu->reg[3].u32 != 0 || cpu->reg[6].u32 != 1 || action.sigInfo[0] != K_SIGSEGV) {
+                testFail("jump target cache, signal unwind: ebx=%u esi=%u", cpu->reg[3].u32, cpu->reg[6].u32);
+            }
+            context.thread->inSignal = 0;
+            memcpy(cpu->seg, savedSegs, sizeof(savedSegs));
+        }
+        context.memory->mprotect(context.thread, page, K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE);
+        context.process->sigActions[K_SIGSEGV] = savedAction;
+        context.thread->inSigMask = 0;
+    }
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    run(main, 0x000);
+    expect("ret after signal unwind", 1, 0, 1, 0);
+
+    // The target block compiled again: same op, new code.
+    {
+        DecodedOp* target = context.memory->getDecodedOp(cs + 0x007);
+        if (target && target->pfnJitCode) {
+            context.memory->removeCodeBlock(cs + 0x007, target, false);
+        }
+        target = cpu->getOp(cs + 0x007, 0);
+        startNewJIT(cpu, cs + 0x007, target);
+        main = s.compile(0x000);
+        s.regs(0, 0, 0, 0, 0, 0, 0);
+        run(main, 0x000);
+        expect("target compiled again", 1, 0, 1, 0);
+        s.regs(0, 0, 0, 0, 0, 0, 0);
+        run(main, 0x000);
+        expect("target compiled again, warm", 1, 0, 1, 0);
+    }
+
+    // Code at the target rewritten (inc ebx -> inc edx) after the entry is warm.
+    if (entry.address != cs + 0x007 || entry.generation != g_wasmJumpTargetGeneration) {
+        testFail("jump target cache: entry not warm before the rewrite");
+    }
+    context.memory->writeb(cs + 0x007, 0x42);
+    if (entry.generation == g_wasmJumpTargetGeneration) testFail("jump target cache: a code write must invalidate entries");
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    if (context.memory->getDecodedOp(cs) != main) main = s.compile(0x000);
+    run(main, 0x000);
+    expect("rewritten target", 1, 1, 0, 0);
+
+    // Decode-mode changes invalidate; setting the same mode does not.
+    U64 generation = g_wasmJumpTargetGeneration;
+    cpu->setIsBig(1);
+    if (g_wasmJumpTargetGeneration != generation) testFail("jump target cache: setting the same decode mode must not invalidate");
+    cpu->setIsBig(0);
+    if (g_wasmJumpTargetGeneration == generation) testFail("jump target cache: a 16-bit code segment must invalidate");
+    generation = g_wasmJumpTargetGeneration;
+    cpu->setIsBig(1);
+    if (g_wasmJumpTargetGeneration == generation) testFail("jump target cache: a 32-bit code segment must invalidate");
+
+    // exec resets the CPU onto another op cache: no entry survives.
+    s.regs(0, 0, 0, 0, 0, 0, 0);
+    run(main, 0x000);
+    cpu->reset();
+    for (const CPU::WasmJumpTarget& e : cpu->wasmJumpTargets) {
+        if (e.address || e.op || e.generation) {
+            testFail("jump target cache: CPU::reset must clear every entry");
+            break;
+        }
+    }
+    JitShape restore;
+    (void)restore;
+    cpu->nextOp = nullptr;
+}
+
 // Catches: the cold arm of a jcc side exit, a CMOV select or the SSE divide guard changing what the path that stays
 // sees: a dirty register lost or read stale, an arm's state leaking into the fall-through, the divide run twice.
 void testWasmJitColdArmsKeepRegisters() {
