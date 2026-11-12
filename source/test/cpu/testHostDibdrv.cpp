@@ -293,9 +293,9 @@ void testHostDibdrvCopies() {
             }
         }
     }
-    // stretch_row/shrink_row with the terms win32u computes for every pair of sizes, the smaller side's last pixel on the
-    // bitmap's last column: the host's move count, worked out without stepping, one too high leaves it to the guest and
-    // one too low misses that pixel.
+    // stretch_row/shrink_row with the terms win32u computes for every unclipped pair of sizes (calc_1d_stretch_params:
+    // err_start 3 minor - 2 major), the smaller side's last pixel on the bitmap's last column: the host's move count,
+    // worked out without stepping, one too high leaves it to the guest and one too low misses that pixel.
     next = heapStart;
     static Bmp big, small;
     makeBmp(big, T_8888, W, 2, 1, { 0, 0, W, 2 });
@@ -304,7 +304,7 @@ void testHostDibdrvCopies() {
     for (S32 major = 1; major <= W; major++) {
         for (S32 minor = 1; minor <= major; minor++) {
             next = bigStart;
-            const StretchParams params = { 2 * minor - major, 2 * minor - 2 * major, 2 * minor, (U32)major, 1, 1 };
+            const StretchParams params = { 3 * minor - 2 * major, 2 * minor - 2 * major, 2 * minor, (U32)major, 1, 1 };
             const Point pBig = { 0, 0 }, pSmall = { W - minor, 1 };
             for (U32 slot : { STRETCH_ROW, SHRINK_ROW }) {
                 Bmp& dst = slot == STRETCH_ROW ? big : small;
