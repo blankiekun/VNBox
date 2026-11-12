@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 globalThis.window = globalThis;
 const L = new Function(fs.readFileSync(new URL('./lazyfs.js', import.meta.url), 'utf8') +
-    '\nreturn { lazyCopy, lazyCache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX, LAZY_EAGER_MAX, LAZY_EAGER_BUDGET, lazyEagerTake, lazyEscapeName, lazyGameName, lazyOverlayPath, lazyPatchIdbfs, vnboxStoreSaves };')();
+    '\nreturn { lazyCopy, lazyCache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX, LAZY_EAGER_MAX, LAZY_EAGER_BUDGET, lazyEagerTake, lazyEscapeName, lazyGameName, lazyOverlayPath, lazyPatchIdbfs, vnboxStoreSaves, mountLazyAppJspi, lazyMountOverlay, lazyFiles, lazyHandles };')();
 const B = L.LAZY_BLOCK, size = 10 * (1 << 20) + 123;
 const file = Uint8Array.from({ length: size }, (_, i) => (i * 7) & 255);
 const reads = [];
@@ -66,9 +66,36 @@ assert.equal(L.lazyOverlayPath('/g', `${nfd}/a`), `/g/${nfd}/a`);
 overlay.add(`/g/${L.lazyEscapeName(nfc)}`);
 assert.equal(L.lazyOverlayPath('/g', `${nfd}/a`), `/g/${L.lazyEscapeName(nfc)}/a`);
 
+// Mount opens the folder's files several at a time, keeping the listing order, the indexes and the eager budget.
+// The bug: one await per file, seconds before the first frame for a folder of thousands.
+let opening = 0, mostOpen = 0;
+const fileHandle = size => ({ kind: 'file', getFile: async () => {
+    mostOpen = Math.max(mostOpen, ++opening);
+    await new Promise(resolve => setImmediate(resolve));
+    opening--;
+    return { size, arrayBuffer: async () => new Uint8Array(size).fill(size & 255).buffer };
+} });
+const dirHandle = list => ({ kind: 'directory', async *entries() { yield* list; } });
+const tooBig = L.LAZY_EAGER_MAX + 1, many = Array.from({ length: 40 }, (_, i) => [`f${i}`, fileHandle(i === 1 ? tooBig : 10 + i)]);
+const mounted = [], fsStub = globalThis.FS;
+globalThis.FS = {
+    mkdirTree() { }, analyzePath: () => ({ exists: false }),
+    createFile: (parent, name) => { const n = { node_ops: {}, stream_ops: {} }; mounted.push([parent + '/' + name, n]); return n; },
+};
+await L.mountLazyAppJspi('/lazyapp/j', 'g', dirHandle([['d', dirHandle([['in', fileHandle(5)]])], ...many]));
+globalThis.FS = fsStub;
+assert.ok(mostOpen > 1, 'files opened one at a time');
+assert.deepEqual(mounted.map(([p]) => p), ['/lazyapp/j/g/d/in', ...many.map(([name]) => '/lazyapp/j/g/' + name)]);
+assert.deepEqual(mounted.map(([, n]) => [n.lazyFile, n.lazySize]), [[0, 5], ...many.map((_, i) => [i + 1, i === 1 ? tooBig : 10 + i])]);
+assert.deepEqual(mounted.map(([, n]) => n.lazyBytes && n.lazyBytes[0]), [5, ...many.map((_, i) => i === 1 ? null : 10 + i)]);
+assert.deepEqual(L.lazyFiles.map(f => f.size), mounted.map(([, n]) => n.lazySize));
+assert.equal(L.lazyHandles.length, 41);
+
 // The budget must stop eager reads for good: 40,000 small files all held in memory is the bug.
 assert.ok(!L.lazyEagerTake(L.LAZY_EAGER_MAX + 1));
-for (let left = L.LAZY_EAGER_BUDGET; left > 0; left -= L.LAZY_EAGER_MAX) assert.ok(L.lazyEagerTake(L.LAZY_EAGER_MAX));
+let left = L.LAZY_EAGER_BUDGET - mounted.reduce((sum, [, n]) => sum + (n.lazyBytes ? n.lazySize : 0), 0); // less what the mount above took
+for (; left >= L.LAZY_EAGER_MAX; left -= L.LAZY_EAGER_MAX) assert.ok(L.lazyEagerTake(L.LAZY_EAGER_MAX));
+assert.ok(L.lazyEagerTake(left));
 assert.ok(!L.lazyEagerTake(1));
 
 // IDBFS with its IndexedDB side stubbed: persists and syncs are recorded, the callbacks run by hand.
@@ -204,5 +231,33 @@ const big = { name: 'big', lazyPristine: true, lazySize: 2, lazyBytes: null, laz
 const count = renames.length;
 assert.throws(() => ops.rename(big, {}, 'x'), { name: 'ErrnoError' });
 assert.equal(renames.length, count);
+// A persist lists the files the game wrote: IDBFS's own walk less the shipped files, without a path
+// lookup per game file (a hitch on every save, tens of thousands of files).
+const getattr = n => ({ mtime: new Date(n.mtime) });
+const dirNode = (mtime, contents) => ({ mode: 1, mtime, contents, node_ops: { getattr } });
+const fileNode = (mtime, pristine) => ({ mode: 0, mtime, lazyPristine: pristine || undefined, node_ops: { getattr } });
+const tree = dirNode(1, { g: dirNode(2, { 'ship.dat': fileNode(3, true), 'save.dat': fileNode(4), data: dirNode(5, { 'a.dat': fileNode(6, true) }) }), top: fileNode(7) });
+const nodeAt = p => p.split('/').slice(3).reduce((n, part) => n && n.contents && n.contents[part], tree);
+const lazyMount = { mountpoint: '/lazyapp/x', root: tree };
+let pathLookups = 0;
+globalThis.FS = { analyzePath: p => (pathLookups++, { object: nodeAt(p) }), isDir: mode => mode === 1, isLink: () => false, mkdirTree() { }, mount: () => ({ mount: lazyMount }) };
+IDBFS.getLocalSet = (mount, callback) => { // libidbfs.js's walk: an lstat per path
+    const entries = {}, check = Object.keys(tree.contents).map(n => mount.mountpoint + '/' + n);
+    while (check.length) {
+        const p = check.pop(), n = nodeAt(p);
+        pathLookups++;
+        if (n.mode === 1) check.push(...Object.keys(n.contents).map(c => p + '/' + c));
+        entries[p] = { timestamp: getattr(n).mtime };
+    }
+    callback(null, { type: 'local', entries });
+};
+L.lazyMountOverlay('/lazyapp/x');
+let localSet;
+IDBFS.getLocalSet(lazyMount, (err, set) => { assert.equal(err, null); localSet = set; });
+assert.deepEqual(localSet, { type: 'local', entries: {
+    '/lazyapp/x/g': { timestamp: new Date(2) }, '/lazyapp/x/g/save.dat': { timestamp: new Date(4) },
+    '/lazyapp/x/g/data': { timestamp: new Date(5) }, '/lazyapp/x/top': { timestamp: new Date(7) },
+} });
+assert.equal(pathLookups, 0);
 console.error = realError; console.warn = realWarn; globalThis.setTimeout = realTimeout;
 console.log('lazyfs self-check ok');
