@@ -814,7 +814,7 @@ void testX11ResizeMarksDirty() {
     // Raising a window over a sibling changes what is shown, with no geometry change.
     auto above = server->createNewWindow(0, server->getRoot(), 2, 2, 16, 0, 0, InputOutput, 0, visual);
     server->isDisplayDirty = false;
-    changes.stack_mode = Above;
+    changes.stack_mode = 0; // Above
     window->configure(CWStackMode, &changes);
     if (!server->isDisplayDirty) testFail("X11 raising a window did not mark the display dirty");
     server->destroyWindow(above->id);
