@@ -1183,6 +1183,196 @@ void testWasmJitFailedGroupSplits() {
         if (ops[i]->pfnJitCode) context.memory->removeCodeBlock(addresses[i], ops[i], false);
     }
 }
+
+// Batches compile off the page thread (WebAssembly.compile) and install at a later main loop tick. Catches: a hot
+// block losing its old code while its hot group compiles, a block whose code is invalidated meanwhile (a write, an
+// unmap) installed anyway, and a fresh block not left to the interpreter until its batch installs.
+void testWasmJitAsyncInstall() {
+    testNewInstruction(0);
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    constexpr U32 blockCount = 4;
+    constexpr U32 blockBytes = 8;
+    constexpr U32 hotEntries = 4;
+    wasmJitTestResetRuntimeBatching();
+    struct Reset {
+        ~Reset() { wasmJitTestResetRuntimeBatching(); }
+    } reset;
+    wasmJitTestSetHotGroups(hotEntries, 1e12); // entries per period; the period never ends here: flush below
+    // Separate blocks that each end the test: a hot block would follow a jump into the next block's code and cover
+    // it too. So each covers only its own code, and invalidating one block cancels only its own recompile.
+    for (U32 i = 0; i < blockCount; ++i) {
+        testPushCode8(0x43); // inc ebx
+        testPushCode8(0xcd); testPushCode8(0x97); // TestEnd
+        for (U32 pad = 3; pad < blockBytes; ++pad) testPushCode8(0x90);
+    }
+    std::vector<DecodedOp*> blocks;
+    std::vector<void*> tier1;
+    for (U32 i = 0; i < blockCount; ++i) {
+        U32 address = TEST_CODE_ADDRESS + i * blockBytes;
+        DecodedOp* op = cpu->getOp(address, 0);
+        startNewJIT(cpu, address, op);
+        op->runCount = JIT_RUN_COUNT + 1;
+        blocks.push_back(op);
+        tier1.push_back(op->pfnJitCode);
+    }
+    auto runOnce = [&]() {
+        cpu->reg[3].u32 = 0;
+        for (U32 b = 0; b < blockCount; ++b) {
+            cpu->eip.u32 = b * blockBytes;
+            cpu->nextOp = blocks[b];
+            cpu->yield = false;
+            for (U32 i = 0; i < 4 && cpu->nextOp->inst != TestEnd; ++i) {
+                cpu->blockInstructionCount = 0;
+                cpu->run();
+            }
+            if (cpu->nextOp->inst != TestEnd) return false;
+        }
+        return cpu->reg[3].u32 == blockCount;
+    };
+    for (U32 i = 0; i < hotEntries; ++i) {
+        if (!runOnce()) testFail("async install: blocks must run the chain");
+    }
+    wasmJitTestClearHotCounts();
+    if (wasmJitTestHotQueueSize() != blockCount) testFail("async install: every block must queue");
+
+    wasmJitTestDeferInstall(true);
+    wasmJitTestHotFlush(cpu);
+    for (U32 i = 0; i < blockCount; ++i) {
+        DecodedOp* op = blocks[i];
+        if (op->pfnJitCode != tier1[i] || !(op->flags & OP_FLAG_JIT) || op->pfn != context.process->startJITOp ||
+                (op->flags2 & OP_FLAG2_WASM_JIT_PENDING) || op->runCount != JIT_RUN_COUNT + 1) {
+            testFail("async hot group: block %u must keep its old code while the group compiles", i);
+        }
+        if (op->blockStart != op) testFail("async hot group: block %u must cover only its own code", i);
+    }
+    if (wasmJitTestPendingCount() != blockCount) testFail("async hot group: every block must wait for the install");
+    if (!runOnce()) testFail("async hot group: the old code must run while the group compiles");
+    // The last block's code is invalidated while the group compiles: it must not install.
+    DecodedOp* dropped = blocks[blockCount - 1];
+    context.memory->removeCodeBlock(TEST_CODE_ADDRESS + (blockCount - 1) * blockBytes, dropped, false);
+    if (wasmJitTestPendingCount() != blockCount - 1) testFail("async hot group: invalidated code must cancel its recompile");
+    wasmJitTestTick();
+    for (U32 i = 0; i < blockCount - 1; ++i) {
+        if (!blocks[i]->pfnJitCode || blocks[i]->pfnJitCode == tier1[i] || blocks[i]->pfn != context.process->startJITOp) {
+            testFail("async hot group: block %u must be published at its new slot at the tick", i);
+        }
+    }
+    if (dropped->pfnJitCode || wasmJitTestPendingCount() != 0 || wasmJitTestRuntimeGroupCount() != 1) {
+        testFail("async hot group: the invalidated block must stay uninstalled, and nothing pending");
+    }
+    if (!runOnce()) testFail("async hot group: the group must run after the install");
+    cpu->nextOp = nullptr;
+    for (U32 i = 0; i < blockCount; ++i) {
+        if (blocks[i]->pfnJitCode) context.memory->removeCodeBlock(TEST_CODE_ADDRESS + i * blockBytes, blocks[i], false);
+    }
+    wasmJitTestResetRuntimeBatching();
+
+    // Fresh blocks run in the interpreter until their batch installs; one invalidated meanwhile never installs.
+    WasmJitBatchLimits limits;
+    limits.maxBlocks = 2;
+    limits.maxBatchBytes = 1024 * 1024;
+    limits.urgentPendingHits = 1000;
+    limits.maxProcessOpenBytes = 4 * 1024 * 1024;
+    wasmJitTestSetBatchLimits(limits);
+    wasmJitTestSetMappedFileKeyOverride(79);
+    wasmJitTestEnableRuntimeBatching(true);
+    wasmJitTestDeferInstall(true);
+    context.codeIp = TEST_CODE_ADDRESS + 0x100;
+    DecodedOp* ops[2];
+    U32 addresses[2];
+    for (U32 i = 0; i < 2; ++i) {
+        addresses[i] = context.codeIp;
+        testPushCode8(0x40 + i); // inc eax, ecx
+        testPushCode8(0xcd); testPushCode8(0x97);
+    }
+    for (U32 i = 0; i < 2; ++i) {
+        ops[i] = cpu->getOp(addresses[i], 0);
+        startNewJIT(cpu, addresses[i], ops[i]);
+    }
+    for (U32 i = 0; i < 2; ++i) {
+        if (ops[i]->pfnJitCode || !(ops[i]->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
+            testFail("async file batch: block %u must stay pending while its batch compiles", i);
+        }
+    }
+    if (wasmJitTestPendingCount() != 2) testFail("async file batch: both blocks must wait for the install");
+    context.memory->removeCodeBlock(addresses[0], ops[0], false);
+    if (wasmJitTestPendingCount() != 1) testFail("async file batch: invalidated code must cancel its pending block");
+    wasmJitTestTick();
+    if (ops[0]->pfnJitCode || !ops[1]->pfnJitCode || (ops[1]->flags2 & OP_FLAG2_WASM_JIT_PENDING) || wasmJitTestPendingCount() != 0) {
+        testFail("async file batch: only the live block must install at the tick");
+    }
+    for (U32 i = 0; i < 2; ++i) {
+        if (ops[i]->pfnJitCode) context.memory->removeCodeBlock(addresses[i], ops[i], false);
+    }
+
+    // A failed compile is only seen at the tick that installs it. Catches: its blocks stuck pending (Compiling) for
+    // good, or not given the recovery a failure got before (halves tried again, "out of memory" sealed for a retry).
+    boxedwine_wasm_test_reset_oom_state();
+    struct ResetOom {
+        ~ResetOom() { boxedwine_wasm_test_reset_oom_state(); }
+    } resetOom;
+    auto startBatch = [&](U32 base, bool forceOom) {
+        wasmJitTestResetRuntimeBatching();
+        wasmJitTestSetBatchLimits(limits);
+        wasmJitTestSetMappedFileKeyOverride(79);
+        wasmJitTestEnableRuntimeBatching(true);
+        wasmJitTestDeferInstall(true);
+        if (forceOom) boxedwine_wasm_test_force_next_module_oom();
+        context.codeIp = TEST_CODE_ADDRESS + base;
+        for (U32 i = 0; i < 2; ++i) {
+            addresses[i] = context.codeIp;
+            testPushCode8(0x40 + i); // inc eax, ecx
+            testPushCode8(0xcd); testPushCode8(0x97);
+        }
+        for (U32 i = 0; i < 2; ++i) {
+            ops[i] = cpu->getOp(addresses[i], 0);
+            startNewJIT(cpu, addresses[i], ops[i]);
+        }
+        if (wasmJitTestPendingCount() != 2) testFail("async failure: both blocks must wait for the install");
+    };
+
+    // The module is rejected (here every slot fails): the halves compile again and fail at later ticks, and each
+    // block is left to the interpreter.
+    startBatch(0x200, false);
+    wasmJitTestFailBatchAfterSlots(0);
+    for (U32 tick = 0; tick < 4 && wasmJitTestPendingCount(); ++tick) {
+        wasmJitTestTick();
+    }
+    wasmJitTestFailBatchAfterSlots(-1);
+    if (wasmJitTestPendingCount() != 0) testFail("async rejected batch: %u blocks stay pending", wasmJitTestPendingCount());
+    for (U32 i = 0; i < 2; ++i) {
+        if (ops[i]->pfnJitCode || (ops[i]->flags & OP_FLAG_JIT) || (ops[i]->flags2 & OP_FLAG2_WASM_JIT_PENDING) ||
+                ops[i]->pfn == context.process->startJITOp) {
+            testFail("async rejected batch: block %u must be left to the interpreter", i);
+        }
+    }
+
+    // "Out of memory" from the compile: the blocks wait sealed, in the interpreter, and install after the retry.
+    startBatch(0x300, true);
+    boxedwine_wasm_test_clear_forced_module_oom();
+    wasmJitTestTick();
+    if (wasmJitTestPendingCount() != 2 || wasmJitTestSealedCount() != 1 || !wasmJitCompilationPaused()) {
+        testFail("async out of memory: both blocks must wait sealed, and compiling is paused");
+    }
+    for (U32 i = 0; i < 2; ++i) {
+        if (ops[i]->pfnJitCode || !(ops[i]->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
+            testFail("async out of memory: block %u must stay pending in the interpreter", i);
+        }
+    }
+    // That tick also armed the retry at its own time plus 5 s; the retry starts the compile again.
+    wasmJitTestOomTick(emscripten_get_now() + 5000);
+    wasmJitTestTick();
+    if (wasmJitTestPendingCount() != 0 || wasmJitTestSealedCount() != 0 || wasmJitCompilationPaused()) {
+        testFail("async out of memory: the retry must install the batch");
+    }
+    for (U32 i = 0; i < 2; ++i) {
+        if (!ops[i]->pfnJitCode || ops[i]->pfn != context.process->startJITOp) {
+            testFail("async out of memory: block %u must be installed after the retry", i);
+        }
+        if (ops[i]->pfnJitCode) context.memory->removeCodeBlock(addresses[i], ops[i], false);
+    }
+}
 #endif
 
 #ifdef BOXEDWINE_MULTI_THREADED
