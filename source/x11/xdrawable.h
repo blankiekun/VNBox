@@ -78,6 +78,7 @@ protected:
 
 private:
 	void drawPixel(const XGC& gc, S32 x, S32 y, U32 source);
+	void drawPixel(const XGC& gc, S32 x, S32 y, U32 source, const XDrawable* clipMask); // clipMask: gc.values.clip_mask already looked up, null when it is not set or not found
 	BOXEDWINE_MUTEX mutex;
 	U32 w;
 	U32 h;
