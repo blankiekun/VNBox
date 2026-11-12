@@ -293,6 +293,30 @@ void testHostDibdrvCopies() {
             }
         }
     }
+    // stretch_row/shrink_row with the terms win32u computes for every pair of sizes, the smaller side's last pixel on the
+    // bitmap's last column: the host's move count, worked out without stepping, one too high leaves it to the guest and
+    // one too low misses that pixel.
+    next = heapStart;
+    static Bmp big, small;
+    makeBmp(big, T_8888, W, 2, 1, { 0, 0, W, 2 });
+    makeBmp(small, T_8888, W, 2, -1, { 0, 0, W, 2 });
+    const U32 bigStart = next;
+    for (S32 major = 1; major <= W; major++) {
+        for (S32 minor = 1; minor <= major; minor++) {
+            next = bigStart;
+            const StretchParams params = { 2 * minor - major, 2 * minor - 2 * major, 2 * minor, (U32)major, 1, 1 };
+            const Point pBig = { 0, 0 }, pSmall = { W - minor, 1 };
+            for (U32 slot : { STRETCH_ROW, SHRINK_ROW }) {
+                Bmp& dst = slot == STRETCH_ROW ? big : small;
+                Bmp& src = slot == STRETCH_ROW ? small : big;
+                const Point& pDst = slot == STRETCH_ROW ? pBig : pSmall;
+                const Point& pSrc = slot == STRETCH_ROW ? pSmall : pBig;
+                mustRun(T_8888, slot, { dst.infoAddr, guestStruct(&pDst, sizeof(pDst)), src.infoAddr, guestStruct(&pSrc, sizeof(pSrc)), guestStruct(&params, sizeof(params)), STRETCH_DELETESCANS, 0 });
+                ((void (*)(const void*, const void*, const void*, const void*, const void*, S32, S32))fn(T_8888, slot))(dst.hostInfo, &pDst, src.hostInfo, &pSrc, &params, (S32)STRETCH_DELETESCANS, 0);
+                same(dst, "stretch_row/shrink_row at the edge");
+            }
+        }
+    }
     // A new DIB section's memory: mapped, never written, so no RAM yet. It gets some, as the guest's first write would.
     Rect whole = { 0, 0, 16, 4 };
     next = heapStart;
