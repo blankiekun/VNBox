@@ -227,18 +227,18 @@ void testMalformedIsoDirectories() {
 
 void testRawSectorFileReads() {
     DiscFixture fixture;
-    // FILE.TXT is 5000 bytes in sectors 24 and 25, with a pattern that differs per byte
+    // FILE.TXT is 5000 bytes in sectors 24 to 26, with a pattern that differs per byte
     auto image = isoImage();
-    image.resize(26 * SECTOR);
-    isoNumber(image.data() + 16 * SECTOR + 80, 26);
+    image.resize(27 * SECTOR);
+    isoNumber(image.data() + 16 * SECTOR + 80, 27);
     isoRecord(image.data() + ROOT + 68, 24, 5000, "FILE.TXT;1", 10, false);
     std::vector<U8> expected(5000);
     for (U32 i = 0; i < expected.size(); ++i)
         image[24 * SECTOR + i] = expected[i] = (U8)(i * 7 + (i >> 8));
     for (U32 raw : {2352u, 2336u}) {
         U32 header = raw == 2352 ? 16 : 8;
-        std::vector<U8> sectors(26 * raw, 0xEE); // header and error correction bytes must never be returned
-        for (U32 s = 0; s < 26; ++s)
+        std::vector<U8> sectors(27 * raw, 0xEE); // header and error correction bytes must never be returned
+        for (U32 s = 0; s < 27; ++s)
             memcpy(sectors.data() + s * raw + header, image.data() + s * SECTOR, SECTOR);
         memcpy(sectors.data() + 16 * raw + header, "\001CD001\001", 7);
         cdromInit({fixture.write("raw.bin", sectors)}, B("/mnt/cdrom"), B(""));
