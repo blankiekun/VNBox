@@ -34,6 +34,8 @@ bool hostClockRun(CPU* cpu, U32 fn); // hostclock.cpp, fn: 1 NtQueryPerformanceC
 extern thread_local U32 hostLibcTestAddress, hostLibcTestFn;
 extern "C" U32 bw_hook_add(U32 pid, U32 eip); // hosthooks.cpp
 extern "C" void bw_hook_remove(U32 id);
+extern "C" void bw_prefetch(U32 addr, U32 size);
+bool hostHookPrefetchStep(KThread* thread);
 
 namespace {
 
@@ -407,16 +409,16 @@ void testHostLibcMutex() {
     }
 }
 
-// A private file mapping of two pages holding `code` from offset 0: hostHookPatched compares against this file, and its
-// pages start out File (not loaded), then CopyOnWrite once read.
-static void mapFile(U32 address, const U8* code, U32 len) {
+// A private file mapping of two pages (or `pages`) holding `code` from offset 0: hostHookPatched compares against this file,
+// and its pages start out File (not loaded), then CopyOnWrite once read.
+static void mapFile(U32 address, const U8* code, U32 len, U32 pages = 2) {
     KProcessPtr process = testContext().process;
     U32 fd = process->memfd_create(B("hostlibc-test"), 0);
     if ((S32)fd < 0) testFail("memfd_create failed");
     std::shared_ptr<KFile> file = std::dynamic_pointer_cast<KFile>(process->getFileDescriptor(fd)->kobject);
-    if (process->ftruncate64(fd, 2 * K_PAGE_SIZE)) testFail("ftruncate failed");
+    if (process->ftruncate64(fd, pages * K_PAGE_SIZE)) testFail("ftruncate failed");
     if (file->pwriteNative(const_cast<U8*>(code), 0, len) != len) testFail("file write failed");
-    if (memory->mmap(testContext().thread, address, 2 * K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE | K_PROT_EXEC, K_MAP_FIXED | K_MAP_PRIVATE, fd, 0) != address) testFail("mmap failed");
+    if (memory->mmap(testContext().thread, address, pages * K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE | K_PROT_EXEC, K_MAP_FIXED | K_MAP_PRIVATE, fd, 0) != address) testFail("mmap failed");
     process->close(fd);
 }
 
@@ -458,6 +460,32 @@ void testHostHookPatchedExport() {
     hooked("overwritten on the next page", false);
     hostLibcTestFn = 0;
     memory->unmap(MAPPED, 2 * K_PAGE_SIZE);
+}
+
+// Catches: a hook script's prefetch (the game's whole exe before attach) loading inside one syscall, a stop as long as the
+// read on a lazy game folder; or a slice skipping a page. Each step loads 16 file pages at most until every one is in.
+void testHostHookPrefetchSlices() {
+    constexpr U32 MAPPED = 0x20000000, PAGES = 40;
+    setup();
+    U8 code[K_PAGE_SIZE] = {};
+    mapFile(MAPPED, code, sizeof(code), PAGES);
+    auto fileLeft = [] {
+        U32 n = 0;
+        for (U32 i = 0; i < PAGES; i++) n += getMemData(memory)->mmu[(MAPPED >> K_PAGE_SHIFT) + i].getPageType() == PageType::File;
+        return n;
+    };
+    memory->readb(MAPPED + 10 * K_PAGE_SIZE); // already loaded: doesn't count
+    bw_prefetch(MAPPED + 2 * K_PAGE_SIZE, 3 * K_PAGE_SIZE);
+    bw_prefetch(MAPPED + 1, PAGES * K_PAGE_SIZE - 1);
+    expect("pages not loaded", fileLeft(), PAGES - 1);
+    expect("first step not done", hostHookPrefetchStep(testContext().thread), false);
+    expect("first step loads 16", fileLeft(), PAGES - 17);
+    expect("second step not done", hostHookPrefetchStep(testContext().thread), false);
+    expect("second step loads 16", fileLeft(), PAGES - 33);
+    expect("third step done", hostHookPrefetchStep(testContext().thread), true);
+    expect("all loaded", fileLeft(), 0);
+    expect("nothing left", hostHookPrefetchStep(testContext().thread), true);
+    memory->unmap(MAPPED, PAGES * K_PAGE_SIZE);
 }
 
 // Catches: a change in getOp or the head's fields that breaks hooks while the direct hostLibcRun tests still pass: the head
