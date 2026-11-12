@@ -171,7 +171,7 @@ bool hostHookPrefetchStep(KThread* thread) {
         }
         MMU& mmu = getMemData(thread->memory)->mmu[page];
         if (mmu.getPageType() == PageType::File && thread->memory->canRead(page)) {
-            if (loaded++ == 0x100000) return false; // TEMP: the old whole-range load, to see the test fail in CI
+            if (loaded++ == 16) return false;
             thread->memory->readb(page << K_PAGE_SHIFT); // loads the page
         }
         U64 next = (U64)(page + 1) << K_PAGE_SHIFT;
