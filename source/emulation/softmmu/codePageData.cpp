@@ -250,6 +250,9 @@ void DecodedOpCache::removePageRange(U32 address, U32 len, bool becauseOfWrite) 
 #endif
 			page->ops[i] = nullptr;
 			activeOps--;
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+			wasmJumpTargetsInvalidate();
+#endif
 		}
 		if (pageWriteCounts) {
 #if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
@@ -305,6 +308,9 @@ DecodedOp* DecodedOpCache::getPreviousOpAndRemoveIfOverlapping(U32 address) {
             previousOp->detachJitEntry();
 #endif
 			previousPageCache->ops[previousOpAddress & K_PAGE_MASK] = nullptr;			
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+			wasmJumpTargetsInvalidate();
+#endif
 			if (preparedRemovalPendingDeallocs) {
 				preparedRemovalPendingDeallocs->ops.push_back(previousOp);
 			} else {
@@ -543,6 +549,9 @@ void DecodedOpCache::finishPreparedRemove() {
 }
 
 void DecodedOpCache::removeAll() {
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+	wasmJumpTargetsInvalidate();
+#endif
 #if defined(BOXEDWINE_JIT_X64) || defined(BOXEDWINE_JIT_ARMV8)
     if (jitPageGroups) {
         for (U32 first = 0; first < FIRST_INDEX_SIZE; ++first) {

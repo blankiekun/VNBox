@@ -29,6 +29,7 @@ void testWasmJitHotGroupOom();
 void testWasmJitSingleOpOomPropagates();
 void testWasmJitOomProbe();
 void testWasmJitInlineCall();
+void testWasmJitJumpTargetCache();
 void testWasmJitColdArmsKeepRegisters();
 void testWasmJitLazyFlagStores();
 void testWasmJitStopBlockBefore();

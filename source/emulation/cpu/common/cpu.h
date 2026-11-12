@@ -625,7 +625,30 @@ public:
     std::atomic<U32>* decodedOpCacheGlobalEpoch = nullptr;
     std::atomic<U32> decodedOpCacheEpoch{0};
 #endif
+
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+public:
+    // ret, jmp reg and call reg in compiled code look their target up here before walking the op cache:
+    // linear address -> DecodedOp*, direct-mapped. An entry is used only when its generation equals
+    // g_wasmJumpTargetGeneration, which every op cache removal and decode-mode change bumps, so an entry
+    // can never name an op that is no longer the one cached at its address. Appended last, like the
+    // fields above, so the offsets of established fields stay the same.
+    struct WasmJumpTarget {
+        U32 address;
+        DecodedOp* op;
+        U64 generation;
+    };
+    static constexpr U32 WASM_JUMP_TARGET_COUNT = 1024;
+    static U32 wasmJumpTargetIndex(U32 address) { return (address ^ (address >> 10)) & (WASM_JUMP_TARGET_COUNT - 1); }
+    WasmJumpTarget wasmJumpTargets[WASM_JUMP_TARGET_COUNT] = {};
+#endif
 };
+
+#if defined(BOXEDWINE_WASM_JIT) && !defined(BOXEDWINE_MULTI_THREADED)
+// Starts at 1, so a zeroed CPU::wasmJumpTargets entry never matches.
+extern U64 g_wasmJumpTargetGeneration;
+inline void wasmJumpTargetsInvalidate() { ++g_wasmJumpTargetGeneration; }
+#endif
 
 void common_prepareException(CPU* cpu, int code, int error);
 

@@ -406,6 +406,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testWasmJitSingleOpOomPropagates, "Test ST WASM JIT single op allocation failure", TEST_ENTRY_SERIAL},
     {testWasmJitOomProbe, "Test ST WASM JIT out of memory retry by time", TEST_ENTRY_SERIAL},
     {testWasmJitInlineCall, "Test ST WASM JIT leaf-call inlining", TEST_ENTRY_SERIAL},
+    {testWasmJitJumpTargetCache, "Test ST WASM JIT jump target cache", TEST_ENTRY_SERIAL},
     {testWasmJitColdArmsKeepRegisters, "Test ST WASM JIT side exit, cmov and divide guard keep registers", TEST_ENTRY_SERIAL},
     {testWasmJitLazyFlagStores, "Test ST WASM JIT lazy type stores and forwarded results", TEST_ENTRY_SERIAL},
     {testWasmJitStopBlockBefore, "Test ST WASM JIT block stop before a block start", TEST_ENTRY_SERIAL},
