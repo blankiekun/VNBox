@@ -1125,6 +1125,7 @@ int XWindow::configure(U32 mask, XWindowChanges* changes) {
 			if (index >= 0 && index < (int)parent->zchildren.size() - 1) {
 				parent->zchildren.erase(parent->zchildren.begin() + index);
 				parent->zchildren.push_back(shared_from_this());
+				changed = true; // raised: what is on top changed
 			}
 		}
 	}
