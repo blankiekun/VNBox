@@ -5338,6 +5338,7 @@ static void failOrSplitRuntimeBatch(const std::vector<WasmJitBatchEntryId>& live
 }
 
 static bool installRuntimeBatch(const WasmJitCompilingBatch& batch);
+static bool releaseWasmJitSlots(const std::vector<void*>& jitOps);
 
 // "Out of memory": a hot block keeps its old code and may queue itself again in a later period; the others wait
 // sealed for the retry. Returns those.
@@ -5496,9 +5497,9 @@ static bool installRuntimeBatch(const WasmJitCompilingBatch& batch) {
     for (WasmJitBatchEntryId id : liveIds) {
         erasePendingWasmJitBlock(id);
     }
-    if (!oldSlots.empty()) {
-        clearJitBlock(oldSlots);
-    }
+    // Only the slots: clearJitBlock would also retry the oldest sealed request, which can be the one a caller
+    // (queueRuntimeFlushes, retryOldestSealedRequest) is flushing right now. That caller, or the tick, goes on with them.
+    releaseWasmJitSlots(oldSlots);
     return true;
 }
 
@@ -17306,27 +17307,15 @@ void startNewJIT(CPU* cpu, U32 address, DecodedOp* op) {
 // clearJitBlock: called by kmemory when evicting JIT blocks.
 // For WASM, release the compiled function from wasmTable.
 // ---------------------------------------------------------------------------
-void clearJitBlock(const std::vector<void*>& jitOps) {
-    // A parent block can contain subblock entries with distinct wasmTable
-    // indexes, so dedupe before freeing.
-    std::set<int> seen;
 #ifndef BOXEDWINE_MULTI_THREADED
+// Frees the slots and nothing else: no sealed request is retried. True if one was freed.
+static bool releaseWasmJitSlots(const std::vector<void*>& jitOps) {
+    std::set<int> seen;
     bool releasedSlot = false;
-#else
-    std::vector<KMemory*> retiredMemories;
-#endif
     for (void* p : jitOps) {
         if (!p) continue;
         int tableIdx = (int)(uintptr_t)p;
         if (seen.insert(tableIdx).second) {
-#ifdef BOXEDWINE_MULTI_THREADED
-            KMemory* retiredMemory = wasmJitMtRetireSlot(tableIdx);
-            if (retiredMemory && std::find(retiredMemories.begin(),
-                    retiredMemories.end(), retiredMemory) ==
-                    retiredMemories.end()) {
-                retiredMemories.push_back(retiredMemory);
-            }
-#else
             boxedwine_wasm_free_block(tableIdx);
             wasmJitHotForgetSlot(tableIdx);
             releasedSlot = true;
@@ -17338,21 +17327,41 @@ void clearJitBlock(const std::vector<void*>& jitOps) {
                 delete[] g_wasmRelocBaseByTable[tableIdx];
                 g_wasmRelocBaseByTable[tableIdx] = nullptr;
             }
-#endif
         }
     }
-#ifdef BOXEDWINE_MULTI_THREADED
-    for (KMemory* retiredMemory : retiredMemories) {
-        wasmJitMtTryReapRetired(retiredMemory);
-    }
-#else
-    if (releasedSlot) {
+    return releasedSlot;
+}
+#endif
+
+void clearJitBlock(const std::vector<void*>& jitOps) {
+#ifndef BOXEDWINE_MULTI_THREADED
+    if (releaseWasmJitSlots(jitOps)) {
         bool wasPaused = g_wasmJitCompilationPaused;
         g_wasmJitCompilationPaused = false;
         if (wasPaused) {
             g_wasmJitOomRetryProbePending = true;
         }
         retryOldestSealedRequest();
+    }
+#else
+    // A parent block can contain subblock entries with distinct wasmTable
+    // indexes, so dedupe before freeing.
+    std::set<int> seen;
+    std::vector<KMemory*> retiredMemories;
+    for (void* p : jitOps) {
+        if (!p) continue;
+        int tableIdx = (int)(uintptr_t)p;
+        if (seen.insert(tableIdx).second) {
+            KMemory* retiredMemory = wasmJitMtRetireSlot(tableIdx);
+            if (retiredMemory && std::find(retiredMemories.begin(),
+                    retiredMemories.end(), retiredMemory) ==
+                    retiredMemories.end()) {
+                retiredMemories.push_back(retiredMemory);
+            }
+        }
+    }
+    for (KMemory* retiredMemory : retiredMemories) {
+        wasmJitMtTryReapRetired(retiredMemory);
     }
 #endif
 }
