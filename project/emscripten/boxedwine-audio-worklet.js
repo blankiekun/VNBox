@@ -16,6 +16,8 @@ addToLibrary({
     // episodes, rendered frames, render quantum, maximum queued frames,
     // nonzero output samples, drained. Stop: 0=running, 1=abort, 2=drain.
     processorSource: function() {
+      // Filter tables by ratio, shared by every node of the same rate: the constructor runs on the audio thread.
+      const filters = new Map();
       class BoxedwinePcmProcessor extends AudioWorkletProcessor {
         constructor(options) {
           super();
@@ -40,33 +42,39 @@ addToLibrary({
           this.primed = false;
           // A 32-tap windowed-sinc filter needs only 16 input frames of
           // lookahead (1.45 ms at 11025 Hz), with phase carried across blocks.
-          this.filter = new Float32Array(1024 * 32);
-          const cutoff = Math.min(1, 1 / this.ratio);
-          for (let phase = 0; phase < 1024; ++phase) {
-            let total = 0;
-            for (let tap = 0; tap < 32; ++tap) {
-              const x = tap - 15 - phase / 1024;
-              const sinc = Math.abs(x) < 1e-9 ? cutoff : Math.sin(Math.PI * x * cutoff) / (Math.PI * x);
-              const value = sinc * (0.5 + 0.5 * Math.cos(Math.PI * x / 16));
-              this.filter[phase * 32 + tap] = value;
-              total += value;
+          // Ratio 1 copies samples and never reads it.
+          this.filter = this.ratio === 1 ? null : filters.get(this.ratio);
+          if (this.filter === undefined) {
+            this.filter = new Float32Array(1024 * 32);
+            filters.set(this.ratio, this.filter);
+            const cutoff = Math.min(1, 1 / this.ratio);
+            for (let phase = 0; phase < 1024; ++phase) {
+              let total = 0;
+              for (let tap = 0; tap < 32; ++tap) {
+                const x = tap - 15 - phase / 1024;
+                const sinc = Math.abs(x) < 1e-9 ? cutoff : Math.sin(Math.PI * x * cutoff) / (Math.PI * x);
+                const value = sinc * (0.5 + 0.5 * Math.cos(Math.PI * x / 16));
+                this.filter[phase * 32 + tap] = value;
+                total += value;
+              }
+              for (let tap = 0; tap < 32; ++tap) this.filter[phase * 32 + tap] /= total;
             }
-            for (let tap = 0; tap < 32; ++tap) this.filter[phase * 32 + tap] /= total;
           }
           this.started = false;
           this.starved = false;
           this.playing = false;
           this.sinceReport = -1;
+          // postMessage copies it, so one report object serves every post.
+          this.report = {c: this.control, t: 0};
         }
         receive(m) {
           const control = this.control;
           if (m.data) {
-            const mask = this.capacity - 1;
-            for (let i = 0, frames = m.data.length / this.channels; i < frames; ++i) {
-              for (let c = 0; c < this.channels; ++c) {
-                this.pcm[((m.start + i) & mask) * this.channels + c] = m.data[i * this.channels + c];
-              }
-            }
+            // The ring and the post are both interleaved: at most two runs, split at the wrap.
+            const start = (m.start & (this.capacity - 1)) * this.channels;
+            const first = Math.min(m.data.length, this.pcm.length - start);
+            this.pcm.set(m.data.subarray(0, first), start);
+            if (first < m.data.length) this.pcm.set(m.data.subarray(first), 0);
             control[1] = m.start + m.data.length / this.channels;
           }
           // At creation only: the first data post moves the write on from here.
@@ -179,7 +187,8 @@ addToLibrary({
             this.sinceReport = this.sinceReport < 0 ? -1 : this.sinceReport + frames;
             if (changed || this.sinceReport < 0 || this.sinceReport >= sampleRate * 0.02) {
               this.sinceReport = 0;
-              this.port.postMessage({c: control.slice(), t: Date.now()});
+              this.report.t = Date.now();
+              this.port.postMessage(this.report);
             }
           }
           return !done;
@@ -294,11 +303,13 @@ addToLibrary({
       const write = Atomics.load(device.control, 1);
       const frames = (write - device.sent) >>> 0;
       if (!frames) return;
-      const data = new Float32Array(frames * device.channels);
-      for (let i = 0; i < frames; ++i) {
-        const source = ((device.sent + i) & (device.capacity - 1)) * device.channels;
-        for (let c = 0; c < device.channels; ++c) data[i * device.channels + c] = device.pcm[source + c];
-      }
+      // The ring is interleaved like the post: at most two runs, split at the wrap.
+      const start = (device.sent & (device.capacity - 1)) * device.channels;
+      const length = frames * device.channels;
+      const first = Math.min(length, device.pcm.length - start);
+      const data = new Float32Array(length);
+      data.set(device.pcm.subarray(start, start + first));
+      if (first < length) data.set(device.pcm.subarray(0, length - first), first);
       device.node.port.postMessage({start: device.sent, data: data}, [data.buffer]);
       device.sent = write;
     },

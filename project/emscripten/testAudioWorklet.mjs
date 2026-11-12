@@ -55,7 +55,7 @@ function fixture({channels = 2, capacity = 512, moduleFailure = false, rate = 48
         context.HEAPF32.set(values);
         return audio.queue(1, 0, values.length / channels);
     }
-    return {audio, context, device, control, processor, render, queue, errors, listeners, library,
+    return {audio, context, device, control, processor, Processor, render, queue, errors, listeners, library,
         advance(ms) { now += ms; audio.tick(); }};
 }
 
@@ -201,9 +201,9 @@ test('unsupported or explicitly selected SDL bypasses worklet initialization', (
 // A page that isn't cross-origin isolated (blankie.moe): no SharedArrayBuffer, PCM and counters go by message.
 async function messageFixture({channels = 1, rate = 48000, beforeNode = null} = {}) {
     let library, Processor, now = 0, posts = 0;
-    const pending = [];
+    const pending = [], reports = [];
     const port = () => ({onmessage: null, peer: null,
-        postMessage(data) { if (data.c) ++posts; pending.push([this.peer, structuredClone(data)]); }});
+        postMessage(data) { if (data.c) { ++posts; reports.push(data.c); } pending.push([this.peer, structuredClone(data)]); }});
     const context = vm.createContext({
         addToLibrary(value) { library = value; },
         Int32Array, Float32Array, ArrayBuffer, Atomics, Map, Math, Array,
@@ -255,7 +255,7 @@ async function messageFixture({channels = 1, rate = 48000, beforeNode = null} = 
         context.HEAPF32.set(values);
         return audio.queue(id, 0, values.length / channels);
     }
-    return {audio, context, device, id, render, queue, pump, posted: () => posts, advance(ms) { now += ms; }};
+    return {audio, context, device, id, render, queue, pump, posted: () => posts, reports, advance(ms) { now += ms; }};
 }
 
 test('without SharedArrayBuffer the worklet plays posted PCM in order and reports its reads', async () => {
@@ -326,6 +326,36 @@ test('message mode reports about every 20 ms in steady playback, not every quant
     }
     assert(f.posted() <= 60, 'too many reports: ' + f.posted());
     assert(f.posted() >= 40, 'too few reports: ' + f.posted());
+});
+
+test('message mode PCM keeps its order across ring wrap and reports reuse one counters array', async () => {
+    const f = await messageFixture({channels: 2});
+    assert.equal(f.device.capacity, 32768);
+    const input = [], output = [[], []];
+    for (let k = 0; k < 20; ++k) { // 40960 frames: past the 32768-frame ring
+        const chunk = Array.from({length: 4096}, (_, i) => ((k * 4096 + i) % 1009) / 1009);
+        assert.equal(f.queue(chunk), 2048);
+        input.push(...chunk);
+        for (let i = 0; i < 16; ++i) {
+            const rendered = f.render().output;
+            output[0].push(...rendered[0]);
+            output[1].push(...rendered[1]);
+        }
+    }
+    const expected = Array.from(new Float32Array(input));
+    assert.deepEqual(output[0], expected.filter((_, i) => i % 2 === 0));
+    assert.deepEqual(output[1], expected.filter((_, i) => i % 2 === 1));
+    assert(f.reports.length > 1);
+    assert.equal(new Set(f.reports).size, 1, 'a report must not allocate a counters copy');
+});
+
+test('nodes of one rate share one filter table and 1:1 nodes build none', () => {
+    const f = fixture({channels: 1, rate: 11025});
+    const options = (rate) => ({processorOptions: {control: new SharedArrayBuffer(40),
+        pcm: new SharedArrayBuffer(4096 * 4), channels: 1, rate}});
+    assert.equal(new f.Processor(options(11025)).filter, f.processor.filter);
+    assert.notEqual(new f.Processor(options(22050)).filter, f.processor.filter);
+    assert.equal(new f.Processor(options(48000)).filter, null);
 });
 
 test('message mode reports at once when playback starts and when the ring empties', async () => {
