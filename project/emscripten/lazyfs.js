@@ -25,11 +25,16 @@ var LAZY_RUN_MAX = 1 << 22; // longest single read (and the sab buffer)
 var LAZY_EAGER_MAX = 1 << 20; // a file up to this size is read whole at mount while the budget lasts
 var LAZY_EAGER_BUDGET = 64 << 20; // all of them together: past it they are normal lazy nodes
 var LAZY_TAB_WAIT = 3000; // ms: a reload's old page lets go of its storage a moment after the new page asks
-var LAZY_CACHE_BLOCKS = 64; // 4 MiB
+var LAZY_CACHE_BLOCKS = 64; // 4 MiB, counting whole runs: a cached block is a view and keeps its run alive
+var LAZY_RUN_KEEP = 1 << 20; // a longer run caches only its last 1 MiB: the reader has the rest, other files keep theirs
+var LAZY_PREFETCH_FILES = 4; // jspi: next runs read in the background, for this many files read sequentially
 // win: the stats=1 window (jspi reads), set and taken by the [stats] line every ~2 s; null when stats are off.
 var lazyStats = { reads: 0, blocksFetched: 0, bytesFetched: 0, cacheHits: 0, waitMs: 0, files: 0, mode: "", overlay: 0, copied: 0, win: null };
 window.__lazyStats = lazyStats;
 var lazyCache = new Map(); // "file:block" → Uint8Array, insertion order = LRU order
+var lazyCacheRuns = new Map(); // ArrayBuffer of a run → its blocks in lazyCache
+var lazyCacheBytes = 0; // those runs' sizes
+var lazyPrefetches = new Map(); // file → { start, stop, bytes: promise of the run or null }, insertion order = age
 var lazyFiles = []; // jspi mode: File objects by index
 var lazyHandles = []; // jspi mode: their file handles, for a new File when one went stale
 var lazyEagerLeft = LAZY_EAGER_BUDGET;
@@ -71,23 +76,39 @@ function lazyCached(key) {
     return hit;
 }
 
-// Splits a run read at file offset start into cached blocks; returns it for the reader.
+function lazyUncache(key) {
+    var hit = lazyCache.get(key);
+    if (!hit) return;
+    lazyCache.delete(key);
+    var left = lazyCacheRuns.get(hit.buffer) - 1;
+    if (left) lazyCacheRuns.set(hit.buffer, left);
+    else { lazyCacheRuns.delete(hit.buffer); lazyCacheBytes -= hit.buffer.byteLength; }
+}
+
+// Splits a run read at file offset start into cached blocks, views of it (of a copy of its last LAZY_RUN_KEEP
+// when longer); returns it for the reader.
 function lazyKeepRun(file, start, bytes) {
-    for (var i = 0; i < bytes.length; i += LAZY_BLOCK) {
-        lazyCache.delete(file + ":" + (start + i) / LAZY_BLOCK);
-        lazyCache.set(file + ":" + (start + i) / LAZY_BLOCK, bytes.slice(i, i + LAZY_BLOCK));
-        lazyStats.blocksFetched++;
+    var from = Math.max(0, Math.ceil(bytes.length / LAZY_BLOCK) * LAZY_BLOCK - LAZY_RUN_KEEP);
+    var kept = from ? bytes.slice(from) : bytes;
+    for (var i = from; i < bytes.length; i += LAZY_BLOCK) {
+        lazyUncache(file + ":" + (start + i) / LAZY_BLOCK);
+        lazyCache.set(file + ":" + (start + i) / LAZY_BLOCK, kept.subarray(i - from, i - from + LAZY_BLOCK));
+        var held = lazyCacheRuns.get(kept.buffer) || 0;
+        if (!held) lazyCacheBytes += kept.buffer.byteLength;
+        lazyCacheRuns.set(kept.buffer, held + 1);
     }
+    lazyStats.blocksFetched += Math.ceil(bytes.length / LAZY_BLOCK);
     lazyStats.bytesFetched += bytes.length;
     if (lazyStats.win) { lazyStats.win.fetches++; lazyStats.win.fetchBytes += bytes.length; }
-    while (lazyCache.size > LAZY_CACHE_BLOCKS) lazyCache.delete(lazyCache.keys().next().value);
+    while (lazyCacheBytes > LAZY_CACHE_BLOCKS * LAZY_BLOCK && lazyCache.size) lazyUncache(lazyCache.keys().next().value);
     return { start: start, bytes: bytes };
 }
 
 // Copies node bytes [position, position + length) into buffer[offset…]. On a cache miss
 // readRun(file, start, length) reads from the missing block to the end of the range plus
 // LAZY_READAHEAD (when the miss starts where the file's last read ended) in one go, and returns
-// the bytes or (jspi) a promise of them.
+// the bytes or (jspi) a promise of them. jspi: a sequential run also starts reading the next run of its length
+// (lazyPrefetches), which the miss at its start then takes instead of a new read.
 function lazyCopy(node, buffer, offset, length, position, readRun) {
     lazyStats.reads++;
     var end = Math.min(node.lazySize, position + length), done = 0, run = null, short = false;
@@ -105,13 +126,27 @@ function lazyCopy(node, buffer, offset, length, position, readRun) {
                     bytes = hit; from = pos - block * LAZY_BLOCK;
                 } else {
                     if (short) break; // the last run came back short: the file shrank
-                    var start = block * LAZY_BLOCK;
+                    var start = block * LAZY_BLOCK, file = node.lazyFile, pre = lazyPrefetches.get(file), r;
                     var ahead = node.lazyNext === start ? LAZY_READAHEAD : 0;
                     var stop = Math.min(node.lazySize, start + LAZY_RUN_MAX, Math.ceil(end / LAZY_BLOCK) * LAZY_BLOCK + ahead);
+                    lazyPrefetches.delete(file);
+                    if (pre && pre.start === start) { // a failed one is read again, with readRun's retry and error
+                        stop = pre.stop;
+                        r = pre.bytes.then(b => b || readRun(file, start, stop - start));
+                    } else {
+                        r = readRun(file, start, stop - start);
+                    }
                     node.lazyNext = stop;
-                    var r = readRun(node.lazyFile, start, stop - start);
-                    var got = b => { short = b.length < stop - start; run = lazyKeepRun(node.lazyFile, start, b); };
-                    if (r instanceof Promise) return r.then(b => (got(b), step()));
+                    var got = b => { short = b.length < stop - start; run = lazyKeepRun(file, start, b); };
+                    if (r instanceof Promise) return r.then(b => {
+                        got(b);
+                        if (ahead && !short && stop < node.lazySize) {
+                            var next = Math.min(node.lazySize, stop + (stop - start));
+                            lazyPrefetches.set(file, { start: stop, stop: next, bytes: readRun(file, stop, next - stop).catch(() => null) });
+                            if (lazyPrefetches.size > LAZY_PREFETCH_FILES) lazyPrefetches.delete(lazyPrefetches.keys().next().value);
+                        }
+                        return step();
+                    });
                     got(r);
                     continue;
                 }

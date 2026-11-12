@@ -4,12 +4,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 globalThis.window = globalThis;
 const L = new Function(fs.readFileSync(new URL('./lazyfs.js', import.meta.url), 'utf8') +
-    '\nreturn { lazyCopy, lazyCache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX, LAZY_EAGER_MAX, LAZY_EAGER_BUDGET, lazyEagerTake, lazyEscapeName, lazyGameName, lazyOverlayPath, lazyPatchIdbfs, vnboxStoreSaves, mountLazyAppJspi, lazyMountOverlay, lazyFiles, lazyHandles };')();
+    '\nreturn { lazyCopy, lazyCache, lazyUncache, LAZY_BLOCK, LAZY_READAHEAD, LAZY_RUN_MAX, LAZY_EAGER_MAX, LAZY_EAGER_BUDGET, lazyEagerTake, lazyEscapeName, lazyGameName, lazyOverlayPath, lazyPatchIdbfs, vnboxStoreSaves, mountLazyAppJspi, lazyMountOverlay, lazyFiles, lazyHandles };')();
 const B = L.LAZY_BLOCK, size = 10 * (1 << 20) + 123;
 const file = Uint8Array.from({ length: size }, (_, i) => (i * 7) & 255);
 const reads = [];
 const readRun = (f, start, length) => { reads.push([start, length]); return file.slice(start, start + length); };
 const node = { lazyFile: 0, lazySize: size };
+const clearCache = () => { reads.length = 0; [...L.lazyCache.keys()].forEach(L.lazyUncache); };
 const get = (pos, len) => { const out = new Uint8Array(len); return [L.lazyCopy(node, out, 0, len, pos, readRun), out]; };
 
 let [n, out] = get(B + 5, 3 * B); // one read: block 1 to the end of block 4, no read-ahead yet
@@ -21,14 +22,14 @@ assert.deepEqual(reads[1], [5 * B, B + L.LAZY_READAHEAD]);
 [n] = get(2 * B, 8 * B); // cached, nothing read
 assert.equal(n, 8 * B);
 assert.equal(reads.length, 2);
-reads.length = 0; L.lazyCache.clear();
+clearCache();
 [n, out] = get(0, 8 << 20); // longer than LAZY_RUN_MAX: several runs, no gaps
 assert.equal(n, 8 << 20);
 assert.deepEqual(out, file.slice(0, 8 << 20));
 assert.ok(reads.every(([, len]) => len <= L.LAZY_RUN_MAX) && reads.length === 2, JSON.stringify(reads));
 [n] = get(size - 100, 1000); // past the end
 assert.equal(n, 100);
-reads.length = 0; L.lazyCache.clear();
+clearCache();
 const short = { lazyFile: 1, lazySize: size }; // the file shrank to 1.5 blocks: stops, no loop
 const shortRun = (f, start, length) => { reads.push([start, length]); return file.slice(start, Math.min(start + length, B * 1.5)); };
 assert.equal(L.lazyCopy(short, new Uint8Array(4 * B), 0, 4 * B, 0, shortRun), B * 1.5);
@@ -37,6 +38,39 @@ const pre = { lazySize: 10, lazyBytes: file.slice(0, 10) }; // read whole at mou
 const o = new Uint8Array(4);
 assert.equal(L.lazyCopy(pre, o, 0, 4, 8, null), 2);
 assert.deepEqual(o.subarray(0, 2), file.slice(8, 10));
+// Cached blocks are views of their run, and a long read caches only its last LAZY_RUN_KEEP: the bug copied
+// every block of an 8 MiB read and flushed the hot blocks of every other file from the cache.
+clearCache();
+const hot = { lazyFile: 5, lazySize: size };
+L.lazyCopy(hot, new Uint8Array(10), 0, 10, 0, readRun);
+L.lazyCopy({ lazyFile: 6, lazySize: size }, new Uint8Array(8 << 20), 0, 8 << 20, 0, readRun);
+reads.length = 0;
+assert.equal(L.lazyCopy(hot, new Uint8Array(10), 0, 10, 0, readRun), 10);
+assert.equal(reads.length, 0);
+L.lazyCopy({ lazyFile: 7, lazySize: size }, new Uint8Array(2 * B), 0, 2 * B, 0, readRun);
+assert.equal(L.lazyCache.get('7:0').buffer, L.lazyCache.get('7:1').buffer);
+// jspi: a sequential run starts reading the next one in the background, and the miss there takes it instead of
+// waiting for a new read. A failed one is read again.
+reads.length = 0;
+let failAt = 16 * B;
+const asyncRun = (f, start, length) => {
+    reads.push([start, length]);
+    return start === failAt ? Promise.reject(new Error('stale')) : Promise.resolve(file.slice(start, start + length));
+};
+const seq = { lazyFile: 8, lazySize: size };
+const getAsync = async (pos, len) => { const out = new Uint8Array(len); return [await L.lazyCopy(seq, out, 0, len, pos, asyncRun), out]; };
+await getAsync(0, B); // not sequential yet: nothing more
+await getAsync(B, B); // to the end of block 1 plus read-ahead, then the next run of that length
+assert.deepEqual(reads, [[0, B], [B, 5 * B], [6 * B, 5 * B]]);
+[n, out] = await getAsync(6 * B, 2 * B);
+assert.equal(n, 2 * B);
+assert.deepEqual(out, file.slice(6 * B, 8 * B));
+assert.deepEqual(reads.slice(3), [[11 * B, 5 * B]]);
+await getAsync(8 * B, 8 * B); // takes [11, 16) and starts [16, 21), which fails
+failAt = -1;
+[n, out] = await getAsync(16 * B, B);
+assert.deepEqual(out, file.slice(16 * B, 17 * B));
+assert.deepEqual(reads.slice(4), [[16 * B, 5 * B], [16 * B, 5 * B], [21 * B, 5 * B]]);
 
 // A different spelling than Fs::localNameToRemote (fs.cpp) hides the game's safe-saved file behind the shipped one.
 assert.equal(L.lazyEscapeName('\u30bb@a. b.'), '(_xE3_)(_x82_)(_xBB_)(_at_)a. b(_dot_)');
