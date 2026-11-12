@@ -111,6 +111,123 @@ void testWasmJitStBoundedDispatch() {
     cpu->nextOp = nullptr;
 }
 
+// What a hop between compiled blocks (emitChainToNextOp, jumpEip) no longer checks must still hold: a thread stopped
+// mid-chain stops at the next hop, a code write reaches the hop's target, a cache entry of the other decode mode is
+// not entered, and the hop clears the SMC arming of the block it leaves.
+void testWasmJitHopChecks() {
+    extern S32 contextTimeRemaining;
+    const S32 savedBudget = contextTimeRemaining;
+    contextTimeRemaining = 100000;
+    TestContext& context = testContext();
+    CPU* cpu = context.cpu;
+    auto compile = [&](U32 offset) {
+        DecodedOp* op = cpu->getOp(TEST_CODE_ADDRESS + offset, 0);
+        startNewJIT(cpu, TEST_CODE_ADDRESS + offset, op);
+        if (!op->pfnJitCode || op->pfn != context.process->startJITOp) {
+            testFail("hop test requires compiled block entries");
+        }
+        op->runCount = JIT_RUN_COUNT + 1;
+        return op;
+    };
+    auto start = [&](DecodedOp* op) { // every case starts at offset 0
+        cpu->eip.u32 = 0;
+        cpu->nextOp = op;
+        cpu->yield = false;
+        cpu->blockInstructionCount = 0;
+    };
+    auto runToEnd = [&]() {
+        for (U32 i = 0; i < 64 && (!cpu->nextOp || cpu->nextOp->inst != TestEnd); i++) {
+            cpu->blockInstructionCount = 0;
+            cpu->run();
+        }
+        return cpu->nextOp && cpu->nextOp->inst == TestEnd;
+    };
+
+    // ST: the running thread is terminated only by terminateCurrentThread, and it sets yield, which the hop tests.
+    testNewInstruction(0);
+    bool wasScheduled = context.thread->scheduledThreadNode.isInList();
+    cpu->yield = false;
+    terminateCurrentThread(context.thread);
+    bool yielded = cpu->yield;
+    context.thread->terminating = false;
+    cpu->yield = false;
+    if (wasScheduled) {
+        scheduleThread(context.thread);
+    }
+    if (!yielded) {
+        testFail("terminateCurrentThread must set cpu->yield: the hop tests yield, not terminating");
+    }
+
+    // A syscall that yields mid-chain: the chain stops at the next hop, then resumes without skipping a block.
+    testNewInstruction(0);
+    testPushCode8(0x43); testPushCode8(0xb8); testPushCode32(8); testPushCode8(0xff); testPushCode8(0xe0); // 0: inc ebx; mov eax,8; jmp eax
+    testPushCode8(0x43); testPushCode8(0xb8); testPushCode32(158); testPushCode8(0xcd); testPushCode8(0x80); // 8: inc ebx; sched_yield
+    testPushCode8(0x43); testPushCode8(0xcd); testPushCode8(0x97); // 16: inc ebx; TestEnd
+    DecodedOp* a = compile(0);
+    compile(8);
+    DecodedOp* c = compile(16);
+    start(a);
+    cpu->run();
+    if (cpu->reg[3].u32 != 2 || !cpu->yield || cpu->nextOp != c) {
+        testFail("a block that yields must not hop on: ebx=%u yield=%d", cpu->reg[3].u32, (int)cpu->yield);
+    }
+    cpu->yield = false;
+    if (!runToEnd() || cpu->reg[3].u32 != 3) {
+        testFail("the chain must resume after a yield without skipping or repeating a block");
+    }
+
+    // A code write by one block reaches the target of its indirect jump.
+    testNewInstruction(0);
+    testPushCode8(0x26); testPushCode8(0xc6); testPushCode8(0x05); testPushCode32(TEST_CODE_ADDRESS + 16); testPushCode8(0x46); // 0: mov byte es:[16],0x46 (inc esi)
+    testPushCode8(0xb8); testPushCode32(16); testPushCode8(0xff); testPushCode8(0xe0); // 8: mov eax,16; jmp eax
+    testPushCode8(0x90); // 15
+    testPushCode8(0x43); testPushCode8(0xcd); testPushCode8(0x97); // 16: inc ebx; TestEnd
+    compile(16);
+    start(compile(0));
+    if (!runToEnd() || cpu->reg[3].u32 != 0 || cpu->reg[6].u32 != 1) {
+        testFail("a hop must run the rewritten target: ebx=%u esi=%u", cpu->reg[3].u32, cpu->reg[6].u32);
+    }
+
+    // The target's cache entry was decoded in 16-bit mode: a 32-bit block's indirect jump must not enter it.
+    testNewInstruction(0);
+    testPushCode8(0xb8); testPushCode32(8); testPushCode8(0xff); testPushCode8(0xe0); // 0: mov eax,8; jmp eax
+    testPushCode8(0x90); // 7
+    testPushCode8(0xb8); testPushCode32(0x12345678); testPushCode8(0xcd); testPushCode8(0x97); // 8: mov eax,0x12345678; TestEnd
+    cpu->big = 0;
+    DecodedOp* op16 = cpu->getOp(TEST_CODE_ADDRESS + 8, 0); // mov ax,0x5678; xor al,0x12; TestEnd
+    cpu->big = 1;
+    if (!op16 || (op16->flags2 & OP_FLAG2_DECODED_32BIT)) {
+        testFail("decode mode test setup");
+    }
+    start(compile(0));
+    if (!runToEnd() || cpu->reg[0].u32 != 0x12345678) {
+        testFail("a hop entered a cache entry of the other decode mode: eax=%x", cpu->reg[0].u32);
+    }
+
+    // A write to the block's own code page arms wasmJitActiveBlock. Without a hop it stays armed; a hop clears it.
+    testNewInstruction(0);
+    testPushCode8(0x26); testPushCode8(0xc7); testPushCode8(0x05); testPushCode32(TEST_CODE_ADDRESS + 0x800); testPushCode32(1); // 0: mov dword es:[0x800],1
+    testPushCode8(0xcd); testPushCode8(0x97); // 11: TestEnd
+    DecodedOp* writer = compile(0);
+    start(writer);
+    if (!runToEnd() || cpu->wasmJitActiveBlock != writer) {
+        testFail("hop test setup: a write to a code page must arm the SMC check");
+    }
+    testNewInstruction(0);
+    testPushCode8(0x26); testPushCode8(0xc7); testPushCode8(0x05); testPushCode32(TEST_CODE_ADDRESS + 0x800); testPushCode32(1); // 0: mov dword es:[0x800],1
+    testPushCode8(0xb8); testPushCode32(24); testPushCode8(0xff); testPushCode8(0xe0); // 11: mov eax,24; jmp eax
+    for (U32 i = 18; i < 24; i++) testPushCode8(0x90);
+    testPushCode8(0x46); testPushCode8(0xcd); testPushCode8(0x97); // 24: inc esi; TestEnd
+    compile(24);
+    start(compile(0));
+    if (!runToEnd() || cpu->reg[6].u32 != 1 || cpu->wasmJitActiveBlock || cpu->wasmJitBailout != WASM_JIT_BAILOUT_NONE) {
+        testFail("a hop must clear wasmJitActiveBlock and wasmJitBailout: esi=%u active=%p bailout=%u", cpu->reg[6].u32,
+            (void*)cpu->wasmJitActiveBlock, cpu->wasmJitBailout);
+    }
+    contextTimeRemaining = savedBudget;
+    cpu->nextOp = nullptr;
+}
+
 // Hot groups: chained standalone blocks that reach the entry threshold are compiled again into one module, keep
 // running correctly, and a block whose slot is cleared while queued drops out of the queue.
 void testWasmJitHotGroups() {
