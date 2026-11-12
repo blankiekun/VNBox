@@ -958,8 +958,8 @@ const TestEntry TEST_ENTRIES[] = {
     {testHostCrt, "Test native Wine CRT memcpy/memset/strlen/strstr/_strnicmp"},
     {testHostCrtExports, "Test the Wine CRT exports are found in a builtin .dll.so"},
     {testHostHookHeadSingleStep, "Test a Frida hook under TF fires once and steps one op", TEST_ENTRY_SERIAL},
-    {testHostDsoundSameBytes, "Test host dsound convert/mix leave the bytes the guest functions do"},
-    {testHostDsoundDeclines, "Test host dsound convert/mix leave what they can't do to the guest"},
+    {testHostDsoundSameBytes, "Test host dsound convert/mix/resample leave the bytes the guest functions do"},
+    {testHostDsoundDeclines, "Test host dsound convert/mix/resample leave what they can't do to the guest"},
 #ifdef BOXEDWINE_HOST_VORBIS
     {testHostAcmConvert, "Test native vorbis.acm convert"},
     {testHostAcmBadFile, "Test a corrupt vorbis.acm can't make the host allocate gigabytes"},

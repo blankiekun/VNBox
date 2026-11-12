@@ -113,19 +113,68 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
      for (i = 0; i < committed_samples; i++)
          for (channel = 0; channel < dsb->mix_channels; channel++)
              dsb->put(dsb, i * ostride, channel, get_current_sample(dsb, dsb->committedbuff,
-@@ -387,7 +468,10 @@
-             float* cache = &intermediate[channel * required_input + ipos];
-             for (j = 0; j < fir_used; j++)
-                 sum += fir_copy[j] * cache[j];
--            dsb->put(dsb, i * ostride, channel, sum * dsb->firgain);
-+            if (dsb->put == putieee32) /* VNBox: inline, see cp_run_fast */
-+                dsb->device->tmp_buffer[i * (ostride / sizeof(float)) + channel] = sum * dsb->firgain;
-+            else
-+                dsb->put(dsb, i * ostride, channel, sum * dsb->firgain);
-         }
+@@ -308,6 +389,44 @@
+     return count;
+ }
+ 
++/* VNBox: cp_fields_resample's loop over the output frames for a plain store (putieee32, or put_mono2stereo
++ * into putieee32 when dup): the same operations in the same order, count frames to out, ochannels floats
++ * apart, out[1] = out[0] when dup (mono to stereo, channels 1). A leaf with no other state (fir passed in),
++ * exported so that Boxedwine runs it as host code (source/emulation/cpu/normal/hostdsound.cpp, same
++ * results); this code is the fallback. */
++__attribute__((visibility("default"), noinline))
++void vnbox_dsound_resample(float *out, UINT ochannels, UINT count, LONG64 freqAcc_start, LONG64 freqAdjustNum,
++        LONG64 freqAdjustDen, UINT dsbfirstep, float firgain, const float *fir, UINT fir_len, float *fir_copy,
++        const float *intermediate, UINT required_input, UINT channels, BOOL dup)
++{
++    UINT i, channel;
++
++    for(i = 0; i < count; ++i, out += ochannels) {
++        UINT int_fir_steps = (freqAcc_start + i * freqAdjustNum) * dsbfirstep / freqAdjustDen;
++        float total_fir_steps = (freqAcc_start + i * freqAdjustNum) * dsbfirstep / (float)freqAdjustDen;
++        UINT ipos = int_fir_steps / dsbfirstep;
++
++        UINT idx = (ipos + 1) * dsbfirstep - int_fir_steps - 1;
++        float rem = int_fir_steps + 1.0 - total_fir_steps;
++
++        int fir_used = 0;
++        while (idx < fir_len - 1) {
++            fir_copy[fir_used++] = fir[idx] * (1.0 - rem) + fir[idx + 1] * rem;
++            idx += dsbfirstep;
++        }
++
++        for (channel = 0; channel < channels; channel++) {
++            int j;
++            float sum = 0.0;
++            const float* cache = &intermediate[channel * required_input + ipos];
++            for (j = 0; j < fir_used; j++)
++                sum += fir_copy[j] * cache[j];
++            out[channel] = sum * firgain;
++        }
++        if (dup) out[1] = out[0];
++    }
++}
++
+ static UINT cp_fields_resample(IDirectSoundBufferImpl *dsb, UINT count, LONG64 *freqAccNum)
+ {
+     UINT i, channel;
+@@ -364,6 +483,15 @@
+                     dsb->buflen, dsb->sec_mixpos + i * istride, channel);
      }
  
-@@ -479,11 +563,27 @@
++    /* VNBox: a plain store runs the whole loop in vnbox_dsound_resample */
++    if (dsb->put == putieee32 || (dsb->put == put_mono2stereo && dsb->put_aux == putieee32))
++    {
++        vnbox_dsound_resample(dsb->device->tmp_buffer, ostride / sizeof(float), count, freqAcc_start,
++                dsb->freqAdjustNum, dsb->freqAdjustDen, dsbfirstep, dsb->firgain, fir, fir_len, fir_copy,
++                intermediate, required_input, channels, dsb->put != putieee32);
++        return max_ipos;
++    }
++
+     for(i = 0; i < count; ++i) {
+         UINT int_fir_steps = (freqAcc_start + i * dsb->freqAdjustNum) * dsbfirstep / dsb->freqAdjustDen;
+         float total_fir_steps = (freqAcc_start + i * dsb->freqAdjustNum) * dsbfirstep / (float)dsb->freqAdjustDen;
+@@ -479,11 +607,27 @@
  	}
  }
  
@@ -156,7 +205,7 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
  
  	TRACE("(%p,%d)\n",dsb,frames);
  	TRACE("left = %lx, right = %lx\n", dsb->volpan.dwTotalAmpFactor[0],
-@@ -492,22 +592,17 @@
+@@ -492,22 +636,17 @@
  	if ((!(dsb->dsbd.dwFlags & DSBCAPS_CTRLPAN) || (dsb->volpan.lPan == 0)) &&
  	    (!(dsb->dsbd.dwFlags & DSBCAPS_CTRLVOLUME) || (dsb->volpan.lVolume == 0)) &&
  	     !(dsb->dsbd.dwFlags & DSBCAPS_CTRL3D))
@@ -182,7 +231,7 @@ diff --git a/dlls/dsound/mixer.c b/dlls/dsound/mixer.c
  }
  
  /**
-@@ -536,10 +631,11 @@
+@@ -536,10 +675,11 @@
  	ibuf = dsb->device->tmp_buffer;
  
  	if (secondarybuffer_is_audible(dsb)) {
