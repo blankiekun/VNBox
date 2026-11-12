@@ -321,7 +321,7 @@ void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src) {
 	drawPixel(gc, x, y, src, mask.get());
 }
 
-void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src, const XDrawable* mask) {
+void XDrawable::drawPixel(const XGC& gc, S32 x, S32 y, U32 src, XDrawable* mask) {
 	if (!data || x < 0 || y < 0 || (U32)x >= w || (U32)y >= h) return;
 	S64 cx = (S64)x - gc.values.clip_x_origin, cy = (S64)y - gc.values.clip_y_origin;
 	if (gc.hasClipRects) {
