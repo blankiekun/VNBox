@@ -1112,22 +1112,32 @@ static void wasmJitAddInlineDep(KMemory* memory, U32 start, U32 end, U32 callerE
     for (U32 page = start >> K_PAGE_SHIFT; page <= ((end - 1) >> K_PAGE_SHIFT); ++page) {
         std::vector<WasmJitInlineDep>& deps = g_wasmJitInlineDeps[page];
         bool known = false;
-        for (size_t i = 0; i < deps.size();) {
-            const WasmJitInlineDep& dep = deps[i];
-            if (dep.memory == memory) {
-                g_wasmJitInlineDepLookups++;
-                if (memory->getDecodedOp(dep.callerEip) != dep.caller) {
-                    deps[i] = deps.back();
-                    deps.pop_back();
-                    continue;
-                }
-                if (dep.start == start && dep.end == end && dep.caller == caller && dep.callerEip == callerEip) {
-                    known = true;
-                }
+        for (const WasmJitInlineDep& dep : deps) {
+            if (dep.memory == memory && dep.start == start && dep.end == end && dep.caller == caller && dep.callerEip == callerEip) {
+                known = true;
+                break;
             }
-            ++i;
         }
-        if (!known) deps.push_back({memory, start, end, callerEip, caller});
+        if (known) continue;
+        // Drop entries whose caller's op is gone (its code was unmapped or rewritten): a callee page that is never
+        // invalidated (ntdll) would otherwise keep one entry per caller load for good. Only when the list is full,
+        // so a popular callee's page costs O(1) lookups per add, not one per caller.
+        if (deps.size() == deps.capacity()) {
+            for (size_t i = 0; i < deps.size();) {
+                const WasmJitInlineDep& dep = deps[i];
+                if (dep.memory == memory) {
+                    g_wasmJitInlineDepLookups++;
+                    if (memory->getDecodedOp(dep.callerEip) != dep.caller) {
+                        deps[i] = deps.back();
+                        deps.pop_back();
+                        continue;
+                    }
+                }
+                ++i;
+            }
+            if (deps.size() > deps.capacity() / 2) deps.reserve(deps.capacity() * 2);
+        }
+        deps.push_back({memory, start, end, callerEip, caller});
     }
 }
 
