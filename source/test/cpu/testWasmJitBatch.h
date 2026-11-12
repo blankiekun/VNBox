@@ -34,6 +34,7 @@ void testWasmJitLazyFlagStores();
 void testWasmJitStopBlockBefore();
 void testWasmJitInlineCalleeShapes();
 void testWasmJitFailedGroupSplits();
+void testWasmJitAsyncInstall();
 void testWasmJitFlagsMatchOneBlockPerOp();
 void testWasmJitRuntimeGrouping();
 void testWasmJitPendingLifecycle();

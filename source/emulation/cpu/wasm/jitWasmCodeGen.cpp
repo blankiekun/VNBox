@@ -382,7 +382,8 @@ static inline U32 wasmJitRelocBaseForTable(int tableIndex);
 
 #ifndef BOXEDWINE_MULTI_THREADED
 enum class WasmJitPendingKind : U8 { FileBatch, TinyAnonymous, HotGroup };
-enum class WasmJitPendingState : U8 { Open, SealedOom };
+// Compiling: its batch is in the browser's compile (WebAssembly.compile, off the page thread); it installs at a tick.
+enum class WasmJitPendingState : U8 { Open, SealedOom, Compiling };
 enum class WasmJitSealedKind : U8 { RuntimeBatch, TinyAnonymous };
 
 struct WasmJitPendingBlock {
@@ -401,6 +402,10 @@ struct WasmJitPendingBlock {
     std::vector<U8> bytes;
     std::vector<U32> relocValues;
     std::unique_ptr<U32[]> relocArray;
+    // HotGroup: the code the op keeps running until its hot-group code installs.
+    void* hotOldSlot = nullptr;
+    U32 hotOldOpCount = 0;
+    U32 hotOldLen = 0;
 };
 
 struct WasmJitSealedRequest {
@@ -413,6 +418,16 @@ static std::unordered_map<DecodedOp*, U64> g_wasmJitPendingByOp;
 static WasmJitBatchPolicy g_wasmJitBatchPolicy;
 static U64 g_wasmJitNextPendingId = 1;
 static std::deque<WasmJitSealedRequest> g_wasmJitSealedRequests;
+// Batches in the browser's compile, waiting for a main loop tick to install them (no compiled block on the stack then).
+struct WasmJitCompilingBatch {
+    U32 ticket = 0;
+    bool retryProbe = false;
+    size_t mergedBytes = 0;
+    std::vector<WasmJitBatchEntryId> entries;
+};
+static std::deque<WasmJitCompilingBatch> g_wasmJitCompilingBatches;
+static U32 g_wasmJitNextCompileTicket = 1;
+static int g_wasmJitCompileReady = 0; // the browser sets it when a compile ends
 static bool g_wasmJitCompilationPaused = false;
 // A release while paused unlocks exactly one browser compilation probe. The first standalone, grouped, or tiny attempt consumes this token.
 static bool g_wasmJitOomRetryProbePending = false;
@@ -453,6 +468,7 @@ static void wasmJitMaybeLogRuntimeStats();
 static bool g_wasmJitTestRuntimeBatchingEnabled = false;
 static S32 g_wasmJitTestMappedFileKeyOverride = -1;
 static U32 g_wasmJitTestTinyAdditionalHits = WASM_JIT_TINY_ADDITIONAL_HITS;
+static bool g_wasmJitTestDeferInstall = false; // false: a batch installs as soon as it is compiled, as tests expect
 #endif
 
 static void registerPendingWasmJitBlock(std::unique_ptr<WasmJitPendingBlock> pending);
@@ -464,7 +480,7 @@ U32 g_hopNextMod = 1, g_hopCurMod = 0, g_hopSrcSlot = 0;
 U32 g_hopCnt[24];
 U32 g_hopEntry[0x60];
 U32 g_hopHot[8]; // [cross*4 + srcHot*2 + dstHot]
-U32 g_hopCurHot = 0, g_hopFlushHot = 0;
+U32 g_hopCurHot = 0;
 void hopStatsPrint(double sec) {
     static const char* kinds[4] = { "const", "next", "dyn", "exit" };
     static const char* regions[3] = { "disp", "exe", "other" };
@@ -2664,26 +2680,67 @@ EM_JS(void, boxedwine_wasm_log_runtime_stats, (U64 compiledBlocks, U64 browserMo
             ' resumptions=' + oomResumptions + ']');
 });
 
-EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int size, const void** importFns, int importCount, int entryCount, int* outputSlots), {
+static constexpr int WASM_JIT_BATCH_COMPILING = 2;
+
+// Starts the browser's compile of a merged batch. WebAssembly.compile runs on the browser's own threads, so the page
+// (the game, the clicks, the audio feed) goes on meanwhile; the module waits under its ticket for
+// boxedwine_wasm_install_runtime_batch, and the end of the compile sets *readyFlag. 0: compiling is paused (out of memory).
+EM_JS(int, boxedwine_wasm_compile_runtime_batch, (const void* bytes, int size, int ticket, int* readyFlag), {
     if (Module.wasmJitReleaseGeneration === undefined) {
         Module.wasmJitReleaseGeneration = 0;
     }
     if (Module.wasmJitOomGeneration === Module.wasmJitReleaseGeneration) {
         return 0;
     }
-    var allocated = [];
-    var groupId;
-    try {
-        Module.wasmJitRuntimeModuleAttemptCount = (Module.wasmJitRuntimeModuleAttemptCount || 0) + 1;
+    Module.wasmJitRuntimeModuleAttemptCount = (Module.wasmJitRuntimeModuleAttemptCount || 0) + 1;
+    if (!Module.wasmJitCompiling) {
+        Module.wasmJitCompiling = new Map();
+    }
+    var compiling = Module.wasmJitCompiling;
+    var done = function(result) {
+        compiling.set(ticket, result);
+        HEAP32[readyFlag >>> 2] = 1;
+    };
+    // A copy: the heap may grow or the buffer be reused before the compile reads it.
+    var copy = HEAPU8.slice(bytes >>> 0, (bytes >>> 0) + size);
 #ifdef __TEST
+    // A test runs no promise until it ends: compile here. The install still waits for its call.
+    try {
         if (Module.wasmJitTestForceNextModuleOom > 0) {
             Module.wasmJitTestForceNextModuleOom--;
             throw new Error('out of memory');
         }
+        done({module: new WebAssembly.Module(copy)});
+    } catch (e) {
+        done({error: e});
+    }
+#else
+    compiling.set(ticket, null);
+    WebAssembly.compile(copy).then(function(module) { done({module: module}); }, function(e) { done({error: e}); });
 #endif
+    return 1;
+});
+
+// Instantiates the batch compiled under ticket and installs the blocks still live: the i-th gets export
+// b<exportIndices[i]>. Blocks dropped while it compiled (code written, unmapped, process gone) get no slot.
+// 2: the compile has not ended.
+EM_JS(int, boxedwine_wasm_install_runtime_batch, (int ticket, const void** importFns, int importCount, const int* exportIndices, int entryCount, int* outputSlots), {
+    var compiled = Module.wasmJitCompiling && Module.wasmJitCompiling.get(ticket);
+    if (!compiled) {
+        return 2;
+    }
+    Module.wasmJitCompiling.delete(ticket);
+    if (!entryCount) {
+        return 1;
+    }
+    var allocated = [];
+    var groupId;
+    try {
+        if (compiled.error) {
+            throw compiled.error;
+        }
+        var module = compiled.module;
         var statsT = performance.now();
-        var module = new WebAssembly.Module(new Uint8Array(HEAPU8.buffer, bytes >>> 0, size));
-        if (Module.vnboxJit) { Module.vnboxJit.ms += performance.now() - statsT; Module.vnboxJit.n++; }
         var helpers = Module.wasmJitHelpers;
         if (!helpers) {
             helpers = {};
@@ -2697,9 +2754,9 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int siz
             env: {memory: wasmMemory, table: wasmTable}, helpers: helpers
         });
         for (var i = 0; i < entryCount; ++i) {
-            var fn = instance.exports['b' + i];
+            var fn = instance.exports['b' + HEAP32[(exportIndices >>> 2) + i]];
             if (!fn) {
-                throw new Error('missing runtime batch export b' + i);
+                throw new Error('missing runtime batch export b' + HEAP32[(exportIndices >>> 2) + i]);
             }
             allocated.push(addFunction(fn, 'vii'));
 #ifdef __TEST
@@ -2708,6 +2765,7 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int siz
             }
 #endif
         }
+        if (Module.vnboxJit) { Module.vnboxJit.ms += performance.now() - statsT; Module.vnboxJit.n++; }
         if (!Module.wasmJitRuntimeGroups) {
             Module.wasmJitRuntimeGroups = new Map();
         }
@@ -2742,7 +2800,7 @@ EM_JS(int, boxedwine_wasm_instantiate_runtime_batch, (const void* bytes, int siz
         if (oom) {
             Module.wasmJitOomGeneration = Module.wasmJitReleaseGeneration;
         }
-        console.error('boxedwine_wasm_instantiate_runtime_batch failed:', e);
+        console.error('boxedwine_wasm_install_runtime_batch failed:', e);
         return oom ? 0 : -1;
     }
 });
@@ -2802,6 +2860,7 @@ EM_JS(void, boxedwine_wasm_test_reset_runtime_batching_js, (), {
     Module.wasmJitRuntimeModuleCount = 0;
     Module.wasmJitRuntimeModuleAttemptCount = 0;
     Module.wasmJitStandaloneModuleAttemptCount = 0;
+    Module.wasmJitCompiling = new Map();
     Module.wasmJitRuntimeGroupsCreated = 0;
     Module.wasmJitRuntimeGroupsReleased = 0;
     Module.wasmJitTestFailBatchAfterSlots = -1;
@@ -5224,6 +5283,20 @@ static void erasePendingWasmJitBlock(U64 id) {
     g_wasmJitPendingBlocks.erase(found);
 }
 
+// Is the op still running the code it had when its hot recompile was queued?
+static bool hotOldBlockLive(const WasmJitPendingBlock& pending) {
+    const DecodedOp* op = pending.op;
+    return op->pfnJitCode == pending.hotOldSlot && (op->flags & OP_FLAG_JIT) && op->pfn == pending.process->startJITOp &&
+        !(op->flags2 & OP_FLAG2_WASM_JIT_PENDING);
+}
+
+// A hot recompile that will not install: the op's block is its old one again.
+static void keepHotOldBlock(WasmJitPendingBlock& pending) {
+    if (hotOldBlockLive(pending)) {
+        claimJitBlockOps(pending.op, pending.hotOldOpCount, pending.hotOldLen);
+    }
+}
+
 static void failRuntimeBatch(const std::vector<WasmJitBatchEntryId>& liveIds, const char* stage, const char* detail = nullptr) {
     if (detail) {
         klog_fmt("[WASM JIT batch] %s failed: %s", stage, detail);
@@ -5234,7 +5307,13 @@ static void failRuntimeBatch(const std::vector<WasmJitBatchEntryId>& liveIds, co
         auto found = g_wasmJitPendingBlocks.find(id);
         if (found != g_wasmJitPendingBlocks.end()) {
             ++g_wasmJitRuntimeStats.permanentFailures;
-            failPendingWasmJitBlock(*found->second);
+            if (found->second->kind == WasmJitPendingKind::HotGroup) {
+                // Rejected for good: it keeps the code it has and is not queued again.
+                g_wasmJitHotRejected.insert((int)(uintptr_t)found->second->hotOldSlot);
+                keepHotOldBlock(*found->second);
+            } else {
+                failPendingWasmJitBlock(*found->second);
+            }
             erasePendingWasmJitBlock(id);
         }
     }
@@ -5258,6 +5337,31 @@ static void failOrSplitRuntimeBatch(const std::vector<WasmJitBatchEntryId>& live
     flushRuntimeBatch(second);
 }
 
+static bool installRuntimeBatch(const WasmJitCompilingBatch& batch);
+
+// "Out of memory": a hot block keeps its old code and may queue itself again in a later period; the others wait
+// sealed for the retry. Returns those.
+static std::vector<WasmJitBatchEntryId> sealRuntimeBatchOom(const std::vector<WasmJitBatchEntryId>& liveIds) {
+    wasmJitRecordOomPause();
+    std::vector<WasmJitBatchEntryId> sealed;
+    for (WasmJitBatchEntryId id : liveIds) {
+        auto found = g_wasmJitPendingBlocks.find(id);
+        if (found == g_wasmJitPendingBlocks.end()) {
+            continue;
+        }
+        if (found->second->kind == WasmJitPendingKind::HotGroup) {
+            keepHotOldBlock(*found->second);
+            erasePendingWasmJitBlock(id);
+        } else {
+            found->second->state = WasmJitPendingState::SealedOom;
+            sealed.push_back(id);
+        }
+    }
+    return sealed;
+}
+
+// Starts the browser's compile of the batch's live blocks; they install at a later main loop tick
+// (wasmJitInstallCompiledBatches). Meanwhile a fresh block runs in the interpreter and a hot one keeps its old code.
 static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
     std::vector<WasmJitBatchEntryId> liveIds;
     std::vector<WasmJitMergeInput> inputs;
@@ -5265,7 +5369,7 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
     inputs.reserve(request.entries.size());
     for (WasmJitBatchEntryId id : request.entries) {
         auto found = g_wasmJitPendingBlocks.find(id);
-        if (found != g_wasmJitPendingBlocks.end()) {
+        if (found != g_wasmJitPendingBlocks.end() && found->second->state != WasmJitPendingState::Compiling) {
             liveIds.push_back(id);
             inputs.push_back({&found->second->bytes});
         }
@@ -5281,42 +5385,109 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
         return;
     }
 
-    std::vector<int> slots(liveIds.size(), -1);
-    bool retryProbe = wasmJitBeginOomRetryProbe();
-    int result = boxedwine_wasm_instantiate_runtime_batch(merged.data(), (int)merged.size(), g_wasmHelperTable, WASM_HELPER_COUNT, (int)liveIds.size(), slots.data());
-    if (result == WASM_JIT_BATCH_PAUSED) {
-        wasmJitRecordOomPause();
-        for (WasmJitBatchEntryId id : liveIds) {
-            auto found = g_wasmJitPendingBlocks.find(id);
-            if (found != g_wasmJitPendingBlocks.end()) {
-                found->second->state = WasmJitPendingState::SealedOom;
-            }
-        }
+    WasmJitCompilingBatch batch;
+    batch.retryProbe = wasmJitBeginOomRetryProbe();
+    batch.ticket = g_wasmJitNextCompileTicket++;
+    if (!boxedwine_wasm_compile_runtime_batch(merged.data(), (int)merged.size(), (int)batch.ticket, &g_wasmJitCompileReady)) {
+        sealRuntimeBatchOom(liveIds); // its request stays first in g_wasmJitSealedRequests
         return;
     }
-    if (result == WASM_JIT_BATCH_ERROR) {
-        failOrSplitRuntimeBatch(liveIds, merged.size(), "runtime install");
+    for (WasmJitBatchEntryId id : liveIds) {
+        g_wasmJitPendingBlocks.find(id)->second->state = WasmJitPendingState::Compiling;
+    }
+    batch.mergedBytes = merged.size();
+    batch.entries = std::move(liveIds);
+#ifdef __TEST
+    if (!g_wasmJitTestDeferInstall) {
+        installRuntimeBatch(batch);
         return;
+    }
+#endif
+    g_wasmJitCompilingBatches.push_back(std::move(batch));
+}
+
+// Blocks sealed by "out of memory" at an install wait first in line for the retry (unless a request has them already).
+static void queueSealedRetry(std::vector<WasmJitBatchEntryId> ids) {
+    for (const WasmJitSealedRequest& sealed : g_wasmJitSealedRequests) {
+        for (WasmJitBatchEntryId id : sealed.entries) {
+            ids.erase(std::remove(ids.begin(), ids.end(), id), ids.end());
+        }
+    }
+    if (!ids.empty()) {
+        g_wasmJitSealedRequests.push_front({WasmJitSealedKind::RuntimeBatch, std::move(ids)});
+    }
+}
+
+// false: its compile has not ended.
+static bool installRuntimeBatch(const WasmJitCompilingBatch& batch) {
+    // Only blocks still live install: one cancelled while it compiled is gone from the map, and a hot block whose old
+    // code was replaced or freed meanwhile is dropped.
+    std::vector<WasmJitBatchEntryId> liveIds;
+    std::vector<int> exportIndices;
+    for (size_t i = 0; i < batch.entries.size(); ++i) {
+        auto found = g_wasmJitPendingBlocks.find(batch.entries[i]);
+        if (found == g_wasmJitPendingBlocks.end() || found->second->state != WasmJitPendingState::Compiling) {
+            continue;
+        }
+        WasmJitPendingBlock& pending = *found->second;
+        auto byOp = g_wasmJitPendingByOp.find(pending.op);
+        if (byOp == g_wasmJitPendingByOp.end() || byOp->second != pending.id ||
+                (pending.kind == WasmJitPendingKind::HotGroup && !hotOldBlockLive(pending))) {
+            erasePendingWasmJitBlock(pending.id);
+            continue;
+        }
+        liveIds.push_back(pending.id);
+        exportIndices.push_back((int)i);
+    }
+    std::vector<int> slots(liveIds.size(), -1);
+    int result = boxedwine_wasm_install_runtime_batch((int)batch.ticket, g_wasmHelperTable, WASM_HELPER_COUNT, exportIndices.data(), (int)liveIds.size(), slots.data());
+    if (result == WASM_JIT_BATCH_COMPILING) {
+        return false;
+    }
+    if (liveIds.empty()) {
+        return true;
+    }
+    if (result == WASM_JIT_BATCH_PAUSED) {
+        queueSealedRetry(sealRuntimeBatchOom(liveIds));
+        return true;
+    }
+    if (result == WASM_JIT_BATCH_ERROR) {
+        for (WasmJitBatchEntryId id : liveIds) {
+            g_wasmJitPendingBlocks.find(id)->second->state = WasmJitPendingState::Open; // compiled again in halves
+        }
+        failOrSplitRuntimeBatch(liveIds, batch.mergedBytes, "runtime install");
+        std::vector<WasmJitBatchEntryId> sealed;
+        for (WasmJitBatchEntryId id : liveIds) {
+            auto found = g_wasmJitPendingBlocks.find(id);
+            if (found != g_wasmJitPendingBlocks.end() && found->second->state == WasmJitPendingState::SealedOom) {
+                sealed.push_back(id);
+            }
+        }
+        queueSealedRetry(std::move(sealed));
+        return true;
     }
     if (result != WASM_JIT_BATCH_OK) {
         failRuntimeBatch(liveIds, "runtime install status");
-        return;
+        return true;
     }
     g_wasmJitCompilationPaused = false;
-    wasmJitRecordOomResumption(retryProbe);
+    wasmJitRecordOomResumption(batch.retryProbe);
     ++g_wasmJitRuntimeStats.groupedModules;
     g_wasmJitRuntimeStats.groupedFunctions += liveIds.size();
-    g_wasmJitRuntimeStats.mergedBytes += merged.size();
+    g_wasmJitRuntimeStats.mergedBytes += batch.mergedBytes;
 
+    // A hot block's old slot is unreachable once its new code is published.
+    std::vector<void*> oldSlots;
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopCurMod = g_hopNextMod++;
-    g_hopCurHot = g_hopFlushHot;
+    g_hopCurHot = g_wasmJitPendingBlocks.find(liveIds[0])->second->kind == WasmJitPendingKind::HotGroup;
 #endif
     for (size_t i = 0; i < liveIds.size(); ++i) {
-        auto found = g_wasmJitPendingBlocks.find(liveIds[i]);
-        if (found != g_wasmJitPendingBlocks.end()) {
-            publishWasmJitBlock(*found->second, slots[i]);
+        WasmJitPendingBlock& pending = *g_wasmJitPendingBlocks.find(liveIds[i])->second;
+        if (pending.kind == WasmJitPendingKind::HotGroup) {
+            oldSlots.push_back(pending.hotOldSlot);
         }
+        publishWasmJitBlock(pending, slots[i]);
     }
 #ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
     g_hopCurMod = 0;
@@ -5325,11 +5496,29 @@ static void flushRuntimeBatch(const WasmJitFlushRequest& request) {
     for (WasmJitBatchEntryId id : liveIds) {
         erasePendingWasmJitBlock(id);
     }
+    if (!oldSlots.empty()) {
+        clearJitBlock(oldSlots);
+    }
+    return true;
 }
 
+// At a main loop tick (no compiled block on the stack): install the batches whose compile has ended.
+static void wasmJitInstallCompiledBatches() {
+    g_wasmJitCompileReady = 0;
+    std::deque<WasmJitCompilingBatch> batches;
+    batches.swap(g_wasmJitCompilingBatches);
+    for (WasmJitCompilingBatch& batch : batches) {
+        if (!installRuntimeBatch(batch)) {
+            g_wasmJitCompilingBatches.push_back(std::move(batch));
+        }
+    }
+}
+
+// Still pending after its flush, and not compiling: sealed after "out of memory".
 static bool retainedEntriesStillPending(const std::vector<WasmJitBatchEntryId>& entries) {
     for (WasmJitBatchEntryId id : entries) {
-        if (g_wasmJitPendingBlocks.find(id) != g_wasmJitPendingBlocks.end()) {
+        auto found = g_wasmJitPendingBlocks.find(id);
+        if (found != g_wasmJitPendingBlocks.end() && found->second->state != WasmJitPendingState::Compiling) {
             return true;
         }
     }
@@ -5545,37 +5734,41 @@ static void wasmJitHotFlush(CPU* cpu) {
         (e.memory == cpu->memory ? mine : others).push_back(e);
     }
     g_wasmJitHotQueue.swap(others);
-    // What a block needs to go back to its old slot.
-    struct OldBlock {
-        WasmJitBatchEntryId id;
-        DecodedOp* op;
-        void* slot;
-        U16 blockOpCount;
-        U16 blockLen;
-        decltype(DecodedOp::runCount) runCount;
-        U32 memArrays;
-    };
     std::vector<WasmJitBatchEntryId> ids;
-    std::vector<OldBlock> oldBlocks;
     for (const WasmJitHotEntry& e : mine) {
         DecodedOp* op = e.op;
-        // Still the block that queued itself? (A cleared slot already dropped its entry.)
+        // Still the block that queued itself? (A cleared slot already dropped its entry.) One whose last hot
+        // recompile is still compiling waits for it.
         if (op->pfnJitCode != (void*)(uintptr_t)(U32)e.slot || !(op->flags & OP_FLAG_JIT) ||
-                op->pfn != cpu->thread->process->startJITOp || (op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
+                op->pfn != cpu->thread->process->startJITOp || (op->flags2 & OP_FLAG2_WASM_JIT_PENDING) ||
+                g_wasmJitPendingByOp.count(op)) {
             continue;
         }
         g_wasmJitHotSubmittedId = 0;
-        OldBlock old = {0, op, op->pfnJitCode, op->blockOpCount, op->blockLen, op->runCount, (U32)(op->flags2 & OP_FLAG2_WASM_JIT_MEM_ARRAYS)};
+        void* slot = op->pfnJitCode;
+        const U32 blockOpCount = op->blockOpCount;
+        const U32 blockLen = op->blockLen;
+        const decltype(DecodedOp::runCount) runCount = op->runCount;
+        const U32 memArrays = op->flags2 & OP_FLAG2_WASM_JIT_MEM_ARRAYS;
         op->flags &= ~OP_FLAG_JIT; // doJIT skips compiled entries
         JitWasmCodeGen* jit = static_cast<JitWasmCodeGen*>(startNewJIT(cpu));
         jit->m_hotTier = true;
         jit->doJIT(e.eip, op);
         delete jit;
         if (g_wasmJitHotSubmittedId) {
-            // Pending now (pfnJitCode cleared): the old slot is unreachable once the group publishes.
+            // Pending now (pfnJitCode cleared). The old code goes on running until the new code installs, so the
+            // op's block covers the ops of both: a write to any of them cancels the recompile and frees the old slot.
+            WasmJitPendingBlock& pending = *g_wasmJitPendingBlocks.find(g_wasmJitHotSubmittedId)->second;
+            pending.hotOldSlot = slot;
+            pending.hotOldOpCount = blockOpCount;
+            pending.hotOldLen = blockLen;
+            claimJitBlockOps(op, std::max(pending.blockOpCount, blockOpCount), std::max(pending.emulatedLen, blockLen));
+            op->pfnJitCode = slot;
+            op->pfn = cpu->thread->process->startJITOp;
+            op->runCount = runCount;
+            op->flags |= OP_FLAG_JIT;
+            op->flags2 = (op->flags2 & ~(OP_FLAG2_WASM_JIT_PENDING | OP_FLAG2_WASM_JIT_MEM_ARRAYS)) | memArrays;
             ids.push_back(g_wasmJitHotSubmittedId);
-            old.id = g_wasmJitHotSubmittedId;
-            oldBlocks.push_back(old);
         } else if (op->pfnJitCode == (void*)(uintptr_t)(U32)e.slot && !(op->flags2 & OP_FLAG2_WASM_JIT_PENDING)) {
             op->flags |= OP_FLAG_JIT;
         }
@@ -5590,38 +5783,10 @@ static void wasmJitHotFlush(CPU* cpu) {
     request.entries = ids;
     ++g_wasmJitHotModules;
     g_wasmJitHotBlocks += ids.size();
-#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
-    g_hopFlushHot = 1;
-#endif
+    // Only published code replaces the old slot (installRuntimeBatch). After "out of memory" or a failed module a
+    // block keeps the code it has; only after "out of memory" does it queue itself again in a later period, a
+    // rejected module is not tried again. A group that failed may publish in parts (failOrSplitRuntimeBatch).
     queueRuntimeFlushes({request});
-#ifdef BOXEDWINE_WASM_JIT_HOPCOUNT
-    g_hopFlushHot = 0;
-#endif
-    // Only published code replaces the old slot: after "out of memory" or a failed module a block keeps the code it has
-    // (sealed, it would run nothing but the interpreter). Only after "out of memory" does it queue itself again in a
-    // later period; a rejected module is not tried again. A group that failed may have published in parts
-    // (failOrSplitRuntimeBatch): this goes block by block.
-    std::vector<void*> oldSlots;
-    for (const OldBlock& old : oldBlocks) {
-        // Still pending here means the browser was out of memory: that block may try again later.
-        const bool outOfMemory = g_wasmJitPendingBlocks.find(old.id) != g_wasmJitPendingBlocks.end();
-        cancelPendingWasmJitBlock(old.id, old.op); // no-op once published or failed
-        if (old.op->pfnJitCode) {
-            oldSlots.push_back(old.slot);
-            continue;
-        }
-        if (!outOfMemory) g_wasmJitHotRejected.insert((int)(uintptr_t)old.slot);
-        claimJitBlockOps(old.op, old.blockOpCount, old.blockLen);
-        old.op->pfnJitCode = old.slot;
-        old.op->pfn = cpu->thread->process->startJITOp;
-        old.op->runCount = old.runCount;
-        old.op->flags |= OP_FLAG_JIT;
-        old.op->flags2 |= old.memArrays;
-    }
-    if (oldSlots.empty()) {
-        return;
-    }
-    clearJitBlock(oldSlots);
     if (g_wasmJitHotModules <= 16 || g_wasmJitHotModules % 64 == 0) {
         klog_fmt("[WASM JIT hot] group %llu: %u blocks; total %llu blocks, %llu KB", (unsigned long long)g_wasmJitHotModules,
             (U32)ids.size(), (unsigned long long)g_wasmJitHotBlocks, (unsigned long long)(g_wasmJitHotBytes / 1024));
@@ -5695,6 +5860,9 @@ static void wasmJitOomTickAt(double nowMs) {
 
 // Once per main loop tick, with no compiled block on the stack.
 void wasmJitOomTick() {
+    if (g_wasmJitCompileReady) {
+        wasmJitInstallCompiledBatches();
+    }
     if (!g_wasmJitCompilationPaused && g_wasmJitSealedRequests.empty()) {
         g_wasmJitOomNextProbeMs = 0;
         return;
@@ -5727,6 +5895,9 @@ void wasmJitTestResetRuntimeBatching() {
     g_wasmJitPendingByOp.clear();
     g_wasmJitBatchPolicy.reset();
     g_wasmJitSealedRequests.clear();
+    g_wasmJitCompilingBatches.clear();
+    g_wasmJitCompileReady = 0;
+    g_wasmJitTestDeferInstall = false;
     g_wasmJitCompilationPaused = false;
     g_wasmJitOomRetryProbePending = false;
     g_wasmJitOomNextProbeMs = 0;
@@ -5752,6 +5923,14 @@ void wasmJitTestSetHotGroups(U32 entries, double waitMs) {
 
 void wasmJitTestHotFlush(CPU* cpu) {
     wasmJitHotFlush(cpu);
+}
+
+void wasmJitTestDeferInstall(bool defer) {
+    g_wasmJitTestDeferInstall = defer;
+}
+
+void wasmJitTestTick() {
+    wasmJitOomTick();
 }
 
 void wasmJitTestOomTick(double nowMs) {

@@ -1281,7 +1281,8 @@ extern "C" int  boxedwine_wasm_instantiate(const void* bytes, int size,
                                             const void** importFns, int importCount);
 
 #ifndef BOXEDWINE_MULTI_THREADED
-extern "C" int boxedwine_wasm_instantiate_runtime_batch(const void* bytes, int size, const void** importFns, int importCount, int entryCount, int* outputSlots);
+extern "C" int boxedwine_wasm_compile_runtime_batch(const void* bytes, int size, int ticket, int* readyFlag);
+extern "C" int boxedwine_wasm_install_runtime_batch(int ticket, const void** importFns, int importCount, const int* exportIndices, int entryCount, int* outputSlots);
 #else
 enum WasmJitMtRuntimeGroupInstallResult : S32 {
     WasmJitMtRuntimeGroupInstallSuccess = 1,
@@ -1382,6 +1383,8 @@ void wasmJitTestClearHotCounts();
 void wasmJitTestForgetHotRejections();
 U32 wasmJitTestHotQueueSize();
 void wasmJitTestHotFlush(CPU* cpu);
+void wasmJitTestDeferInstall(bool defer); // true: a compiled batch waits for a tick to install, as in the browser
+void wasmJitTestTick(); // one main loop tick
 void wasmJitTestOomTick(double nowMs); // one main loop tick of the OOM retry at this host time
 U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
