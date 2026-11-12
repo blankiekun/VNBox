@@ -1358,7 +1358,12 @@ U32 wasmJitTestMaxRegLoads() {
 // shouldStopBlockBefore is off under __TEST unless a test turns it on (ST only).
 static bool g_wasmJitTestStopBlocks = false;
 void wasmJitTestSetStopBlocks(bool enabled) { g_wasmJitTestStopBlocks = enabled; }
-#define WASM_JIT_TEST_MEM_STAT(STAT) do { if (!strncmp(#STAT, "ReadMem", 7) || !strncmp(#STAT, "WriteMem", 8)) g_wasmJitTestMemHelperCalls++; } while (0)
+// A test can run code inside a memory slow-path helper (a call made from the
+// middle of a compiled block), e.g. to remap a page the block is using.
+static void (*g_wasmJitTestMemHelperHook)(CPU*) = nullptr;
+void wasmJitTestSetMemHelperHook(void (*hook)(CPU*)) { g_wasmJitTestMemHelperHook = hook; }
+#define WASM_JIT_TEST_MEM_STAT(STAT) do { if (!strncmp(#STAT, "ReadMem", 7) || !strncmp(#STAT, "WriteMem", 8)) g_wasmJitTestMemHelperCalls++; \
+    if (g_wasmJitTestMemHelperHook) g_wasmJitTestMemHelperHook(cpu); } while (0)
 #else
 #define WASM_JIT_TEST_COUNT(counter) do {} while (0)
 #define WASM_JIT_TEST_MEM_STAT(STAT) do {} while (0)
@@ -7418,7 +7423,7 @@ JitWasmCodeGen::JitWasmCodeGen(CPU* cpu) : JitSSE(cpu) {
         { 8, WasmType::F64 },  // persistent x87 values (locals 76-83)
         { 19, WasmType::I32 }, // x87 metadata (84-100), flag result (101), loop carry (102)
         { 8, WasmType::V128 }, // cached MMX registers (103-110)
-        { 3, WasmType::I32 },  // read/write page-table bases (111-112), bailout EIP (113)
+        { 3 + WASM_STACK_HOST_LOCAL_COUNT, WasmType::I32 },  // read/write page-table bases (111-112), bailout EIP (113), stack page pointers (114-117)
     });
 
     m_gpLoaded.fill(false);
@@ -11551,9 +11556,33 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
     auto savedGpLoaded  = m_gpLoaded;
     auto savedSegLoaded = m_segLoaded;
 
+    // A hoisted stack pointer (validated against the write table, like the
+    // lookup below) supplies the host address directly.
+    U32 stackHost = 0, stackOffset = 0;
+    const bool stackHoisted = stackHoistFor(w, true, stackHost, stackOffset);
+    if (stackHoisted) {
+        m_emitter.emitLocalGet(stackHost);
+        m_emitter.setNextBranchHint(WasmBranchHint::Likely);
+        m_emitter.emitIf();
+        m_emitter.emitLocalGet(stackHost);
+        if (stackOffset) {
+            m_emitter.emitI32Const((S32)stackOffset);
+            m_emitter.emitOp(WASM_I32_ADD);
+        }
+        m_emitter.emitLocalTee(entryLocal);
+        switch (w) {
+        case JitWidth::b8:  m_emitter.emitI32Load8U(0);  break;
+        case JitWidth::b16: m_emitter.emitI32Load16U(0); break;
+        default:            m_emitter.emitI32Load(0, 0); break;
+        }
+        m_emitter.emitLocalSet(result->hardwareReg());
+        m_emitter.emitElse();
+    }
+
     // A writable-page entry is also readable and points directly at the
     // page's bytes. Mark cross-page accesses as slow by clearing the entry
     // in that arm; the same test can then select the write path below.
+    // The fast arm leaves the host address of the access in entryLocal.
     TEST_MEM_MARK(tmA);
     U32 offLocal = emitPageLookup(addressReg, wasmJitWidthBytes(w), true, entryLocal);
 
@@ -11575,6 +11604,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
     m_emitter.emitElse();
     {
         pushHostAddress(entryLocal, addressReg, offLocal);
+        m_emitter.emitLocalTee(entryLocal);
         switch (w) {
         case JitWidth::b8:  m_emitter.emitI32Load8U(0);  break;
         case JitWidth::b16: m_emitter.emitI32Load16U(0); break;
@@ -11584,6 +11614,8 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
     }
     m_emitter.emitEnd();
     TEST_MEM_ACCOUNT_KIND(2, tmA, tmB, tmC);
+    if (offLocal) freeScratch(offLocal);
+    if (stackHoisted) m_emitter.emitEnd();
 
     m_gpDirty   = savedGpDirty;
     m_xmmDirty = savedXmmDirty;
@@ -11615,7 +11647,7 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
         }
         m_emitter.emitElse();
         {
-            pushHostAddress(entryLocal, addressReg, offLocal);
+            m_emitter.emitLocalGet(entryLocal);
             pushRegValue(result);
             switch (w) {
             case JitWidth::b8:  m_emitter.emitI32Store8(0);  break;
@@ -11631,7 +11663,6 @@ RegPtr JitWasmCodeGen::readWriteMem(JitWidth w, RegPtr addressReg,
         m_gpLoaded  = savedGpLoaded;
         m_segLoaded = savedSegLoaded;
     }
-    if (offLocal) freeScratch(offLocal);
     freeScratch(entryLocal);
     if (canReleaseScratchReg(addressReg))
         freeScratch(addressReg->hardwareReg());
@@ -11809,6 +11840,43 @@ void JitWasmCodeGen::prepareReadGroupAddress(RegPtr address) {
 }
 
 RegPtr JitWasmCodeGen::readMemoryValue(JitWidth w, RegPtr addressReg, RegPtr tmp, bool signExtend, bool allowGroup) {
+    U32 stackHost = 0, stackOffset = 0;
+    if (stackHoistFor(w, false, stackHost, stackOffset)) {
+        // if (host) tmp = load(host + offset) else <the inline access below>
+        DecodedOp* hoistOp = m_stackHoistOp;
+        m_stackHoistOp = nullptr;
+        auto savedGpDirty = m_gpDirty;
+        auto savedXmmDirty = m_xmmDirty;
+        auto savedXmmLoaded = m_xmmLoaded;
+        auto savedGpLoaded  = m_gpLoaded;
+        auto savedSegLoaded = m_segLoaded;
+        m_emitter.emitLocalGet(stackHost);
+        m_emitter.setNextBranchHint(WasmBranchHint::Likely);
+        m_emitter.emitIf();
+        m_emitter.emitLocalGet(stackHost);
+        switch (w) {
+        case JitWidth::b8:
+            if (signExtend) m_emitter.emitI32Load8S(stackOffset);
+            else m_emitter.emitI32Load8U(stackOffset);
+            break;
+        case JitWidth::b16:
+            if (signExtend) m_emitter.emitI32Load16S(stackOffset);
+            else m_emitter.emitI32Load16U(stackOffset);
+            break;
+        default: m_emitter.emitI32Load(stackOffset, 0); break;
+        }
+        m_emitter.emitLocalSet(tmp->hardwareReg());
+        m_emitter.emitElse();
+        readMemoryValue(w, addressReg, tmp, signExtend, false);
+        m_emitter.emitEnd();
+        m_gpDirty   = savedGpDirty;
+        m_xmmDirty = savedXmmDirty;
+        m_xmmLoaded = savedXmmLoaded;
+        m_gpLoaded  = savedGpLoaded;
+        m_segLoaded = savedSegLoaded;
+        m_stackHoistOp = hoistOp;
+        return tmp;
+    }
     if (allowGroup && m_readGroupActive) {
         prepareReadGroupAddress(addressReg);
         m_emitter.emitLocalGet(READ_GROUP_LOCAL);
@@ -11921,6 +11989,38 @@ void JitWasmCodeGen::write(JitWidth w, RegPtr addressReg, RegPtr src,
         return;
     }
 
+    U32 stackHost = 0, stackOffset = 0;
+    if (stackHoistFor(w, true, stackHost, stackOffset)) {
+        // if (host) store(host + offset, src) else <the inline access below>
+        DecodedOp* hoistOp = m_stackHoistOp;
+        m_stackHoistOp = nullptr;
+        if (src && src->emulatedReg < WASM_GP_LOCAL_COUNT) loadGPReg(src->emulatedReg); // valid on both arms
+        auto savedGpDirty = m_gpDirty;
+        auto savedXmmDirty = m_xmmDirty;
+        auto savedXmmLoaded = m_xmmLoaded;
+        auto savedGpLoaded  = m_gpLoaded;
+        auto savedSegLoaded = m_segLoaded;
+        m_emitter.emitLocalGet(stackHost);
+        m_emitter.setNextBranchHint(WasmBranchHint::Likely);
+        m_emitter.emitIf();
+        m_emitter.emitLocalGet(stackHost);
+        pushRegValue(src);
+        switch (w) {
+        case JitWidth::b8:  m_emitter.emitI32Store8(stackOffset);  break;
+        case JitWidth::b16: m_emitter.emitI32Store16(stackOffset); break;
+        default:            m_emitter.emitI32Store(stackOffset, 0); break;
+        }
+        m_emitter.emitElse();
+        write(w, addressReg, src, nullptr, nullptr, checkAlignment);
+        m_emitter.emitEnd();
+        m_gpDirty   = savedGpDirty;
+        m_xmmDirty = savedXmmDirty;
+        m_xmmLoaded = savedXmmLoaded;
+        m_gpLoaded  = savedGpLoaded;
+        m_segLoaded = savedSegLoaded;
+        m_stackHoistOp = hoistOp;
+        return;
+    }
     m_needsWasmMemoryPageArrays = true;
     U32 entryLocal = allocScratch();
     auto savedGpDirty = m_gpDirty;
@@ -14956,6 +15056,8 @@ void JitWasmCodeGen::findDirectLoopCandidates() {
     m_directLoopToken = 0;
     m_directLoopOpen = false;
     m_directLoopFpuEntry = FpuStackCache{};
+    m_stackHoistOp = nullptr;
+    m_emitter.zeroAfterCall.clear();
 
     auto candidates = findLoopBackedges();
     const auto fixedFpuLoops = findFpuRegisterLoops(8);
@@ -15027,9 +15129,240 @@ void JitWasmCodeGen::findDirectLoopCandidates() {
             loop.forwardTargets.erase(std::unique(loop.forwardTargets.begin(), loop.forwardTargets.end(),
                 [](const auto& a, const auto& b) { return a.eip == b.eip; }), loop.forwardTargets.end());
         }
+        findStackHoists(loop);
         m_directLoops.push_back(std::move(loop));
     }
     std::reverse(m_directLoops.begin(), m_directLoops.end());
+}
+
+// ---------------------------------------------------------------------------
+// Loop-invariant stack page lookups
+//
+// In a direct loop where nothing writes ESP (or EBP), every [ESP+disp] access
+// lies in [ESP+lo, ESP+lo+span) on every iteration. When that range is inside
+// one page whose read (write) table entry is nonzero, the loop header keeps
+// host = entry + ((ESP+lo) & K_PAGE_MASK) in a local and each access becomes
+// `if (host) load/store(host + disp - lo) else <the unchanged inline access>`.
+// The tables are the same ones the inline access uses, so code, copy-on-write,
+// special and unmapped pages keep their existing paths (the write table has no
+// entry for them). They change only inside a call in the single-threaded
+// build, and every call emitted while the loop is open zeroes the pointers
+// (WasmEmitter::zeroAfterCall); the next header pass looks them up again.
+// Multi-threaded builds keep the per-access lookup: another thread can remap
+// the stack while this one runs.
+// ---------------------------------------------------------------------------
+
+// Instructions whose only memory access is their ModRM operand, read or
+// written through readMemoryValue / write / readWriteMem at calculateEaa(op).
+static bool wasmJitStackHoistableAccess(U32 inst) {
+    switch (inst) {
+    case AddR8E8: case AddE8R8: case AddE8I8: case AddR16E16: case AddE16R16: case AddE16I16: case AddR32E32: case AddE32R32: case AddE32I32:
+    case OrR8E8: case OrE8R8: case OrE8I8: case OrR16E16: case OrE16R16: case OrE16I16: case OrR32E32: case OrE32R32: case OrE32I32:
+    case AdcR8E8: case AdcE8R8: case AdcE8I8: case AdcR16E16: case AdcE16R16: case AdcE16I16: case AdcR32E32: case AdcE32R32: case AdcE32I32:
+    case SbbR8E8: case SbbE8R8: case SbbE8I8: case SbbR16E16: case SbbE16R16: case SbbE16I16: case SbbR32E32: case SbbE32R32: case SbbE32I32:
+    case AndR8E8: case AndE8R8: case AndE8I8: case AndR16E16: case AndE16R16: case AndE16I16: case AndR32E32: case AndE32R32: case AndE32I32:
+    case SubR8E8: case SubE8R8: case SubE8I8: case SubR16E16: case SubE16R16: case SubE16I16: case SubR32E32: case SubE32R32: case SubE32I32:
+    case XorR8E8: case XorE8R8: case XorE8I8: case XorR16E16: case XorE16R16: case XorE16I16: case XorR32E32: case XorE32R32: case XorE32I32:
+    case CmpR8E8: case CmpE8R8: case CmpE8I8: case CmpR16E16: case CmpE16R16: case CmpE16I16: case CmpR32E32: case CmpE32R32: case CmpE32I32:
+    case TestE8R8: case TestE8I8: case TestE16R16: case TestE16I16: case TestE32R32: case TestE32I32:
+    case MovE8R8: case MovR8E8: case MovE8I8: case MovE16R16: case MovR16E16: case MovE16I16: case MovE32R32: case MovR32E32: case MovE32I32:
+    case MovGwXzE8: case MovGwSxE8: case MovGdXzE8: case MovGdSxE8: case MovGdXzE16: case MovGdSxE16:
+    case IncE8: case IncE16: case IncE32: case DecE8: case DecE16: case DecE32:
+    case NotE8: case NotE16: case NotE32: case NegE8: case NegE16: case NegE32:
+    case ImulR16E16: case ImulR32E32: case DimulR16E16: case DimulR32E32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// True when `op` cannot write general register `reg` (ESP or EBP). Ranges
+// follow the Instruction enum order; every listed instruction writes only its
+// ModRM register operands, memory, flags, x87/MMX/XMM state, or implicitly
+// EAX/ECX/EDX (MUL/DIV/CMPXCHG/CWD/CDQ). Anything else (push/pop/call/ret,
+// enter/leave, strings, interrupts, segment loads, callbacks) disqualifies.
+// The check is conservative: an operand field equal to `reg` disqualifies even
+// when it names a byte register (AH/CH), an XMM register or a source.
+static bool wasmJitOpPreservesStackBase(DecodedOp* op, U8 reg) {
+    const U32 inst = op->inst;
+    if (op->lock) return false;
+    const bool memory = instructionInfo[inst].readMemWidth || instructionInfo[inst].writeMemWidth;
+    // Register forms may write either field; memory forms write only `reg`
+    // (rm and sibIndex then name the address registers).
+    auto operands = [&]() { return op->reg != reg && (memory || op->rm != reg); };
+    auto in = [inst](U32 first, U32 last) { return inst >= first && inst <= last; };
+    if (in(AddR8E8, DecE32) || in(ImulR16E16, ImulR32R32) || in(MovR8R8, MovE32I32) ||
+            in(MovGwXzR8, MovGdSxE16) || in(RolR8I8, SarE32Cl) || in(CmovO_R16R16, CmovNLE_R32E32) ||
+            in(SetO_R8, SetNLE_E8)) {
+        return operands();
+    }
+    if (in(JumpO, JumpNLE) || inst == JmpJb || inst == JmpJw || inst == JmpJd || inst == Nop ||
+            inst == Cwd || inst == Cwq) {
+        return true;
+    }
+    if (inst == LeaR16 || inst == LeaR32) return op->reg != reg; // rm is an address register
+    // x87: writes only FPU state and memory (FNSTSW AX writes EAX).
+    if (in(FADD_ST0_STj, FISTP_QWORD_INTEGER)) return true;
+    // MMX and SSE/SSE2 write XMM/MMX registers and memory, except these
+    // forms with a general register destination.
+    if (in(PunpcklbwMmx, PadddE64) || in(AddpsXmm, ShufpdXmmE128)) {
+        switch (inst) {
+        case MovR32Pq: case PextrwR32Mmx: case PextrwR32Xmm: case PmovmskbR32Mmx: case PmovmskbR32Xmm:
+        case Cvtss2siR32Xmm: case Cvtss2siR32E32: case Cvttss2siR32Xmm: case Cvttss2siR32E32:
+        case Cvtsd2siR32Xmm: case Cvtsd2siR32E64: case Cvttsd2siR32Xmm: case Cvttsd2siR32E64:
+        case MovmskpsR32Xmm: case MovmskpdR32Xmm: case MovdR32Xmm:
+            return operands();
+        default:
+            return true;
+        }
+    }
+    return false;
+}
+
+void JitWasmCodeGen::findStackHoists(DirectLoop& loop) {
+#ifdef BOXEDWINE_MULTI_THREADED
+    (void)loop;
+#else
+    // Flat SS only: the address the inline access computes is then base+disp.
+    if (cpu->thread->process->hasSetSeg[SS]) return;
+    for (U8 index = 0; index < 2; ++index) {
+        const U8 reg = index ? 5 : 4; // EBP : ESP
+        auto& hoist = loop.stackHoists[index];
+        S64 lo = 0, hi = 0;
+        U32 count = 0;
+        bool reads = false, writes = false;
+        bool ok = true;
+        for (const auto& entry : blockInstructions) {
+            if (entry.eip < loop.targetEip) continue;
+            if (entry.eip > loop.sourceEip) break;
+            DecodedOp* op = entry.op;
+            if (!wasmJitOpPreservesStackBase(op, reg)) { ok = false; break; }
+            const auto& info = instructionInfo[op->inst];
+            if (!wasmJitStackHoistableAccess(op->inst) || op->ea16 || op->rm != reg || op->sibIndex != 8 ||
+                    op->base != SS) continue;
+            const U32 width = std::max(info.readMemWidth, info.writeMemWidth) / 8;
+            const S64 disp = (S32)op->data.disp;
+            lo = count ? std::min(lo, disp) : disp;
+            hi = count ? std::max(hi, disp + width) : disp + width;
+            reads |= info.readMemWidth && !info.writeMemWidth;
+            writes |= info.writeMemWidth != 0;
+            ++count;
+        }
+        // One page holds the whole range; a quarter page keeps the chance
+        // that a frame straddles a page boundary small.
+        if (!ok || !count || hi - lo > (S64)(K_PAGE_SIZE / 4)) continue;
+        hoist.lo = (S32)lo;
+        hoist.span = (U32)(hi - lo);
+        hoist.reads = reads;
+        hoist.writes = writes;
+        for (const auto& entry : blockInstructions) {
+            if (entry.eip < loop.targetEip) continue;
+            if (entry.eip > loop.sourceEip) break;
+            DecodedOp* op = entry.op;
+            if (wasmJitStackHoistableAccess(op->inst) && !op->ea16 && op->rm == reg && op->sibIndex == 8 && op->base == SS) {
+                loop.stackHoistOps.push_back(op);
+            }
+        }
+    }
+#endif
+}
+
+static U32 wasmJitStackHostLocal(U32 index, bool store) {
+    return WASM_STACK_HOST_LOCAL_BASE + index * 2 + (store ? 1 : 0);
+}
+
+#ifdef __TEST
+static std::atomic<U32> g_wasmJitTestStackHoistedAccesses{0};
+extern "C" U32 wasmJitTestStackHoistedAccesses() { return g_wasmJitTestStackHoistedAccesses.load(); }
+#endif
+
+// The hoisted pointer (local) and constant offset for the current op's ModRM
+// access, or false when this access keeps its inline lookup.
+bool JitWasmCodeGen::stackHoistFor(JitWidth width, bool store, U32& local, U32& offset) const {
+    if (!m_stackHoistOp || m_stackHoistOp != currentOp || !m_directLoopOpen || m_inlineDepth) return false;
+    const U32 index = currentOp->rm == 5 ? 1 : 0;
+    const auto& hoist = m_directLoop->stackHoists[index];
+    if (!hoist.span || !(store ? hoist.writes : hoist.reads)) return false;
+    offset = (U32)((S32)currentOp->data.disp - hoist.lo);
+    if (offset + wasmJitWidthBytes(width) > hoist.span) return false;
+    local = wasmJitStackHostLocal(index, store);
+#ifdef __TEST
+    g_wasmJitTestStackHoistedAccesses++;
+#endif
+    return true;
+}
+
+// Before the loop opens: no pointer is valid until a header pass checks it.
+void JitWasmCodeGen::emitStackHoistInit() {
+    m_emitter.zeroAfterCall.clear();
+    for (U32 index = 0; index < 2; ++index) {
+        const auto& hoist = m_directLoop->stackHoists[index];
+        if (!hoist.span) continue;
+        for (bool store : {false, true}) {
+            if (!(store ? hoist.writes : hoist.reads)) continue;
+            m_emitter.emitI32Const(0);
+            m_emitter.emitLocalSet(wasmJitStackHostLocal(index, store));
+            m_emitter.zeroAfterCall.push_back(wasmJitStackHostLocal(index, store));
+        }
+    }
+}
+
+// Each header pass: a zeroed pointer (first pass, or a call since) is looked
+// up again. host = entry + ((base + lo) & K_PAGE_MASK) when the entry is
+// nonzero and [base + lo, base + lo + span) stays inside its page, else 0.
+void JitWasmCodeGen::emitStackHoistRefresh() {
+    for (U32 index = 0; index < 2; ++index) {
+        const auto& hoist = m_directLoop->stackHoists[index];
+        if (!hoist.span) continue;
+        const U8 reg = index ? 5 : 4;
+        // Load the base outside the conditional arm, so the register cache
+        // stays valid on both paths.
+        loadGPReg(reg);
+        for (bool store : {false, true}) {
+            if (!(store ? hoist.writes : hoist.reads)) continue;
+            const U32 host = wasmJitStackHostLocal(index, store);
+            m_needsWasmMemoryPageArrays = true;
+            m_emitter.emitLocalGet(host);
+            m_emitter.emitOp(WASM_I32_EQZ);
+            m_emitter.setNextBranchHint(WasmBranchHint::Unlikely);
+            m_emitter.emitIf();
+            U32 low = allocScratch();
+            m_emitter.emitLocalGet(wasmLocalForGPReg(reg));
+            if (hoist.lo) {
+                m_emitter.emitI32Const(hoist.lo);
+                m_emitter.emitOp(WASM_I32_ADD);
+            }
+            m_emitter.emitLocalSet(low);
+            pushPageTable(store);
+            m_emitter.emitLocalGet(low);
+            m_emitter.emitI32Const(K_PAGE_SHIFT);
+            m_emitter.emitOp(WASM_I32_SHR_U);
+            m_emitter.emitI32Const(2);
+            m_emitter.emitOp(WASM_I32_SHL);
+            m_emitter.emitOp(WASM_I32_ADD);
+            m_emitter.emitI32Load(0);
+            m_emitter.emitLocalSet(host);           // entry
+            // host = miss ? 0 : entry + (low & K_PAGE_MASK)
+            m_emitter.emitI32Const(0);
+            m_emitter.emitLocalGet(host);
+            m_emitter.emitLocalGet(low);
+            m_emitter.emitI32Const(K_PAGE_MASK);
+            m_emitter.emitOp(WASM_I32_AND);
+            m_emitter.emitOp(WASM_I32_ADD);
+            m_emitter.emitLocalGet(host);
+            m_emitter.emitOp(WASM_I32_EQZ);
+            m_emitter.emitLocalGet(low);
+            m_emitter.emitI32Const(K_PAGE_MASK);
+            m_emitter.emitOp(WASM_I32_AND);
+            m_emitter.emitI32Const((S32)(K_PAGE_SIZE - hoist.span));
+            m_emitter.emitOp(WASM_I32_GT_U);
+            m_emitter.emitOp(WASM_I32_OR);
+            m_emitter.emitOp(WASM_SELECT);
+            m_emitter.emitLocalSet(host);
+            freeScratch(low);
+            m_emitter.emitEnd();
+        }
+    }
 }
 
 void JitWasmCodeGen::syncForwardMemoryJoin() {
@@ -15498,6 +15831,7 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
         m_emitter.emitEnd();
         const bool keptRegisters = keepsLoopRegisters();
         m_directLoopOpen = false;
+        m_emitter.zeroAfterCall.clear(); // stack page pointers are dead after the loop
         if (keptRegisters) branchBoundary();
         m_directLoop = nullptr;
     }
@@ -15586,6 +15920,7 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
                 if (m_directLoop->registers.segments & (1u << seg)) getReadOnlySegAddress(seg);
             }
         }
+        emitStackHoistInit();
         m_emitter.emitI32Const((S32)WASM_DIRECT_LOOP_ITERATIONS);
         m_emitter.emitLocalSet(WASM_DIRECT_LOOP_BUDGET_LOCAL);
         m_emitter.emitLoop();
@@ -15625,6 +15960,13 @@ void JitWasmCodeGen::preCompile(DecodedOp* op, bool skippedOp) {
         }
         currentLazyFlags = FLAGS_NULL;
         m_forwardedResultConsumer = nullptr;
+        emitStackHoistRefresh();
+    }
+    m_stackHoistOp = nullptr;
+    if (m_directLoopOpen) {
+        for (DecodedOp* hoisted : m_directLoop->stackHoistOps) {
+            if (hoisted == op) { m_stackHoistOp = op; break; }
+        }
     }
     JitCodeGen::preCompile(op, skippedOp);
 #ifdef BOXEDWINE_MULTI_THREADED

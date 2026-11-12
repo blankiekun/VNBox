@@ -296,6 +296,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testWasmJitRepMovsdState, "Test WASM JIT REP MOVSD cached state"},
     {testWasmJitLoopReachability, "Test WASM JIT loop reachability and cleanup jumps"},
     {testWasmJitMultipleLoops, "Test WASM JIT multiple separate loops"},
+    {testWasmJitStackHoist, "Test WASM JIT loop-invariant stack page lookups", TEST_ENTRY_SERIAL},
     {testWasmJitConditionalSideExits, "Test WASM JIT conditional side exits"},
     {testWasmJitSseCompareConditions, "Test WASM JIT SSE compare conditions"},
     {testWasmJitFpuCache, "Test WASM JIT x87 stack cache"},

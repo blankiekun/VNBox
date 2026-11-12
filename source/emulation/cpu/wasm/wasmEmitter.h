@@ -451,6 +451,7 @@ public:
     void emitCall(U32 funcIdx, bool keepsMmxCache = false);
     void emitCallIndirect(U32 typeIdx, U32 tableIdx = 0);
     void emitReturnCallIndirect(U32 typeIdx, U32 tableIdx = 0);
+    void emitZeroAfterCall();
 
     void emitIf(WasmType blockType = WasmType::Void);
     void emitElse();
@@ -474,6 +475,9 @@ public:
     // MMX registers (bit i = mm i) whose cached v128 local equals cpu->fpu.regs[i] on every path that
     // reaches the current position. Calls, loop headers and joins narrow it; see JitWasmCodeGen::loadCpuMMXReg.
     U8 mmxCached = 0;
+    // i32 locals set to 0 right after every call and call_indirect (JitWasmCodeGen's hoisted stack page
+    // pointers: page tables change only inside calls, so one hook here covers every helper the JIT emits).
+    std::vector<U32> zeroAfterCall;
     void emitDrop();
     void emitReturn();
     void emitUnreachable();

@@ -9,6 +9,7 @@
 #ifdef BOXEDWINE_WASM_JIT
 #include "../../emulation/cpu/jit/jitCodeGen.h"
 #include "../../emulation/cpu/normal/normal_strings.h"
+#include "../../emulation/softmmu/kmemory_soft.h"
 namespace {
 
 bool conditionExpected(U32 condition, U32 flags) {
@@ -1601,6 +1602,259 @@ void testWasmJitSseCompareConditions() {
                     runConsumers(condition, comparison.flags, false);
                 }
             }
+        }
+    }
+}
+
+// Direct loops keep the page lookup of [ESP+disp] / [EBP+disp] accesses in a
+// local, checked once per header pass, while nothing in the loop writes the
+// base. Every case compares against values computed here.
+extern "C" U32 wasmJitTestStackHoistedAccesses();
+void wasmJitTestSetMemHelperHook(void (*hook)(CPU*));
+static U32 g_stackHoistHookCalls = 0;
+static U32 g_stackHoistHookAt = 0;
+static U32 g_stackHoistRemapPage = 0;
+static U32 g_stackHoistRemapOffset = 0;
+static U32 g_stackHoistRemapValue = 0;
+static void stackHoistRemapHook(CPU* cpu) {
+    if (++g_stackHoistHookCalls != g_stackHoistHookAt) return;
+    KMemory* memory = cpu->memory;
+    memory->mmap(cpu->thread, g_stackHoistRemapPage, K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE,
+        K_MAP_FIXED | K_MAP_PRIVATE | K_MAP_ANONYMOUS, -1, 0);
+    memory->writed(g_stackHoistRemapPage + g_stackHoistRemapOffset, g_stackHoistRemapValue);
+}
+
+static DecodedOp* stackHoistCompile(const char* what) {
+    extern void startNewJIT(CPU*, U32, DecodedOp*);
+    auto& ctx = testContext();
+    testPushCode8(0xcd); testPushCode8(0x97);
+    DecodedOp* op = ctx.cpu->getOp(TEST_CODE_ADDRESS, 0);
+    op->runCount = JIT_RUN_COUNT + 1;
+    startNewJIT(ctx.cpu, TEST_CODE_ADDRESS, op);
+    if (!op->pfnJitCode) testFail("WASM stack hoist: %s did not compile", what);
+    return op;
+}
+
+// Real Wine processes run with a flat SS; the harness default has a base.
+static void stackHoistFlatStack(U32 esp, U32 ebp) {
+    auto& ctx = testContext();
+    ctx.cpu->seg[SS].address = 0;
+    ctx.process->hasSetSeg[SS] = false;
+    ctx.cpu->reg[4].u32 = esp;
+    ctx.cpu->reg[5].u32 = ebp;
+}
+
+// opcode with a ModRM [esp+disp8] (base 4) or [ebp+disp8] (base 5) operand.
+static void stackHoistModrm(U8 opcode, U8 reg, U8 base, S8 disp) {
+    testPushCode8(opcode);
+    testPushCode8((U8)(0x40 | (reg << 3) | base));
+    if (base == 4) testPushCode8(0x24);
+    testPushCode8((U8)disp);
+}
+
+static void stackHoistBackedge(U32 loop) {
+    testPushCode8(0x49); // dec ecx
+    testPushCode8(0x75); testPushCode8((U8)(loop - testContext().codeIp - 1));
+}
+
+static void stackHoistExpect(U32 before, bool hoisted, const char* what) {
+#ifndef BOXEDWINE_MULTI_THREADED
+    if ((wasmJitTestStackHoistedAccesses() != before) != hoisted)
+        testFail("WASM stack hoist: %s %s hoisted", what, hoisted ? "was not" : "must not be");
+#else
+    (void)before; (void)hoisted; (void)what; // multi-threaded builds never hoist
+#endif
+}
+
+void testWasmJitStackHoist() {
+    // Stack locals read, written and updated in place, ESP and EBP based, in a
+    // loop that keeps registers in locals and in one that does not (movzx).
+    // The 65/130 counts leave through the 64-iteration budget and re-enter.
+    // Frames that cross a page leave the pointer zero: the inline path runs.
+    for (bool keeps : {true, false}) for (U32 count : {1u, 2u, 64u, 65u, 130u})
+    for (U32 esp : {0x3100u, 0x3ff4u, 0x3fe8u, 0x3fc0u}) {
+        testNewInstruction(0);
+        auto& ctx = testContext(); CPU* cpu = ctx.cpu;
+        const U32 s = TEST_HEAP_ADDRESS + esp, b = s + 0x40;
+        stackHoistFlatStack(s, b);
+        const U32 m8 = 0x01020304, m12 = 0x10000000, mb4 = 0x55;
+        U32 m16 = 0, m20 = 7, mb8 = 0x1000;
+        ctx.memory->writed(s + 8, m8); ctx.memory->writed(s + 12, m12); ctx.memory->writed(s + 16, m16);
+        ctx.memory->writed(s + 20, m20); ctx.memory->writed(b - 4, mb4); ctx.memory->writed(b - 8, mb8);
+        cpu->reg[1].u32 = count; cpu->reg[2].u32 = 0; cpu->reg[3].u32 = 0;
+        const U32 loop = ctx.codeIp;
+        stackHoistModrm(0x8b, 0, 4, 8);                 // mov eax,[esp+8]
+        stackHoistModrm(0x03, 0, 4, 12);                // add eax,[esp+12]
+        stackHoistModrm(0x89, 0, 4, 16);                // mov [esp+16],eax
+        stackHoistModrm(0x01, 0, 4, 20);                // add [esp+20],eax
+        if (!keeps) { testPushCode8(0x0f); stackHoistModrm(0xb6, 3, 4, 9); } // movzx ebx,byte [esp+9]
+        testPushCode8(0x01); testPushCode8(0xda);       // add edx,ebx
+        stackHoistModrm(0x8b, 0, 5, -4);                // mov eax,[ebp-4]
+        stackHoistModrm(0x29, 0, 5, -8);                // sub [ebp-8],eax
+        stackHoistModrm(0x8b, 3, 5, -8);                // mov ebx,[ebp-8]
+        stackHoistBackedge(loop);
+        U32 before = wasmJitTestStackHoistedAccesses();
+        stackHoistCompile("locals");
+        stackHoistExpect(before, true, "the locals loop");
+        testRunCPU();
+        U32 eax = 0, ebx = 0, edx = 0;
+        for (U32 i = 0; i < count; ++i) {
+            eax = m8 + m12; m16 = eax; m20 += eax;
+            if (!keeps) ebx = (m8 >> 8) & 0xff;
+            edx += ebx;
+            eax = mb4; mb8 -= eax; ebx = mb8;
+        }
+        if (cpu->reg[0].u32 != eax || cpu->reg[3].u32 != ebx || cpu->reg[2].u32 != edx || cpu->reg[1].u32 ||
+                cpu->reg[4].u32 != s || cpu->reg[5].u32 != b ||
+                ctx.memory->readd(s + 16) != m16 || ctx.memory->readd(s + 20) != m20 || ctx.memory->readd(b - 8) != mb8)
+            testFail("WASM stack hoist: locals keeps=%u count=%u esp=%x", keeps, count, esp);
+    }
+
+    // A loop that pushes and pops, or writes ESP or EBP, keeps every lookup.
+    for (U32 variant = 0; variant < 3; ++variant) {
+        testNewInstruction(0);
+        auto& ctx = testContext(); CPU* cpu = ctx.cpu;
+        const U32 s = TEST_HEAP_ADDRESS + 0x3100;
+        stackHoistFlatStack(s, s + 0x40);
+        ctx.memory->writed(s + 8, 5); ctx.memory->writed(s + 0x40 + 8, 9);
+        cpu->reg[1].u32 = 70; cpu->reg[0].u32 = 1; cpu->reg[2].u32 = 0;
+        const U32 loop = ctx.codeIp;
+        if (variant == 0) {
+            testPushCode8(0x50);                                    // push eax
+            testPushCode8(0x8b); testPushCode8(0x1c); testPushCode8(0x24); // mov ebx,[esp]
+            testPushCode8(0x01); testPushCode8(0xda);               // add edx,ebx
+            testPushCode8(0x58);                                    // pop eax
+            testPushCode8(0x40);                                    // inc eax
+        } else if (variant == 1) {
+            testPushCode8(0x83); testPushCode8(0xec); testPushCode8(4); // sub esp,4
+            stackHoistModrm(0x8b, 3, 4, 12);                        // mov ebx,[esp+12] (the old [esp+8])
+            testPushCode8(0x01); testPushCode8(0xda);               // add edx,ebx
+            testPushCode8(0x83); testPushCode8(0xc4); testPushCode8(4); // add esp,4
+        } else {
+            stackHoistModrm(0x8b, 3, 5, 8);                         // mov ebx,[ebp+8]
+            testPushCode8(0x01); testPushCode8(0xda);               // add edx,ebx
+            testPushCode8(0x8d); testPushCode8(0x6d); testPushCode8(0); // lea ebp,[ebp+0]
+        }
+        stackHoistBackedge(loop);
+        U32 before = wasmJitTestStackHoistedAccesses();
+        stackHoistCompile("base written");
+        stackHoistExpect(before, false, "a loop that writes its base");
+        testRunCPU();
+        U32 expected = variant == 0 ? 70 * 71 / 2 : variant == 1 ? 70 * 5 : 70 * 9;
+        if (cpu->reg[2].u32 != expected || cpu->reg[4].u32 != s || cpu->reg[1].u32)
+            testFail("WASM stack hoist: base-writing loop %u edx=%u", variant, cpu->reg[2].u32);
+    }
+
+    // Copy-on-write stack page, first written inside the loop. The write
+    // detaches the page; reads after it (same iteration and later ones) must
+    // see the new copy, and the other mapping keeps the old bytes.
+    for (U32 count : {1u, 3u, 65u}) {
+        testNewInstruction(0);
+        auto& ctx = testContext(); CPU* cpu = ctx.cpu; KMemory* memory = ctx.memory;
+        const U32 page = TEST_HEAP_ADDRESS + 0x5000, s = page + 0x100, alias = 0x30000000;
+        stackHoistFlatStack(s, s);
+        memory->writed(s + 8, 100);
+        auto* data = getMemData(memory);
+        RamPage ram = data->mmu[page >> K_PAGE_SHIFT].getRamPageIndex();
+        memory->mapPages(ctx.thread, alias >> K_PAGE_SHIFT, {ram}, PAGE_READ | PAGE_WRITE);
+        data->mmu[page >> K_PAGE_SHIFT].setPageType(memory, page >> K_PAGE_SHIFT, PageType::CopyOnWrite);
+        data->onPageChanged(page >> K_PAGE_SHIFT);
+        cpu->reg[1].u32 = count; cpu->reg[2].u32 = 0;
+        const U32 loop = ctx.codeIp;
+        stackHoistModrm(0x8b, 0, 4, 8);                             // mov eax,[esp+8]
+        testPushCode8(0x83); testPushCode8(0xc0); testPushCode8(1); // add eax,1
+        stackHoistModrm(0x89, 0, 4, 8);                             // mov [esp+8],eax
+        stackHoistModrm(0x8b, 3, 4, 8);                             // mov ebx,[esp+8]
+        testPushCode8(0x01); testPushCode8(0xda);                   // add edx,ebx
+        stackHoistBackedge(loop);
+        U32 before = wasmJitTestStackHoistedAccesses();
+        stackHoistCompile("cow");
+        stackHoistExpect(before, true, "the copy-on-write loop");
+        testRunCPU();
+        U32 edx = 0;
+        for (U32 i = 1; i <= count; ++i) edx += 100 + i;
+        if (cpu->reg[2].u32 != edx || memory->readd(s + 8) != 100 + count || memory->readd(alias + 0x108) != 100)
+            testFail("WASM stack hoist: copy-on-write count=%u edx=%u stack=%u alias=%u", count, cpu->reg[2].u32,
+                memory->readd(s + 8), memory->readd(alias + 0x108));
+        memory->unmap(alias, K_PAGE_SIZE);
+    }
+
+    // ESP points into the loop's own code page: the store rewrites a later
+    // instruction (add eax,1 -> add eax,3) and must take the code-write path.
+    {
+        testNewInstruction(0);
+        auto& ctx = testContext(); CPU* cpu = ctx.cpu;
+        cpu->reg[1].u32 = 5;
+        const U32 loop = ctx.codeIp;
+        testPushCode8(0x47);                                        // inc edi
+        testPushCode8(0x83); testPushCode8(0xff); testPushCode8(3); // cmp edi,3
+        testPushCode8(0x75); U32 skip = ctx.codeIp; testPushCode8(0);
+        testPushCode8(0xc7); testPushCode8(0x44); testPushCode8(0x24); testPushCode8(8); testPushCode32(3); // mov dword [esp+8],3
+        ctx.memory->writeb(skip, (U8)(ctx.codeIp - skip - 1));
+        testPushCode8(0x81); testPushCode8(0xc0); U32 immediate = ctx.codeIp; testPushCode32(1); // add eax,1
+        stackHoistBackedge(loop);
+        stackHoistFlatStack(immediate - 8, 0);
+        U32 before = wasmJitTestStackHoistedAccesses();
+        stackHoistCompile("code page");
+        stackHoistExpect(before, true, "the code page store");
+        testRunCPU();
+        if (cpu->reg[0].u32 != 11 || cpu->reg[1].u32 || cpu->reg[7].u32 != 5)
+            testFail("WASM stack hoist: a store into code through ESP ran stale code (eax=%u)", cpu->reg[0].u32);
+    }
+
+    // A call made inside the loop (a cross-page read's helper) remaps the
+    // stack page. The read right after it, in the same iteration, must see
+    // the new page; the old page stays alive (aliased) holding the old value.
+    for (U32 at : {1u, 2u, 5u}) {
+        testNewInstruction(0);
+        auto& ctx = testContext(); CPU* cpu = ctx.cpu; KMemory* memory = ctx.memory;
+        const U32 page = TEST_HEAP_ADDRESS + 0x6000, s = page + 0x200, alias = 0x30001000;
+        stackHoistFlatStack(s, s);
+        memory->writed(s + 8, 1);
+        RamPage ram = getMemData(memory)->mmu[page >> K_PAGE_SHIFT].getRamPageIndex();
+        memory->mapPages(ctx.thread, alias >> K_PAGE_SHIFT, {ram}, PAGE_READ | PAGE_WRITE);
+        cpu->reg[1].u32 = 8; cpu->reg[2].u32 = 0; cpu->reg[7].u32 = 0;
+        cpu->reg[6].u32 = 0x1ffe; // DS-relative
+        const U32 loop = ctx.codeIp;
+        stackHoistModrm(0x8b, 0, 4, 8);                             // mov eax,[esp+8]
+        testPushCode8(0x01); testPushCode8(0xc2);                   // add edx,eax
+        testPushCode8(0x8b); testPushCode8(0x1e);                   // mov ebx,[esi] (crosses a page: helper)
+        stackHoistModrm(0x8b, 0, 4, 8);                             // mov eax,[esp+8]
+        testPushCode8(0x01); testPushCode8(0xc7);                   // add edi,eax
+        stackHoistBackedge(loop);
+        U32 before = wasmJitTestStackHoistedAccesses();
+        stackHoistCompile("remap");
+        stackHoistExpect(before, true, "the remap loop");
+        g_stackHoistHookCalls = 0; g_stackHoistHookAt = at;
+        g_stackHoistRemapPage = page; g_stackHoistRemapOffset = 0x208; g_stackHoistRemapValue = 1000;
+        wasmJitTestSetMemHelperHook(stackHoistRemapHook);
+        testRunCPU();
+        wasmJitTestSetMemHelperHook(nullptr);
+        // The helper runs once per iteration, between the two reads.
+        const U32 edx = at + (8 - at) * 1000, edi = (at - 1) + (9 - at) * 1000;
+        if (g_stackHoistHookCalls < at || cpu->reg[2].u32 != edx || cpu->reg[7].u32 != edi || memory->readd(alias + 0x208) != 1)
+            testFail("WASM stack hoist: remap in a helper at=%u edx=%u edi=%u", at, cpu->reg[2].u32, cpu->reg[7].u32);
+        memory->unmap(alias, K_PAGE_SIZE);
+    }
+
+    // Each activation looks the page up again: a remap between two runs of
+    // the same compiled loop must be seen.
+    {
+        testNewInstruction(0);
+        auto& ctx = testContext(); CPU* cpu = ctx.cpu; KMemory* memory = ctx.memory;
+        const U32 page = TEST_HEAP_ADDRESS + 0x7000, s = page + 0x300;
+        stackHoistFlatStack(s, s);
+        const U32 loop = ctx.codeIp;
+        stackHoistModrm(0x8b, 0, 4, 8);                             // mov eax,[esp+8]
+        testPushCode8(0x01); testPushCode8(0xc2);                   // add edx,eax
+        stackHoistBackedge(loop);
+        DecodedOp* entry = stackHoistCompile("activation");
+        for (U32 value : {3u, 40u}) {
+            memory->mmap(ctx.thread, page, K_PAGE_SIZE, K_PROT_READ | K_PROT_WRITE, K_MAP_FIXED | K_MAP_PRIVATE | K_MAP_ANONYMOUS, -1, 0);
+            memory->writed(s + 8, value);
+            cpu->reg[1].u32 = 70; cpu->reg[2].u32 = 0; cpu->reg[4].u32 = s;
+            cpu->eip.u32 = 0; cpu->nextOp = entry; testRunCPU();
+            if (cpu->reg[2].u32 != 70 * value) testFail("WASM stack hoist: stale page across activations (%u)", value);
         }
     }
 }
