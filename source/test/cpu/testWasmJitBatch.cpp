@@ -520,24 +520,43 @@ void testWasmJitInlineCall() {
     before = wasmJitTestInlinedCalls();
     compileDeadCaller(deadCallerA);
     if (wasmJitTestInlinedCalls() - before != 1) testFail("a caller on another page must inline its callee");
-    const U32 depsOfOneCaller = wasmJitTestInlineDepCount();
-    for (U32 i = 0; i < 4; ++i) {
+    // Gone callers' deps are dropped when a page's list fills, so the count stays within a few times the live ones.
+    const U32 depsBound = 4 * (wasmJitTestInlineDepCount() + 1);
+    for (U32 i = 0; i < 64; ++i) {
         context.memory->removeCode(context.thread, TEST_CODE_ADDRESS + deadCallerA, 0x10, false);
         compileDeadCaller(deadCallerA);
-        if (wasmJitTestInlineDepCount() != depsOfOneCaller) {
-            testFail("a caller loaded again at its address must not add inline deps (%u, expected %u)", wasmJitTestInlineDepCount(), depsOfOneCaller);
+        if (wasmJitTestInlineDepCount() > depsBound) {
+            testFail("a caller loaded again at its address must not pile up inline deps (%u, bound %u)", wasmJitTestInlineDepCount(), depsBound);
         }
     }
     context.memory->removeCode(context.thread, TEST_CODE_ADDRESS + deadCallerA, 0x10, false);
     DecodedOp* liveCaller = compileDeadCaller(deadCallerB);
-    if (wasmJitTestInlineDepCount() != depsOfOneCaller) {
-        testFail("a caller loaded at another address must drop the old inline deps (%u, expected %u)", wasmJitTestInlineDepCount(), depsOfOneCaller);
+    if (wasmJitTestInlineDepCount() > depsBound) {
+        testFail("a caller loaded at another address must not pile up inline deps (%u, bound %u)", wasmJitTestInlineDepCount(), depsBound);
     }
     // A live caller's dep survives that pruning: a write to the callee still reaches it.
     compileDeadCaller(deadCallerA);
     context.memory->writeb(TEST_CODE_ADDRESS + 0x402, 2);
     if (context.memory->getDecodedOp(TEST_CODE_ADDRESS + deadCallerB) == liveCaller && liveCaller->pfnJitCode) {
         testFail("a write to an inlined callee must still invalidate a caller whose page's deps were pruned");
+    }
+
+    // Catches: each compile of a caller looking up the op of every other caller of the same callee (a small getter
+    // called from thousands of blocks), which makes N callers cost N*N/2 lookups instead of a few per caller.
+    constexpr U32 manyCallers = 64;
+    for (U32 i = 0; i < manyCallers; ++i) {
+        call(2 * K_PAGE_SIZE + i * 8, 0x400); code(2 * K_PAGE_SIZE + i * 8 + 5, {0xcd, 0x97});
+    }
+    const U32 depsBefore = wasmJitTestInlineDepCount();
+    const U64 lookupsBefore = wasmJitTestInlineDepLookups();
+    before = wasmJitTestInlinedCalls();
+    for (U32 i = 0; i < manyCallers; ++i) {
+        compileDeadCaller(2 * K_PAGE_SIZE + i * 8);
+    }
+    if (wasmJitTestInlinedCalls() - before != manyCallers) testFail("each of %u callers must inline the callee", manyCallers);
+    const U64 lookups = wasmJitTestInlineDepLookups() - lookupsBefore;
+    if (lookups > 4 * (manyCallers + depsBefore)) {
+        testFail("adding %u callers of one callee took %llu op lookups (bound %u)", manyCallers, (unsigned long long)lookups, 4 * (manyCallers + depsBefore));
     }
 
     cpu->nextOp = nullptr;

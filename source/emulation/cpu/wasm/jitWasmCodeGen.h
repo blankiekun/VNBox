@@ -1387,6 +1387,7 @@ U64 wasmJitTestHotModules();
 U64 wasmJitTestHotBlocks();
 U64 wasmJitTestInlinedCalls();
 U32 wasmJitTestInlineDepCount();
+U64 wasmJitTestInlineDepLookups();
 bool wasmJitTestRelocAllocationTransfer();
 U32 wasmJitTestSealedCount();
 extern "C" U32 wasmJitTestRuntimeGroupCount();
