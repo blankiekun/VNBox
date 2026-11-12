@@ -21,19 +21,20 @@
 
 // Host dsound mixing: every game that plays audio runs Wine's dsound mixer thread, and its per-sample loops (each
 // playing buffer's 16-bit/float samples to floats, volume, the add into the primary buffer) were emulated x86 on every
-// mix period. jp.zip's dsound.dll.so (vn/wine/dsound-mixer-fast.patch) puts those loops in two exported leaf functions,
-// vnbox_dsound_convert and vnbox_dsound_mix, which get a head op here (hostLibcOp, the native libc mechanism in
-// hosthooks.cpp) and run as host code. Same bytes: the guest does single float operations (SSE, -mfpmath=sse), each
-// rounded to float, and the emulator does them as host float operations, which is what this code does, in the same
-// order and with the same operands (16-bit samples / 32768 is exact). Nothing about buffers or timing changes: the
+// mix period. jp.zip's dsound.dll.so (vn/wine/dsound-mixer-fast.patch) puts those loops in exported leaf functions,
+// vnbox_dsound_convert, vnbox_dsound_mix and vnbox_dsound_resample (the FIR resampler, for a buffer whose rate is not
+// the device's), which get a head op here (hostLibcOp, the native libc mechanism in hosthooks.cpp) and run as host
+// code. Same bytes: the guest does single float/double operations (SSE, -mfpmath=sse), each rounded to its type, and
+// the emulator does them as host operations, which is what this code does, in the same order and with the same
+// operands and types (16-bit samples / 32768 is exact). Nothing about buffers or timing changes: the
 // mixer calls the same functions at the same moments, they only take less emulated time.
 // A call whose memory isn't plain RAM, whose ranges overlap (the copies would not see each other's writes), or whose
 // arguments are outside what the patched dsound passes runs the guest function. The root fs's dsound.dll.so (no
 // exports) gets nothing hooked. nativeDsound=0 (URL) turns it off.
 #include "../../softmmu/kmemory_soft.h"
 
-enum : U32 { DS_CONVERT, DS_MIX, DS_COUNT };
-static const char* const hostDsoundNames[DS_COUNT] = { "vnbox_dsound_convert", "vnbox_dsound_mix" };
+enum : U32 { DS_CONVERT, DS_MIX, DS_RESAMPLE, DS_COUNT };
+static const char* const hostDsoundNames[DS_COUNT] = { "vnbox_dsound_convert", "vnbox_dsound_mix", "vnbox_dsound_resample" };
 
 U32 hostDsoundFnId(const char* name) { // DS_* + 1, or 0
     for (U32 i = 0; i < DS_COUNT; i++) {
@@ -67,9 +68,9 @@ bool hostDsoundRun(CPU* cpu, U32 fn) {
     KMemory* memory = cpu->memory;
     if (fn >= DS_COUNT || cpu->debugTrapActive || !cpu->isBig() || cpu->stackMask != 0xFFFFFFFF ||
         cpu->seg[CS].address || cpu->seg[DS].address || cpu->seg[ES].address || cpu->seg[SS].address ||
-        !libcRange(memory, ESP, 4 + 8 * 4, false)) return false;
-    U32 a[8];
-    for (U32 i = 0; i < 8; i++) a[i] = memory->readd(ESP + 4 + i * 4);
+        !libcRange(memory, ESP, 4 + (fn == DS_RESAMPLE ? 18 : 8) * 4, false)) return false;
+    U32 a[18];
+    for (U32 i = 0; i < (fn == DS_RESAMPLE ? 18u : 8u); i++) a[i] = memory->readd(ESP + 4 + i * 4);
     static thread_local std::vector<U8> in, out;
     if (fn == DS_CONVERT) { // (p, istride, out, ochannels, n, channels, s16, dup)
         U32 p = a[0], istride = a[1], o = a[2], ochannels = a[3], n = a[4], channels = a[5];
@@ -100,6 +101,67 @@ bool hostDsoundRun(CPU* cpu, U32 fn) {
                 }
                 if (dup) ::memcpy(to + 4, to, 4);
             }
+            memory->memcpy(o, out.data(), (U32)outLen);
+        }
+    } else if (fn == DS_RESAMPLE) {
+        // (out, ochannels, count, freqAcc_start, freqAdjustNum, freqAdjustDen (LONG64s, two slots each), firstep,
+        // firgain, fir, fir_len, fir_copy, intermediate, required_input, channels, dup): cp_fields_resample's loop
+        U32 o = a[0], ochannels = a[1], count = a[2], firstep = a[9], fir = a[11], firLen = a[12], firCopy = a[13];
+        U32 inter = a[14], required = a[15], channels = a[16];
+        S64 start = (S64)(a[3] | (U64)a[4] << 32), num = (S64)(a[5] | (U64)a[6] << 32), den = (S64)(a[7] | (U64)a[8] << 32);
+        float firgain;
+        ::memcpy(&firgain, &a[10], 4);
+        bool dup = a[17] != 0;
+        U32 width = dup ? 2 : channels;
+        if (!channels || channels > 32 || (dup && channels != 1) || ochannels < width || !firstep || den <= 0 ||
+            firLen < 2) return false;
+        if (count) {
+            U32 maxUsed = (firLen - 2) / firstep + 1; // fir_copy entries a frame can write (its first idx is >= 0)
+            U64 outLen = ((U64)(count - 1) * ochannels + width) * 4, firBytes = (U64)firLen * 4, copyLen = (U64)maxUsed * 4;
+            U64 interLen = (U64)channels * required * 4;
+            if (outLen > DS_MAX_BYTES || firBytes > DS_MAX_BYTES || interLen > DS_MAX_BYTES ||
+                dsOverlap(o, outLen, fir, firBytes) || dsOverlap(o, outLen, firCopy, copyLen) ||
+                dsOverlap(o, outLen, inter, interLen) || dsOverlap(firCopy, copyLen, fir, firBytes) ||
+                dsOverlap(firCopy, copyLen, inter, interLen) || !libcRange(memory, o, (U32)outLen, true) ||
+                !libcRange(memory, fir, (U32)firBytes, false) || !libcRange(memory, firCopy, (U32)copyLen, true) ||
+                !libcRange(memory, inter, (U32)interLen, false)) return false;
+            static thread_local std::vector<float> f, fc, cache;
+            f.resize(firLen);
+            fc.resize(maxUsed);
+            cache.resize((size_t)channels * required);
+            out.resize((size_t)outLen);
+            memory->memcpy(f.data(), fir, (U32)firBytes);
+            memory->memcpy(fc.data(), firCopy, (U32)copyLen); // entries no frame writes stay as they were
+            if (interLen) memory->memcpy(cache.data(), inter, (U32)interLen);
+            memory->memcpy(out.data(), o, (U32)outLen); // bytes between the frames' values stay as they were
+            float denF = (float)den;
+            U8* to = out.data();
+            // The guest's expressions with the guest's types: LONG64 math (wrapping, done as U64), the LONG64 to float
+            // conversion and float divide, rem in double rounded to float, a float times float product added in double.
+            for (U32 i = 0; i < count; i++, to += ochannels * 4) {
+                S64 steps = (S64)(((U64)start + (U64)i * (U64)num) * firstep);
+                U32 intFirSteps = (U32)(steps / den);
+                float totalFirSteps = steps / denF;
+                U32 ipos = intFirSteps / firstep;
+                U32 idx = (ipos + 1) * firstep - intFirSteps - 1;
+                float rem = intFirSteps + 1.0 - totalFirSteps;
+                U32 used = 0;
+                while (idx < firLen - 1) {
+                    if (used == maxUsed) return false; // not reachable (idx wraps only with a huge firstep)
+                    fc[used++] = f[idx] * (1.0 - rem) + f[idx + 1] * rem;
+                    idx += firstep;
+                }
+                if (used && (U64)ipos + used > required) return false; // the guest would read past its row
+                for (U32 c = 0; c < channels; c++) {
+                    float sum = 0.0;
+                    const float* row = cache.data() + (size_t)c * required + ipos;
+                    for (U32 j = 0; j < used; j++) sum += fc[j] * row[j];
+                    float v = sum * firgain;
+                    ::memcpy(to + c * 4, &v, 4);
+                }
+                if (dup) ::memcpy(to + 4, to, 4);
+            }
+            memory->memcpy(firCopy, fc.data(), (U32)copyLen);
             memory->memcpy(o, out.data(), (U32)outLen);
         }
     } else { // DS_MIX (src, dst, frames, channels, vols): src *= vols per channel when vols, then dst += src
