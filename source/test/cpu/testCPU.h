@@ -58,6 +58,8 @@ void testJitSignalPendingDispatch();
 void testX87ExceptionSummaryState();
 void testDefaultUserSegmentsUseGdtSelectors();
 void testSignalHandlerSegmentsUseGdtSelectors();
+void testWasmWin16PointerArithmetic();
+void testJitSegmentFaultLeavesCompiledBlock();
 void testSignalReturnRefreshesCodeSegmentSize();
 void testSignalAlternateStackDeliverySemantics();
 void testSignalOnStackWithoutConfiguredAlternateStack();
