@@ -240,6 +240,7 @@ int XDrawable::copyImageData(KThread* thread, const std::shared_ptr<XGC>& gc, U3
 }
 
 static U32 readPixel(const U8* row, U32 x, U32 bits);
+static void writePixel(U8* row, U32 x, U32 bits, U32 value);
 
 int XDrawable::copy(KThread* thread,const std::shared_ptr<XGC>& gc, const std::shared_ptr<XDrawable>& srcDrawable, S32 srcX, S32 srcY, U32 width, U32 height, S32 dstX, S32 dstY) {
 	if (!data || !srcDrawable->data) { // no pixels: a PBuffer, or too large to have any (setSize)
@@ -273,7 +274,9 @@ int XDrawable::copy(KThread* thread,const std::shared_ptr<XGC>& gc, const std::s
 			std::vector<U8> rows(srcDrawable->data + srcDrawable->bytes_per_line * sy, srcDrawable->data + srcDrawable->bytes_per_line * (sy + height));
 			for (U32 y = 0; y < height; y++) {
 				for (U32 x = 0; x < width; x++) {
-					drawPixel(*gc, (S32)dx + x, (S32)dy + y, readPixel(rows.data() + y * srcDrawable->bytes_per_line, (U32)sx + x, 1));
+					U32 bit = readPixel(rows.data() + y * srcDrawable->bytes_per_line, (U32)sx + x, 1);
+					if (gc) drawPixel(*gc, (S32)dx + x, (S32)dy + y, bit);
+					else writePixel(data + bytes_per_line * (dy + y), (U32)dx + x, 1, bit); // no GC: plain GXcopy
 				}
 			}
 		} else {

@@ -91,6 +91,7 @@ void testX11OversizedDrawable();
 void testX11BadGuestValues();
 void testX11JisKeys();
 void testX11GetImageBounds();
+void testX11MonochromeCopy();
 void testX11ImageReadback();
 void testX11CopyBounds();
 void testX11CopyWithinDrawable();
@@ -1211,6 +1212,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testX11BadGuestValues, "Test X11 calls with bad guest values"},
     {testX11JisKeys, "Test X11 JIS keys"},
     {testX11GetImageBounds, "Test X11 image capture bounds and padding"},
+    {testX11MonochromeCopy, "Test X11 monochrome copy bit offsets, bounds and overlap"},
     {testX11ImageReadback, "Test X11 window readback and cursor save/restore"},
     {testX11CopyBounds, "Test X11 image and area copies stay inside both drawables"},
     {testX11CopyWithinDrawable, "Test X11 area copy within one drawable"},
