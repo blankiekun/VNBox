@@ -12944,6 +12944,11 @@ void JitWasmCodeGen::movValue(JitWidth w, RegPtr dst, DYN_PTR_SIZE imm) {
 //  to emitI32Load/emitI32Store with the appropriate offsets)
 // ---------------------------------------------------------------------------
 void JitWasmCodeGen::storeLazyFlagType(LazyFlagType flags) {
+    if (flags == FLAGS_CFOF) {
+        // Rotates replace CF/OF but keep the previous lazy type for the other flags (saved in lazyFlagTypePrev by the base).
+        JitCodeGen::storeLazyFlagType(flags);
+        return;
+    }
     writeCPUValue(JitWidth::b8, (U32)offsetof(CPU, lazyFlagType), (DYN_PTR_SIZE)flags);
 }
 void JitWasmCodeGen::storeLazyFlagsDest(RegPtr reg) {
