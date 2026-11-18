@@ -860,7 +860,6 @@ void testX11CapsLockKeys() {
 
 // Bug: a bigger 8 or 16 bit window composited its old, smaller converted copy at the new pitch until the guest drew.
 void testX11ResizeMarksDirty() {
-void testX11HiddenWindowInvalidation() {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
     x11_init();
     testNewInstruction(0);
@@ -1040,6 +1039,13 @@ void testX11MotionCoalesced() {
     server->closeDisplay(thread, data);
 }
 
+void testX11HiddenWindowInvalidation() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto visual = std::make_shared<Visual>();
     visual->bits_per_rgb = 8;
     auto window = server->createNewWindow(0, nullptr, 2, 2, 8, 0, 0, InputOutput, 0, visual);
     auto gc = server->createGC(window);
