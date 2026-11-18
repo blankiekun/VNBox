@@ -91,6 +91,7 @@ void testX11OversizedDrawable();
 void testX11BadGuestValues();
 void testX11JisKeys();
 void testX11GetImageBounds();
+void testX11MonochromeCopy();
 void testX11ImageReadback();
 void testX11CopyBounds();
 void testX11CopyWithinDrawable();
@@ -104,6 +105,9 @@ void testX11MotionCoalesced();
 void testX11PalettedDrawing();
 void testX11PatternFills();
 void testX11PaletteInvalidation();
+void testX11HiddenWindowInvalidation();
+void testX11DialogFocusRevert();
+void testX11DisplayWindowCleanup();
 void testXInputValuatorLayout();
 void testCapturedMouseSensitivity();
 #if defined(BOXEDWINE_OPENGL_SDL) && defined(BOXEDWINE_MULTI_THREADED) && !defined(__EMSCRIPTEN__) && !defined(__APPLE__)
@@ -821,6 +825,14 @@ const TestEntry TEST_ENTRIES[] = {
     {testOverlongPrefixedCliDoesNotPoisonCodeCache, "Test overlong prefixed cli does not poison code cache", TEST_ENTRY_SERIAL},
     {testInt2dRaisesInterruptProtectionFault, "Test int 2d raises interrupt protection fault", TEST_ENTRY_SERIAL},
     {testInt3ImmediateRaisesBreakpoint, "Test int 3 immediate raises breakpoint", TEST_ENTRY_SERIAL},
+    {testInt4RaisesOverflowTrap, "Test int 4 raises overflow trap", TEST_ENTRY_SERIAL},
+    {testIntoRaisesConditionalOverflowTrap, "Test into raises conditional overflow trap", TEST_ENTRY_SERIAL},
+    {testIntegerDivideFaults, "Test integer divide fault metadata", TEST_ENTRY_SERIAL},
+    {testBoundsExceptions, "Test bound exceptions", TEST_ENTRY_SERIAL},
+    {testExceptionInstructionMetadata, "Test CPU exception instruction metadata", TEST_ENTRY_SERIAL},
+    {testSegmentNotPresentExceptions, "Test absent segment exception metadata", TEST_ENTRY_SERIAL},
+    {testPageFaultMetadata, "Test page fault metadata", TEST_ENTRY_SERIAL},
+    {testResumeFlagSuppressesOneBreakpoint, "Test resume flag suppresses one execution breakpoint", TEST_ENTRY_SERIAL},
     {testPortIoRaisesProtectionFault, "Test port I/O raises protection fault", TEST_ENTRY_SERIAL},
     {testDescriptorTableQueries, "Test descriptor table queries"},
     {testDescriptorSelectorQueries, "Test descriptor selector queries"},
@@ -850,6 +862,8 @@ const TestEntry TEST_ENTRIES[] = {
     {testDataHardwareBreakpointRaisesTrap, "Test data hardware breakpoint raises trap", TEST_ENTRY_SERIAL},
     {testDefaultUserSegmentsUseGdtSelectors, "Test default user segments use GDT selectors", TEST_ENTRY_SERIAL},
     {testSignalHandlerSegmentsUseGdtSelectors, "Test signal handler segments use GDT selectors", TEST_ENTRY_SERIAL},
+    {testWasmWin16PointerArithmetic, "Test Win16 pointer arithmetic", TEST_ENTRY_SERIAL},
+    {testJitSegmentFaultLeavesCompiledBlock, "Test segment fault leaves compiled block", TEST_ENTRY_SERIAL},
     {testSignalReturnRefreshesCodeSegmentSize, "Test signal return refreshes code segment size", TEST_ENTRY_SERIAL},
     {testSignalAlternateStackDeliverySemantics, "Test alternate signal stack delivery semantics", TEST_ENTRY_SERIAL},
     {testSignalOnStackWithoutConfiguredAlternateStack, "Test SA_ONSTACK without an alternate stack", TEST_ENTRY_SERIAL},
@@ -1169,6 +1183,11 @@ const TestEntry TEST_ENTRIES[] = {
     {testJitMemoryReadFaultState, "Test JIT memory load preserves fault state", TEST_ENTRY_SERIAL},
     {testLinearMemoryCloneMappings, "Test linear-memory COW and shared clone mappings", TEST_ENTRY_SERIAL},
     {testLinearMemoryCodeInvalidation, "Test linear-memory code invalidation", TEST_ENTRY_SERIAL},
+#ifdef BOXEDWINE_OPENGL
+    {testOpenGLLinearMemory, "Test OpenGL linear-memory spans and fallback", TEST_ENTRY_SERIAL},
+    {testOpenGLLinearMemoryWrites, "Test OpenGL linear-memory COW and code writes", TEST_ENTRY_SERIAL},
+    {testOpenGLMarshalPointerWidths, "Test OpenGL guest pointer widths", TEST_ENTRY_SERIAL},
+#endif
     {testDecodedOpLargeRangeRemoval, "Test decoded op large-range removal"},
     {testJitOverlappingBlockUnmap, "Test JIT overlapping block unmap", TEST_ENTRY_SERIAL},
     {testJitOverlappingBlockRemoveCode, "Test JIT overlapping block code removal", TEST_ENTRY_SERIAL},
@@ -1201,6 +1220,7 @@ const TestEntry TEST_ENTRIES[] = {
     {testX11BadGuestValues, "Test X11 calls with bad guest values"},
     {testX11JisKeys, "Test X11 JIS keys"},
     {testX11GetImageBounds, "Test X11 image capture bounds and padding"},
+    {testX11MonochromeCopy, "Test X11 monochrome copy bit offsets, bounds and overlap"},
     {testX11ImageReadback, "Test X11 window readback and cursor save/restore"},
     {testX11CopyBounds, "Test X11 image and area copies stay inside both drawables"},
     {testX11CopyWithinDrawable, "Test X11 area copy within one drawable"},
@@ -1214,6 +1234,12 @@ const TestEntry TEST_ENTRIES[] = {
     {testX11PalettedDrawing, "Test X11 paletted drawing and clipping"},
     {testX11PatternFills, "Test X11 tiled and stippled rectangle fills"},
     {testX11PaletteInvalidation, "Test X11 shared palette invalidation"},
+#ifndef BOXEDWINE_MULTI_THREADED
+    // These map windows on the headless screen; multi-threaded, that dispatches to an SDL loop the test runner doesn't have.
+    {testX11HiddenWindowInvalidation, "Test X11 hidden window redraw invalidation"},
+    {testX11DialogFocusRevert, "Test X11 focus returns to a closing dialog's owner"},
+    {testX11DisplayWindowCleanup, "Test X11 display close and process exit destroy owned windows"},
+#endif
 #if defined(BOXEDWINE_OPENGL_SDL) && defined(BOXEDWINE_MULTI_THREADED) && !defined(__EMSCRIPTEN__) && !defined(__APPLE__)
     {testSDLGlWindowRemovalLockOrder, "Test SDL GL window removal lock order", TEST_ENTRY_SERIAL},
 #endif

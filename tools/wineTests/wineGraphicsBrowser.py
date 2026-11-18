@@ -124,6 +124,8 @@ GRAPHICS_SUITES = {
             "webgl-context-loss-restore",
             "buffer-lifecycle-growth",
             "element-buffer-client-array-max-index",
+            "client-array-memory-reuse",
+            "client-array-shared-copy",
             "dynamic-buffer-map-sync",
             "texture-level-update-mipmap-row-pitch",
             "compressed-texture-capabilities",

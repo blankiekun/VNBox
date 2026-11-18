@@ -33,6 +33,7 @@ public:
     U32 count = 0; // used by marshalEdgeFlagPointerEXT
     U32 ptr = 0;
     U8* marshal = nullptr;
+    std::vector<U8> marshalBuffer;
     U32 lastMarshalledPtr = 0;
     U32 marshal_size = 0;
     U32 refreshEachCall = 0;
@@ -81,10 +82,11 @@ public:
     void seg_access(U32 address, bool readFault, bool writeFault, bool throwException=true, bool executeFault=false);
     void seg_instructionFetch(U32 address, bool throwException=true);
     bool runSignals();
-    void runSignal(U32 signal, U32 trapNo, U32 errorNo);
+    void runSignal(U32 signal, U32 trapNo, U32 errorNo, bool fault = false);
+    U32 lastPageFaultAddress = 0;
     void signalIllegalInstruction(int code);
-    void signalTrap(U32 code);
-    void signalDebugTrap(U32 code, U32 dr6);
+    void signalTrap();
+    void signalDebugTrap(U32 code, U32 dr6, bool fault = false);
     bool debugTrapBeforeInstruction();
     bool hasHardwareBreakpointAt(U32 address) const;
     bool hasMemoryWriteBreakpointEnabled() const;

@@ -31,6 +31,7 @@
 
 #ifdef BOXEDWINE_MULTI_THREADED
 #include "knativethread.h"
+#include "../../x11/x11.h"
 
 U32 getNextTimer();
 void runTimers();
@@ -61,6 +62,12 @@ extern int allocatedRamPages;
 void mainloop() {
     isMainThread = true;
     checkBrowserSocketEvents();
+    if (XServer* server = XServer::getServer(true)) {
+        // Direct X11 drawing can dirty a window without an XFlush (for example,
+        // MDK Perf's 8-bit GDI graph). Present it on the normal redraw cadence
+        // instead of waiting for mouse input to flush the guest's X display.
+        server->draw();
+    }
         U32 t = KSystem::getMilliesSinceStart();
         U32 nextTimer = getNextTimer();
         if (nextTimer == 0) {
@@ -108,14 +115,12 @@ static U32 idleWaitMs = 16; // the idleWait= URL param: longest idle wait while 
 static void updateMainLoopTiming(bool idle) {
     int mode = EM_TIMING_SETTIMEOUT;
     int value = 1;
-#ifdef BOXEDWINE_WASM_JIT
     // Keep yielding to the browser between slices without paying the nested
     // timer delay while guest work is available. Sleeping guests still use a
     // timer so they do not continuously post messages to the browser.
     if (!idle) {
         mode = EM_TIMING_SETIMMEDIATE;
     }
-#endif
     if (idle) {
         // Browsers hold a timeout set from inside another timeout for at least 4 ms,
         // which would run a guest timer due sooner than that late, such as one of an

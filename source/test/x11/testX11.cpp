@@ -419,6 +419,81 @@ void testX11GetImageBounds() {
     testContext().thread->process->free(address);
 }
 
+void testX11MonochromeCopy() {
+    // Keep a guard inside the allocation so the regression reports an error
+    // deterministically instead of corrupting the test process's heap.
+    class GuardedBitmap : public XDrawable {
+    public:
+        GuardedBitmap(U32 width, const VisualPtr& visual) : XDrawable(width, 32, 1, visual, false) {
+            delete[] data;
+            data = new U8[size + 8];
+        }
+        void setDirty() override { isDirty = true; }
+    };
+    testNewInstruction(0);
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 1;
+    auto check = [&](U32 bitmapWidth, S32 sx, S32 sy, U32 width, U32 height, S32 dx, S32 dy, bool same) {
+        auto src = std::make_shared<GuardedBitmap>(bitmapWidth, visual);
+        auto dst = same ? src : std::make_shared<GuardedBitmap>(bitmapWidth, visual);
+        U32 size = src->getDataSize(), pitch = src->getBytesPerLine();
+        for (U32 i = 0; i < size + 8; ++i) {
+            src->getData()[i] = (U8)(i * 37 + 0x69);
+            if (!same) dst->getData()[i] = (U8)(i * 13 + 0xa5);
+        }
+        std::vector<U8> before(src->getData(), src->getData() + size + 8);
+        std::vector<U8> expected(dst->getData(), dst->getData() + size + 8);
+        bool copied = false;
+        // Build the expected result from the original pixels, including when
+        // source and destination overlap. Leave all other bits/padding intact.
+        for (S32 y = 0; y < 32; ++y) {
+            for (S32 x = 0; x < (S32)bitmapWidth; ++x) {
+                S64 rx = (S64)x - dx, ry = (S64)y - dy;
+                S64 sourceX = sx + rx, sourceY = sy + ry;
+                if (rx < 0 || ry < 0 || rx >= width || ry >= height ||
+                    sourceX < 0 || sourceX >= bitmapWidth || sourceY < 0 || sourceY >= 32) continue;
+                copied = true;
+                U8 bit = (before[sourceY * pitch + sourceX / 8] >> (sourceX & 7)) & 1;
+                U8& pixel = expected[y * pitch + x / 8];
+                pixel = (pixel & ~(1 << (x & 7))) | (bit << (x & 7));
+            }
+        }
+        if (dst->copy(testContext().thread, nullptr, src, sx, sy, width, height, dx, dy) != Success)
+            testFail("monochrome copy failed");
+        if (memcmp(dst->getData() + size, expected.data() + size, 8)) {
+            testFail("monochrome copy overran the bitmap");
+            return false;
+        }
+        if (memcmp(dst->getData(), expected.data(), size))
+            testFail("monochrome copy changed pixels/padding: src=(%d,%d) dst=(%d,%d) size=%ux%u same=%d",
+                sx, sy, dx, dy, width, height, same);
+        if (!same && memcmp(src->getData(), before.data(), size + 8))
+            testFail("monochrome copy modified its source");
+        if (dst->isDirty != copied) testFail("monochrome copy dirty state incorrect");
+        return true;
+    };
+    // Drowned God's 32x32 cursor: the old byte-rounded copy wrote one byte
+    // beyond the final row while copying 31x31 pixels to (1,1).
+    if (!check(32, 0, 0, 31, 31, 1, 1, false)) return;
+    for (S32 srcBit = 0; srcBit < 8; ++srcBit) {
+        for (S32 dstBit = 0; dstBit < 8; ++dstBit) {
+            check(33, srcBit, 0, 25, 32, dstBit, 0, false);
+        }
+    }
+    check(32, 0, 0, 31, 31, 1, 1, true);
+    check(32, 1, 1, 31, 31, 0, 0, true);
+    check(33, 2, 0, 27, 32, 5, 0, true);
+    check(33, 5, 0, 27, 32, 2, 0, true);
+    check(32, -2, -3, 40, 40, -1, -1, false);
+    check(32, 30, 30, 8, 8, 0, 0, false);
+    check(32, 0, 0, 8, 8, 30, 30, false);
+    check(32, 32, 0, 1, 1, 0, 0, false);
+    check(32, 0, 0, 1, 1, 32, 0, false);
+    check(32, 0, 0, 0, 32, 1, 1, false);
+    check(32, (-2147483647 - 1), (-2147483647 - 1), 0xffffffff, 0xffffffff,
+        (-2147483647 - 1), (-2147483647 - 1), false);
+}
+
 void testX11ImageReadback() {
     class ImageWindow : public XWindow {
     public:
@@ -962,6 +1037,128 @@ void testX11MotionCoalesced() {
         testFail("X11 motion coalescing lost the newest position or reordered a press");
     data->unlockEvents();
     server->closeDisplay(thread, data);
+}
+
+void testX11HiddenWindowInvalidation() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 8;
+    auto window = server->createNewWindow(0, nullptr, 2, 2, 8, 0, 0, InputOutput, 0, visual);
+    auto gc = server->createGC(window);
+    gc->values.foreground = 42;
+    window->fillRectangle(nullptr, gc, 0, 0, 2, 2);
+
+    // A presentation consumes the display request but skips unmapped windows.
+    // Their backing pixels remain dirty until they can actually be drawn.
+    server->isDisplayDirty = false;
+    window->draw();
+    if (!window->isDirty) testFail("Hidden window lost its pending pixels");
+    window->mapWindow();
+    if (!server->isDisplayDirty) testFail("Mapping an already-dirty window did not request a redraw");
+
+    window->unmapWindow();
+    server->isDisplayDirty = false;
+    window->draw();
+    gc->values.foreground = 73;
+    window->fillRectangle(nullptr, gc, 0, 0, 2, 2);
+    if (!server->isDisplayDirty) testFail("Updating an already-dirty window did not request a redraw");
+    server->removeGC(gc->id);
+    server->destroyWindow(window->id);
+}
+
+void testX11DialogFocusRevert() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 8;
+    const XWindowPtr& root = server->getRoot();
+    auto owner = server->createNewWindow(0, root, 4, 4, 8, 0, 0, InputOutput, 0, visual);
+    auto dialog = server->createNewWindow(0, root, 2, 2, 8, 1, 1, InputOutput, 0, visual);
+    auto plain = server->createNewWindow(0, root, 2, 2, 8, 1, 1, InputOutput, 0, visual);
+    dialog->setTransient(owner->id);
+    owner->mapWindow();
+    dialog->mapWindow();
+    plain->mapWindow();
+
+    // Wine focuses its windows with RevertToParent. Like a window manager, the server must give
+    // focus back to a closing dialog's owner; the parent of a top-level dialog is the root, and
+    // Wine then treats the owner as deactivated (a fullscreen game minimizes itself).
+    if (server->setInputFocus(nullptr, dialog->id, RevertToParent, 0) != Success || server->getInputFocusWindow() != dialog)
+        testFail("Could not focus the dialog");
+    dialog->unmapWindow();
+    if (server->getInputFocusWindow() != owner) testFail("Closing a dialog did not focus its owner window");
+
+    // Explicit None and PointerRoot policies must also be honored for transients.
+    dialog->mapWindow();
+    if (server->setInputFocus(nullptr, dialog->id, RevertToNone, 0) != Success)
+        testFail("Could not focus the dialog with RevertToNone");
+    dialog->unmapWindow();
+    U32 revertTo;
+    U32 focus = server->getInputFocus(revertTo);
+    if (focus != None || revertTo != RevertToNone)
+        testFail("RevertToNone: got focus=%u (owner=%u), revert=%u; expected None", focus, owner->id, revertTo);
+
+    dialog->mapWindow();
+    if (server->setInputFocus(nullptr, dialog->id, RevertToPointerRoot, 0) != Success)
+        testFail("Could not focus the dialog with RevertToPointerRoot");
+    dialog->unmapWindow();
+    focus = server->getInputFocus(revertTo);
+    if (focus != PointerRoot || revertTo != RevertToPointerRoot)
+        testFail("RevertToPointerRoot did not preserve the requested policy");
+
+    // A window without an owner still reverts to its parent.
+    if (server->setInputFocus(nullptr, plain->id, RevertToParent, 0) != Success || server->getInputFocusWindow() != plain)
+        testFail("Could not focus the plain window");
+    plain->unmapWindow();
+    if (server->getInputFocusWindow() != root) testFail("RevertToParent did not focus the parent");
+
+    server->setInputFocus(nullptr, PointerRoot, RevertToPointerRoot, 0);
+    server->destroyWindow(dialog->id);
+    server->destroyWindow(plain->id);
+    server->destroyWindow(owner->id);
+}
+
+void testX11DisplayWindowCleanup() {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(paletteTestMutex);
+    x11_init();
+    testNewInstruction(0);
+    initPaletteTestServer();
+    auto server = XServer::getServer();
+    auto& context = testContext();
+    auto first = server->getDisplayDataByAddressOfDisplay(context.memory, server->openDisplay(context.thread));
+    auto second = server->getDisplayDataByAddressOfDisplay(context.memory, server->openDisplay(context.thread));
+    auto visual = std::make_shared<Visual>();
+    visual->bits_per_rgb = 8;
+    auto root = server->getRoot();
+    auto owner = server->createNewWindow(first->displayId, root, 8, 8, 8, 0, 0, InputOutput, 0, visual);
+    auto child = server->createNewWindow(second->displayId, owner, 2, 2, 8, 1, 1, InputOutput, 0, visual);
+    auto survivor = server->createNewWindow(second->displayId, root, 4, 4, 8, 20, 20, InputOutput, 0, visual);
+    owner->mapWindow(); child->mapWindow(); survivor->mapWindow();
+    server->setInputFocus(nullptr, child->id, RevertToParent, 0);
+
+    server->closeDisplay(context.thread, first);
+    if (server->getWindow(owner->id) || server->getWindow(child->id) || owner->mapped() || child->mapped())
+        testFail("Closing a display retained its window or another client's inferior");
+    if (server->getInputFocusWindow() != root)
+        testFail("Closing a display retained focus on its destroyed window");
+    if (!server->getWindow(survivor->id) || !survivor->mapped() || !server->getDisplayDataById(second->displayId))
+        testFail("Closing a display destroyed an unrelated window or connection");
+
+    server->processExit(context.process->id);
+    if (server->getDisplayDataById(second->displayId) || server->getWindow(survivor->id) || survivor->mapped())
+        testFail("Process exit left a ghost window or display connection");
+    if (server->getWindow(root->id) != root)
+        testFail("Display cleanup destroyed the server root");
+    // Keep the shared test server usable if a regression fails above.
+    server->setInputFocus(nullptr, PointerRoot, RevertToPointerRoot, 0);
+    server->destroyWindow(child->id); server->destroyWindow(owner->id); server->destroyWindow(survivor->id);
 }
 
 void testX11PaletteInvalidation() {
