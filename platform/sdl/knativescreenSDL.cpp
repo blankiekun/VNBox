@@ -315,7 +315,7 @@ void KNativeScreenSDL::showWindow(bool show) {
         // Single-threaded GL draws directly into #canvas. GDI uses a separate
         // 2D canvas so capability probes cannot corrupt SDL renderer state.
         EM_ASM({
-            var canvas = document.getElementById('boxedwine-webgl-canvas-0');
+            var canvas = typeof document !== 'undefined' && document.getElementById('boxedwine-webgl-canvas-0');
             if (canvas) canvas.style.visibility = $0 ? 'visible' : 'hidden';
         }, show);
 #endif
