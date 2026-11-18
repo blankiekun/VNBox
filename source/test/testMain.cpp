@@ -1234,9 +1234,12 @@ const TestEntry TEST_ENTRIES[] = {
     {testX11PalettedDrawing, "Test X11 paletted drawing and clipping"},
     {testX11PatternFills, "Test X11 tiled and stippled rectangle fills"},
     {testX11PaletteInvalidation, "Test X11 shared palette invalidation"},
+#ifndef BOXEDWINE_MULTI_THREADED
+    // These map windows on the headless screen; multi-threaded, that dispatches to an SDL loop the test runner doesn't have.
     {testX11HiddenWindowInvalidation, "Test X11 hidden window redraw invalidation"},
     {testX11DialogFocusRevert, "Test X11 focus returns to a closing dialog's owner"},
     {testX11DisplayWindowCleanup, "Test X11 display close and process exit destroy owned windows"},
+#endif
 #if defined(BOXEDWINE_OPENGL_SDL) && defined(BOXEDWINE_MULTI_THREADED) && !defined(__EMSCRIPTEN__) && !defined(__APPLE__)
     {testSDLGlWindowRemovalLockOrder, "Test SDL GL window removal lock order", TEST_ENTRY_SERIAL},
 #endif
